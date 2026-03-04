@@ -300,6 +300,17 @@ impl Agent {
             return Ok(());
         };
 
+        // Start the gossip message dispatcher before bootstrap —
+        // even nodes with no bootstrap peers need to receive inbound messages.
+        if let Some(ref runtime) = self.gossip_runtime {
+            runtime.start().await.map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to start gossip runtime: {e}"
+                )))
+            })?;
+            tracing::info!("Gossip message dispatcher started");
+        }
+
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
         if bootstrap_nodes.is_empty() {
             tracing::debug!("No bootstrap peers configured");
