@@ -552,7 +552,8 @@ impl NetworkNode {
                     Some(peer_conn) => {
                         tracing::info!(
                             "Accepted inbound connection from peer {:?} at {:?}",
-                            peer_conn.peer_id, peer_conn.remote_addr
+                            peer_conn.peer_id,
+                            peer_conn.remote_addr
                         );
                         let _ = event_sender.send(NetworkEvent::PeerConnected {
                             peer_id: peer_conn.peer_id.0,

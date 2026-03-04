@@ -128,10 +128,7 @@ impl GossipRuntime {
                             pubsub.handle_incoming(peer, data).await;
                         }
                         other => {
-                            tracing::debug!(
-                                "Ignoring {:?} stream (not yet implemented)",
-                                other
-                            );
+                            tracing::debug!("Ignoring {:?} stream (not yet implemented)", other);
                         }
                     },
                     Err(e) => {
@@ -143,7 +140,14 @@ impl GossipRuntime {
             tracing::info!("Gossip message dispatcher shut down");
         });
 
-        *self.dispatcher_handle.lock().unwrap() = Some(handle);
+        match self.dispatcher_handle.lock() {
+            Ok(mut guard) => *guard = Some(handle),
+            Err(_) => {
+                return Err(crate::error::NetworkError::NodeCreation(
+                    "dispatcher handle lock poisoned".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -155,8 +159,10 @@ impl GossipRuntime {
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> NetworkResult<()> {
-        if let Some(handle) = self.dispatcher_handle.lock().unwrap().take() {
-            handle.abort();
+        if let Ok(mut guard) = self.dispatcher_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
         }
         Ok(())
     }
