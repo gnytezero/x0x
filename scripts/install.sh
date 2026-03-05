@@ -103,8 +103,9 @@ if [ "$GPG_AVAILABLE" = true ]; then
                 exit 1
             fi
         else
-            echo -e "${YELLOW}⚠ Continuing despite failed verification (non-interactive mode).${NC}"
-            echo ""
+            echo -e "${RED}✗ Signature verification failed in non-interactive mode. Aborting.${NC}"
+            echo "  Re-run interactively or set X0X_SKIP_GPG=true to bypass."
+            exit 1
         fi
     fi
 fi
