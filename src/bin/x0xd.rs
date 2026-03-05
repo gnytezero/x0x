@@ -95,6 +95,16 @@ struct DaemonConfig {
     /// How long before a discovered agent entry is considered stale (seconds).
     #[serde(default = "default_identity_ttl")]
     identity_ttl_secs: u64,
+
+    /// Enable rendezvous `ProviderSummary` advertisements for global findability.
+    #[serde(default = "default_rendezvous_enabled")]
+    rendezvous_enabled: bool,
+
+    /// Validity period (milliseconds) for each rendezvous advertisement.
+    /// The daemon re-advertises every `validity_ms / 2` so that the record
+    /// is always fresh before it expires.
+    #[serde(default = "default_rendezvous_validity_ms")]
+    rendezvous_validity_ms: u64,
 }
 
 fn default_bind_address() -> SocketAddr {
@@ -143,6 +153,14 @@ fn default_identity_ttl() -> u64 {
     x0x::IDENTITY_TTL_SECS
 }
 
+fn default_rendezvous_enabled() -> bool {
+    true
+}
+
+fn default_rendezvous_validity_ms() -> u64 {
+    3_600_000 // 1 hour
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -161,6 +179,8 @@ impl Default for DaemonConfig {
             update_repo: default_update_repo(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
+            rendezvous_enabled: default_rendezvous_enabled(),
+            rendezvous_validity_ms: default_rendezvous_validity_ms(),
         }
     }
 }
@@ -483,6 +503,18 @@ async fn main() -> Result<()> {
 
     tracing::info!("Network joined");
 
+    // Initial rendezvous advertisement (if enabled)
+    if config.rendezvous_enabled {
+        if let Err(e) = agent
+            .advertise_identity(config.rendezvous_validity_ms)
+            .await
+        {
+            tracing::warn!("Initial rendezvous advertisement failed: {e}");
+        } else {
+            tracing::info!("Rendezvous advertisement published");
+        }
+    }
+
     // Build shared state
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     let state = Arc::new(AppState {
@@ -550,6 +582,25 @@ async fn main() -> Result<()> {
                     Err(err) => {
                         tracing::warn!("Periodic self-update check failed: {err}");
                     }
+                }
+            }
+        });
+    }
+
+    // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
+    if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {
+        let rendezvous_agent = Arc::clone(&state.agent);
+        let validity_ms = config.rendezvous_validity_ms;
+        tokio::spawn(async move {
+            let interval_secs = (validity_ms / 2).max(60_000) / 1000;
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.tick().await; // skip immediate tick (already advertised at startup)
+            loop {
+                ticker.tick().await;
+                if let Err(e) = rendezvous_agent.advertise_identity(validity_ms).await {
+                    tracing::warn!("Periodic rendezvous re-advertisement failed: {e}");
+                } else {
+                    tracing::debug!("Rendezvous re-advertisement published");
                 }
             }
         });
@@ -1381,7 +1432,6 @@ async fn discovered_agent(
             }
         }
     }
-
 
     match state.agent.discovered_agent(agent_id).await {
         Ok(Some(agent)) => (

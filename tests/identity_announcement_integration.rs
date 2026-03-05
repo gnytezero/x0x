@@ -261,7 +261,42 @@ fn test_shard_distribution_uniform() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 10: round-trip via live gossip overlay (requires network)
+// Test 10: rendezvous shard topic is deterministic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rendezvous_shard_topic_deterministic() {
+    let agent_id = x0x::identity::AgentId([99u8; 32]);
+    let topic_a = x0x::rendezvous_shard_topic_for_agent(&agent_id);
+    let topic_b = x0x::rendezvous_shard_topic_for_agent(&agent_id);
+    assert_eq!(
+        topic_a, topic_b,
+        "same AgentId must always yield the same rendezvous topic"
+    );
+    assert!(
+        topic_a.starts_with("x0x.rendezvous.shard."),
+        "rendezvous topic must use expected prefix"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: rendezvous and identity shards use the same shard number
+//          (same AgentId → same shard, different prefix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rendezvous_and_identity_shard_numbers_match() {
+    let agent_id = x0x::identity::AgentId([77u8; 32]);
+    let id_topic = x0x::shard_topic_for_agent(&agent_id);
+    let rdv_topic = x0x::rendezvous_shard_topic_for_agent(&agent_id);
+    // Both should end in the same shard number
+    let id_num = id_topic.trim_start_matches("x0x.identity.shard.");
+    let rdv_num = rdv_topic.trim_start_matches("x0x.rendezvous.shard.");
+    assert_eq!(id_num, rdv_num, "shard numbers must be identical");
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: round-trip via live gossip overlay (requires network)
 // ---------------------------------------------------------------------------
 
 #[ignore = "requires gossip overlay propagation between two agents"]

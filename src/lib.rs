@@ -132,6 +132,8 @@ pub struct Agent {
     identity_ttl_secs: u64,
     /// Handle for the running heartbeat task, if started.
     heartbeat_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether a rendezvous `ProviderSummary` advertisement is active.
+    rendezvous_advertised: std::sync::atomic::AtomicBool,
 }
 
 /// A message received from the gossip network.
@@ -161,6 +163,20 @@ pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v1";
 pub fn shard_topic_for_agent(agent_id: &identity::AgentId) -> String {
     let shard = saorsa_gossip_rendezvous::calculate_shard(&agent_id.0);
     format!("x0x.identity.shard.{shard}")
+}
+
+/// Gossip topic prefix for rendezvous `ProviderSummary` advertisements.
+pub const RENDEZVOUS_SHARD_TOPIC_PREFIX: &str = "x0x.rendezvous.shard";
+
+/// Return the rendezvous shard gossip topic for the given `agent_id`.
+///
+/// Agents publish [`saorsa_gossip_rendezvous::ProviderSummary`] records to this
+/// topic so that seekers can find them even when the two peers have never been
+/// on the same gossip overlay partition.
+#[must_use]
+pub fn rendezvous_shard_topic_for_agent(agent_id: &identity::AgentId) -> String {
+    let shard = saorsa_gossip_rendezvous::calculate_shard(&agent_id.0);
+    format!("{RENDEZVOUS_SHARD_TOPIC_PREFIX}.{shard}")
 }
 
 /// Default interval between identity heartbeat re-announcements (seconds).
@@ -1062,24 +1078,18 @@ impl Agent {
         Ok(agents)
     }
 
-    /// Find an agent by ID.
-    ///
-    /// Looks up announced network addresses for a known agent.
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_id` - The agent ID to search for
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the gossip runtime is not initialized.
     /// Find an agent by ID, returning its known addresses.
     ///
     /// Performs a three-stage lookup:
-    /// 1. Fast path: return addresses from local cache if already discovered.
-    /// 2. Shard subscription: subscribe to the agent's shard topic and wait up
-    ///    to 10 seconds for a heartbeat announcement.
-    /// 3. Returns `None` if no announcement arrives within the deadline.
+    /// 1. **Cache hit** — return addresses immediately if the agent has already
+    ///    been discovered.
+    /// 2. **Shard subscription** — subscribe to the agent's identity shard topic
+    ///    and wait up to 5 seconds for a heartbeat announcement.
+    /// 3. **Rendezvous** — subscribe to the agent's rendezvous shard topic and
+    ///    wait up to 5 seconds for a `ProviderSummary` advertisement.  This
+    ///    works even when the two agents are on different gossip overlay clusters.
+    ///
+    /// Returns `None` if the agent is not found within the combined deadline.
     ///
     /// # Errors
     ///
@@ -1101,7 +1111,7 @@ impl Agent {
             return Ok(Some(addrs));
         }
 
-        // Stage 2: subscribe to the agent's shard topic and wait up to 10 s.
+        // Stage 2: subscribe to the agent's identity shard topic and wait up to 5 s.
         let runtime = match self.gossip_runtime.as_ref() {
             Some(r) => r,
             None => return Ok(None),
@@ -1109,7 +1119,7 @@ impl Agent {
         let shard_topic = shard_topic_for_agent(&agent_id);
         let mut sub = runtime.pubsub().subscribe(shard_topic).await;
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -1141,6 +1151,11 @@ impl Agent {
                 }
                 _ = timeout => break,
             }
+        }
+
+        // Stage 3: rendezvous shard subscription — wait up to 5 s.
+        if let Some(addrs) = self.find_agent_rendezvous(agent_id, 5).await? {
+            return Ok(Some(addrs));
         }
 
         Ok(None)
@@ -1245,6 +1260,139 @@ impl Agent {
         });
         *handle_guard = Some(handle);
         Ok(())
+    }
+
+    /// Publish a rendezvous `ProviderSummary` for this agent.
+    ///
+    /// Enables global findability across gossip overlay partitions.  Seekers
+    /// that have never been on the same partition as this agent can still
+    /// discover it by subscribing to the rendezvous shard topic and waiting
+    /// for the next heartbeat advertisement.
+    ///
+    /// The summary is signed with this agent's machine key and contains the
+    /// agent's reachability addresses in the `extensions` field (bincode-encoded
+    /// `Vec<SocketAddr>`).
+    ///
+    /// # Arguments
+    ///
+    /// * `validity_ms` — How long (milliseconds) before the summary expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized, serialization
+    /// fails, or signing fails.
+    pub async fn advertise_identity(&self, validity_ms: u64) -> error::Result<()> {
+        use saorsa_gossip_rendezvous::{Capability, ProviderSummary};
+
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized — cannot advertise identity",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        let addresses = self.announcement_addresses();
+        let addr_bytes = bincode::serialize(&addresses).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize addresses for rendezvous: {e}"
+            ))
+        })?;
+
+        let mut summary = ProviderSummary::new(
+            self.agent_id().0,
+            peer_id,
+            vec![Capability::Identity],
+            validity_ms,
+        )
+        .with_extensions(addr_bytes);
+
+        summary
+            .sign_raw(self.identity.machine_keypair().secret_key().as_bytes())
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to sign rendezvous summary: {e}"
+                )))
+            })?;
+
+        let cbor_bytes = summary.to_cbor().map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to CBOR-encode rendezvous summary: {e}"
+            ))
+        })?;
+
+        let topic = rendezvous_shard_topic_for_agent(&self.agent_id());
+        runtime
+            .pubsub()
+            .publish(topic, bytes::Bytes::from(cbor_bytes))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to publish rendezvous summary: {e}"
+                )))
+            })?;
+
+        self.rendezvous_advertised
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Search for an agent via rendezvous shard subscription.
+    ///
+    /// Subscribes to the rendezvous shard topic for `agent_id` and waits up to
+    /// `timeout_secs` for a matching [`saorsa_gossip_rendezvous::ProviderSummary`].
+    /// On success the addresses encoded in the summary `extensions` field are
+    /// returned.
+    ///
+    /// This is Stage 3 of [`Agent::find_agent`]'s lookup cascade.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn find_agent_rendezvous(
+        &self,
+        agent_id: identity::AgentId,
+        timeout_secs: u64,
+    ) -> error::Result<Option<Vec<std::net::SocketAddr>>> {
+        use saorsa_gossip_rendezvous::ProviderSummary;
+
+        let runtime = match self.gossip_runtime.as_ref() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let topic = rendezvous_shard_topic_for_agent(&agent_id);
+        let mut sub = runtime.pubsub().subscribe(topic).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::select! {
+                Some(msg) = sub.recv() => {
+                    let summary = match ProviderSummary::from_cbor(&msg.payload) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if summary.target != agent_id.0 {
+                        continue;
+                    }
+                    // Decode addresses from the extensions field.
+                    let addrs: Vec<std::net::SocketAddr> = summary
+                        .extensions
+                        .as_deref()
+                        .and_then(|b| bincode::deserialize(b).ok())
+                        .unwrap_or_default();
+                    if !addrs.is_empty() {
+                        return Ok(Some(addrs));
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => break,
+            }
+        }
+
+        Ok(None)
     }
 
     /// Insert a discovered agent into the cache (for testing only).
@@ -1694,6 +1842,7 @@ impl AgentBuilder {
                 .unwrap_or(IDENTITY_HEARTBEAT_INTERVAL_SECS),
             identity_ttl_secs: self.identity_ttl_secs.unwrap_or(IDENTITY_TTL_SECS),
             heartbeat_handle: tokio::sync::Mutex::new(None),
+            rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }

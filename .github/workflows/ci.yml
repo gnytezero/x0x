@@ -17,23 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout ant-quic
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/ant-quic
-          path: .deps/ant-quic
-
-      - name: Checkout saorsa-gossip
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/saorsa-gossip
-          path: .deps/saorsa-gossip
-
-      - name: Setup dependency symlinks
-        run: |
-          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
-          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
-
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,23 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout ant-quic
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/ant-quic
-          path: .deps/ant-quic
-
-      - name: Checkout saorsa-gossip
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/saorsa-gossip
-          path: .deps/saorsa-gossip
-
-      - name: Setup dependency symlinks
-        run: |
-          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
-          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -102,23 +68,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout ant-quic
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/ant-quic
-          path: .deps/ant-quic
-
-      - name: Checkout saorsa-gossip
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/saorsa-gossip
-          path: .deps/saorsa-gossip
-
-      - name: Setup dependency symlinks
-        run: |
-          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
-          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -165,23 +114,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout ant-quic
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/ant-quic
-          path: .deps/ant-quic
-
-      - name: Checkout saorsa-gossip
-        uses: actions/checkout@v4
-        with:
-          repository: saorsa-labs/saorsa-gossip
-          path: .deps/saorsa-gossip
-
-      - name: Setup dependency symlinks
-        run: |
-          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
-          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
