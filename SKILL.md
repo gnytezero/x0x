@@ -219,7 +219,7 @@ Document sharing will allow agents to share files, code, datasets, or any binary
 
 ### 4. Presence & Agent Discovery
 
-Find connected peers on the gossip network:
+Find connected peers and discovered agents on the gossip network:
 
 ```rust
 // Get connected peers (gossip overlay neighbours)
@@ -228,15 +228,36 @@ for peer in peers {
     println!("Peer {} is connected", peer);
 }
 
-// Presence heartbeats (returns empty in v0.1 — full presence in v0.2)
-let presence = agent.presence().await?;
+// Announce this agent identity (agent + machine only)
+agent.announce_identity(false, false).await?;
+
+// Announce with human identity (ONLY with explicit consent)
+agent.announce_identity(true, true).await?;
+
+// Presence now returns discovered AgentIds from signed announcements
+let discovered_ids = agent.presence().await?;
+
+// Find one discovered agent's announced addresses
+if let Some(addrs) = agent.find_agent(target_agent_id).await? {
+    println!("Known addresses: {:?}", addrs);
+}
+
+// Full discovery entries (agent_id, machine_id, optional user_id, addresses, timestamps)
+let discovered = agent.discovered_agents().await?;
 ```
 
 **Discovery methods**:
 - **Bootstrap nodes** — Connect to global network via known addresses
 - **HyParView membership** — Partial-view topology with bounded neighbour sets
+- **Signed identity announcements** — `x0x.identity.announce.v1` on Plumtree pub/sub
 - **Capability-based** (coming soon) — Find agents that can "translate languages" or "analyze images"
 - **Reputation** (coming soon) — Weight discovery by trust scores
+
+**Identity announcement security model**:
+- Outer gossip message: signed by the **Agent ML-DSA-65 key** (standard signed pub/sub v2).
+- Inner identity payload: signed by the daemon **Machine ML-DSA-65 key** (daemon PQC identity proof).
+- Optional `user_id` disclosure is allowed only when `include_user_identity=true` **and** `human_consent=true`.
+- When human identity is disclosed, a valid `AgentCertificate` must accompany it (User -> Agent attestation).
 
 ### 5. Contact Trust Store
 
@@ -301,12 +322,15 @@ x0xd --check
 |--------|------|-------------|
 | GET | `/health` | Health check (status, version, peer count, uptime) |
 | GET | `/agent` | Agent identity (agent_id, machine_id, user_id) |
+| POST | `/announce` | Broadcast signed identity announcement (`{"include_user_identity": false, "human_consent": false}`) |
 | GET | `/peers` | List connected gossip peers |
 | POST | `/publish` | Publish to a topic (`{"topic": "...", "payload": "<base64>"}`) — auto-signed |
 | POST | `/subscribe` | Subscribe to a topic (`{"topic": "..."}`) — returns subscription_id |
 | DELETE | `/subscribe/{id}` | Unsubscribe by subscription ID |
 | GET | `/events` | Server-Sent Events stream (messages with sender + trust_level) |
-| GET | `/presence` | List known agents |
+| GET | `/presence` | List discovered AgentIds (64-char hex) |
+| GET | `/agents/discovered` | List full discovered identity records |
+| GET | `/agents/discovered/{agent_id}` | Get one discovered identity record by AgentId hex |
 | GET | `/contacts` | List all contacts with trust levels |
 | POST | `/contacts` | Add contact (`{"agent_id": "hex...", "trust_level": "trusted", "label": "..."}`) |
 | PATCH | `/contacts/:agent_id` | Update trust level (`{"trust_level": "blocked"}`) |
@@ -1087,11 +1111,11 @@ for peer in &peers {
     println!("Connected to: {}", peer);
 }
 
-// Presence info (returns empty in v0.1 — full presence in v0.2)
+// Presence info from signed identity announcements
 let presence = agent.presence().await?;
 
-// Find a specific agent by ID (returns None in v0.1 — FOAF discovery in v0.2)
-let found = agent.find_agent(&agent_id).await?;
+// Find a specific discovered agent by ID
+let found = agent.find_agent(agent_id).await?;
 ```
 
 ### Document Sharing (Planned)

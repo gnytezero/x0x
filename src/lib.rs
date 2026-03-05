@@ -120,6 +120,12 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Cache of discovered agents from identity announcements.
+    identity_discovery_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    /// Ensures identity discovery listener is spawned once.
+    identity_listener_started: std::sync::atomic::AtomicBool,
 }
 
 /// A message received from the gossip network.
@@ -131,6 +137,140 @@ pub struct Message {
     pub payload: Vec<u8>,
     /// The topic this message was published to.
     pub topic: String,
+}
+
+/// Reserved gossip topic for signed identity announcements.
+pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IdentityAnnouncementUnsigned {
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    user_id: Option<identity::UserId>,
+    agent_certificate: Option<identity::AgentCertificate>,
+    machine_public_key: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+}
+
+/// Signed identity announcement broadcast by agents.
+///
+/// The outer pub/sub envelope is agent-signed (v2 message format), and this
+/// payload is machine-signed to bind the daemon's PQC key to the announcement.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdentityAnnouncement {
+    /// Portable agent identity.
+    pub agent_id: identity::AgentId,
+    /// Machine identity for the daemon process.
+    pub machine_id: identity::MachineId,
+    /// Optional human identity (only when explicitly consented).
+    pub user_id: Option<identity::UserId>,
+    /// Optional user->agent certificate.
+    pub agent_certificate: Option<identity::AgentCertificate>,
+    /// Machine ML-DSA-65 public key bytes.
+    pub machine_public_key: Vec<u8>,
+    /// Machine ML-DSA-65 signature over the unsigned announcement.
+    pub machine_signature: Vec<u8>,
+    /// Reachability hints.
+    pub addresses: Vec<std::net::SocketAddr>,
+    /// Unix timestamp (seconds) of announcement creation.
+    pub announced_at: u64,
+}
+
+impl IdentityAnnouncement {
+    fn to_unsigned(&self) -> IdentityAnnouncementUnsigned {
+        IdentityAnnouncementUnsigned {
+            agent_id: self.agent_id,
+            machine_id: self.machine_id,
+            user_id: self.user_id,
+            agent_certificate: self.agent_certificate.clone(),
+            machine_public_key: self.machine_public_key.clone(),
+            addresses: self.addresses.clone(),
+            announced_at: self.announced_at,
+        }
+    }
+
+    /// Verify machine-key attestation and optional user->agent certificate.
+    pub fn verify(&self) -> error::Result<()> {
+        let machine_pub =
+            ant_quic::MlDsaPublicKey::from_bytes(&self.machine_public_key).map_err(|_| {
+                error::IdentityError::CertificateVerification(
+                    "invalid machine public key in announcement".to_string(),
+                )
+            })?;
+        let derived_machine_id = identity::MachineId::from_public_key(&machine_pub);
+        if derived_machine_id != self.machine_id {
+            return Err(error::IdentityError::CertificateVerification(
+                "machine_id does not match machine public key".to_string(),
+            ));
+        }
+
+        let unsigned_bytes = bincode::serialize(&self.to_unsigned()).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize announcement for verification: {e}"
+            ))
+        })?;
+        let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+            &self.machine_signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "invalid machine signature in announcement: {:?}",
+                e
+            ))
+        })?;
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &machine_pub,
+            &unsigned_bytes,
+            &signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "machine signature verification failed: {:?}",
+                e
+            ))
+        })?;
+
+        match (self.user_id, self.agent_certificate.as_ref()) {
+            (Some(user_id), Some(cert)) => {
+                cert.verify()?;
+                let cert_agent_id = cert.agent_id()?;
+                if cert_agent_id != self.agent_id {
+                    return Err(error::IdentityError::CertificateVerification(
+                        "agent certificate agent_id mismatch".to_string(),
+                    ));
+                }
+                let cert_user_id = cert.user_id()?;
+                if cert_user_id != user_id {
+                    return Err(error::IdentityError::CertificateVerification(
+                        "agent certificate user_id mismatch".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(error::IdentityError::CertificateVerification(
+                "user identity disclosure requires matching certificate".to_string(),
+            )),
+        }
+    }
+}
+
+/// Cached discovery data derived from identity announcements.
+#[derive(Debug, Clone)]
+pub struct DiscoveredAgent {
+    /// Portable agent identity.
+    pub agent_id: identity::AgentId,
+    /// Machine identity.
+    pub machine_id: identity::MachineId,
+    /// Optional human identity (when consented and attested).
+    pub user_id: Option<identity::UserId>,
+    /// Reachability hints.
+    pub addresses: Vec<std::net::SocketAddr>,
+    /// Announcement timestamp from the sender.
+    pub announced_at: u64,
+    /// Local timestamp (seconds) when this record was last updated.
+    pub last_seen: u64,
 }
 
 /// Builder for configuring an [`Agent`] before connecting to the network.
@@ -286,6 +426,250 @@ impl Agent {
         }
     }
 
+    /// Announce this agent's identity on the network discovery topic.
+    ///
+    /// By default, announcements include agent + machine identity only.
+    /// Human identity disclosure is opt-in and requires explicit consent.
+    ///
+    /// # Arguments
+    ///
+    /// * `include_user_identity` - Whether to include `user_id` and certificate
+    /// * `human_consent` - Must be `true` when disclosing user identity
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Gossip runtime is not initialized
+    /// - Human identity disclosure is requested without explicit consent
+    /// - Human identity disclosure is requested but no user identity is configured
+    /// - Serialization or publish fails
+    pub async fn announce_identity(
+        &self,
+        include_user_identity: bool,
+        human_consent: bool,
+    ) -> error::Result<()> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        self.start_identity_listener().await?;
+        let announcement =
+            self.build_identity_announcement(include_user_identity, human_consent)?;
+        let encoded = bincode::serialize(&announcement).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize identity announcement: {e}"
+            ))
+        })?;
+
+        runtime
+            .pubsub()
+            .publish(
+                IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                bytes::Bytes::from(encoded),
+            )
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to publish identity announcement: {e}"
+                )))
+            })?;
+
+        let now = Self::unix_timestamp_secs();
+        self.identity_discovery_cache.write().await.insert(
+            announcement.agent_id,
+            DiscoveredAgent {
+                agent_id: announcement.agent_id,
+                machine_id: announcement.machine_id,
+                user_id: announcement.user_id,
+                addresses: announcement.addresses.clone(),
+                announced_at: announcement.announced_at,
+                last_seen: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get all discovered agents from identity announcements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_agents(&self) -> error::Result<Vec<DiscoveredAgent>> {
+        self.start_identity_listener().await?;
+        let mut agents: Vec<_> = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        agents.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
+        Ok(agents)
+    }
+
+    /// Get one discovered agent record by agent ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_agent(
+        &self,
+        agent_id: identity::AgentId,
+    ) -> error::Result<Option<DiscoveredAgent>> {
+        self.start_identity_listener().await?;
+        Ok(self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&agent_id)
+            .cloned())
+    }
+
+    async fn start_identity_listener(&self) -> error::Result<()> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        if self
+            .identity_listener_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+
+        let mut sub = runtime
+            .pubsub()
+            .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
+            .await;
+        let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+
+        tokio::spawn(async move {
+            while let Some(msg) = sub.recv().await {
+                let announcement = match bincode::deserialize::<IdentityAnnouncement>(&msg.payload)
+                {
+                    Ok(announcement) => announcement,
+                    Err(e) => {
+                        tracing::debug!("Ignoring invalid identity announcement payload: {}", e);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = announcement.verify() {
+                    tracing::warn!("Ignoring unverifiable identity announcement: {}", e);
+                    continue;
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+
+                cache.write().await.insert(
+                    announcement.agent_id,
+                    DiscoveredAgent {
+                        agent_id: announcement.agent_id,
+                        machine_id: announcement.machine_id,
+                        user_id: announcement.user_id,
+                        addresses: announcement.addresses.clone(),
+                        announced_at: announcement.announced_at,
+                        last_seen: now,
+                    },
+                );
+            }
+        });
+
+        Ok(())
+    }
+
+    fn unix_timestamp_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    fn announcement_addresses(&self) -> Vec<std::net::SocketAddr> {
+        match self.network.as_ref().and_then(|n| n.local_addr()) {
+            Some(addr) if addr.port() > 0 => vec![addr],
+            _ => Vec::new(),
+        }
+    }
+
+    fn build_identity_announcement(
+        &self,
+        include_user_identity: bool,
+        human_consent: bool,
+    ) -> error::Result<IdentityAnnouncement> {
+        if include_user_identity && !human_consent {
+            return Err(error::IdentityError::Storage(std::io::Error::other(
+                "human identity disclosure requires explicit human consent",
+            )));
+        }
+
+        let (user_id, agent_certificate) = if include_user_identity {
+            let user_id = self.user_id().ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "human identity disclosure requested but no user identity is configured",
+                ))
+            })?;
+            let cert = self.agent_certificate().cloned().ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "human identity disclosure requested but agent certificate is missing",
+                ))
+            })?;
+            (Some(user_id), Some(cert))
+        } else {
+            (None, None)
+        };
+
+        let machine_public_key = self
+            .identity
+            .machine_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec();
+        let unsigned = IdentityAnnouncementUnsigned {
+            agent_id: self.agent_id(),
+            machine_id: self.machine_id(),
+            user_id,
+            agent_certificate: agent_certificate.clone(),
+            machine_public_key: machine_public_key.clone(),
+            addresses: self.announcement_addresses(),
+            announced_at: Self::unix_timestamp_secs(),
+        };
+        let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize unsigned identity announcement: {e}"
+            ))
+        })?;
+        let machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            self.identity.machine_keypair().secret_key(),
+            &unsigned_bytes,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "failed to sign identity announcement with machine key: {:?}",
+                e
+            )))
+        })?
+        .as_bytes()
+        .to_vec();
+
+        Ok(IdentityAnnouncement {
+            agent_id: unsigned.agent_id,
+            machine_id: unsigned.machine_id,
+            user_id: unsigned.user_id,
+            agent_certificate: unsigned.agent_certificate,
+            machine_public_key,
+            machine_signature,
+            addresses: unsigned.addresses,
+            announced_at: unsigned.announced_at,
+        })
+    }
+
     /// Join the x0x gossip network.
     ///
     /// Connects to bootstrap peers in parallel with automatic retries.
@@ -300,20 +684,22 @@ impl Agent {
             return Ok(());
         };
 
-        // Start the gossip message dispatcher before bootstrap —
-        // even nodes with no bootstrap peers need to receive inbound messages.
         if let Some(ref runtime) = self.gossip_runtime {
             runtime.start().await.map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
                     "failed to start gossip runtime: {e}"
                 )))
             })?;
-            tracing::info!("Gossip message dispatcher started");
+            tracing::info!("Gossip runtime started");
         }
+        self.start_identity_listener().await?;
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
         if bootstrap_nodes.is_empty() {
             tracing::debug!("No bootstrap peers configured");
+            if let Err(e) = self.announce_identity(false, false).await {
+                tracing::warn!("Initial identity announcement failed: {}", e);
+            }
             return Ok(());
         }
 
@@ -364,6 +750,10 @@ impl Agent {
             bootstrap_nodes.len() - failed.len(),
             bootstrap_nodes.len()
         );
+
+        if let Err(e) = self.announce_identity(false, false).await {
+            tracing::warn!("Initial identity announcement failed: {}", e);
+        }
 
         Ok(())
     }
@@ -475,46 +865,46 @@ impl Agent {
 
     /// Get online agents.
     ///
-    /// Returns a list of agent IDs that are currently known to be online.
-    /// This is a placeholder; full presence detection will use
-    /// saorsa-gossip-presence in a future release.
+    /// Returns agent IDs discovered from signed identity announcements.
     ///
     /// # Errors
     ///
     /// Returns an error if the gossip runtime is not initialized.
     pub async fn presence(&self) -> error::Result<Vec<identity::AgentId>> {
-        let _runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
-        // Placeholder: presence tracking will be implemented with saorsa-gossip-presence
-        Ok(Vec::new())
+        self.start_identity_listener().await?;
+        let mut agents: Vec<_> = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        agents.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(agents)
     }
 
     /// Find an agent by ID.
     ///
-    /// Looks up network addresses for a known agent. This is a placeholder;
-    /// full FOAF discovery will use saorsa-gossip-rendezvous in a future release.
+    /// Looks up announced network addresses for a known agent.
     ///
     /// # Arguments
     ///
-    /// * `_agent_id` - The agent ID to search for
+    /// * `agent_id` - The agent ID to search for
     ///
     /// # Errors
     ///
     /// Returns an error if the gossip runtime is not initialized.
     pub async fn find_agent(
         &self,
-        _agent_id: identity::AgentId,
+        agent_id: identity::AgentId,
     ) -> error::Result<Option<Vec<std::net::SocketAddr>>> {
-        let _runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
-        // Placeholder: agent discovery will be implemented with saorsa-gossip-rendezvous
-        Ok(None)
+        self.start_identity_listener().await?;
+        Ok(self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&agent_id)
+            .map(|entry| entry.addresses.clone()))
     }
 
     /// Create a new collaborative task list bound to a topic.
@@ -913,6 +1303,10 @@ impl AgentBuilder {
             identity,
             network,
             gossip_runtime,
+            identity_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            identity_listener_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -1143,5 +1537,70 @@ mod tests {
         let agent = Agent::new().await.unwrap();
         // Currently returns error - will be implemented in Task 3
         assert!(agent.subscribe("test-topic").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn identity_announcement_machine_signature_verifies() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+
+        let announcement = agent.build_identity_announcement(false, false).unwrap();
+        assert_eq!(announcement.agent_id, agent.agent_id());
+        assert_eq!(announcement.machine_id, agent.machine_id());
+        assert!(announcement.user_id.is_none());
+        assert!(announcement.agent_certificate.is_none());
+        assert!(announcement.verify().is_ok());
+    }
+
+    #[tokio::test]
+    async fn identity_announcement_requires_human_consent() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+
+        let err = agent.build_identity_announcement(true, false).unwrap_err();
+        assert!(
+            err.to_string().contains("explicit human consent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_announcement_with_user_requires_user_identity() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+
+        let err = agent.build_identity_announcement(true, true).unwrap_err();
+        assert!(
+            err.to_string().contains("no user identity is configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_identity_populates_discovery_cache() {
+        let user_key = identity::UserKeypair::generate().unwrap();
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .with_user_key(user_key)
+            .build()
+            .await
+            .unwrap();
+
+        agent.announce_identity(true, true).await.unwrap();
+        let discovered = agent.discovered_agent(agent.agent_id()).await.unwrap();
+        let entry = discovered.expect("agent should discover its own announcement");
+
+        assert_eq!(entry.agent_id, agent.agent_id());
+        assert_eq!(entry.machine_id, agent.machine_id());
+        assert_eq!(entry.user_id, agent.user_id());
     }
 }

@@ -140,6 +140,15 @@ struct SubscribeRequest {
     topic: String,
 }
 
+/// POST /announce request body.
+#[derive(Debug, Deserialize)]
+struct AnnounceIdentityRequest {
+    #[serde(default)]
+    include_user_identity: bool,
+    #[serde(default)]
+    human_consent: bool,
+}
+
 /// POST /task-lists request body.
 #[derive(Debug, Deserialize)]
 struct CreateTaskListRequest {
@@ -220,6 +229,17 @@ struct AgentData {
     agent_id: String,
     machine_id: String,
     user_id: Option<String>,
+}
+
+/// Discovered identity entry from gossip announcements.
+#[derive(Debug, Serialize)]
+struct DiscoveredAgentEntry {
+    agent_id: String,
+    machine_id: String,
+    user_id: Option<String>,
+    addresses: Vec<String>,
+    announced_at: u64,
+    last_seen: u64,
 }
 
 /// Peer entry.
@@ -350,12 +370,15 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/agent", get(agent_info))
+        .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
         .route("/publish", post(publish))
         .route("/subscribe", post(subscribe))
         .route("/subscribe/:id", delete(unsubscribe))
         .route("/events", get(events_sse))
         .route("/presence", get(presence))
+        .route("/agents/discovered", get(discovered_agents))
+        .route("/agents/discovered/:agent_id", get(discovered_agent))
         .route("/contacts", get(list_contacts))
         .route("/contacts", post(add_contact))
         .route("/contacts/trust", post(quick_trust))
@@ -413,11 +436,35 @@ async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Agen
     Json(ApiResponse {
         ok: true,
         data: AgentData {
-            agent_id: format!("{}", state.agent.agent_id()),
-            machine_id: format!("{}", state.agent.machine_id()),
-            user_id: state.agent.user_id().map(|u| format!("{}", u)),
+            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            machine_id: hex::encode(state.agent.machine_id().as_bytes()),
+            user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
         },
     })
+}
+
+/// POST /announce
+async fn announce_identity(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AnnounceIdentityRequest>,
+) -> impl IntoResponse {
+    match state
+        .agent
+        .announce_identity(req.include_user_identity, req.human_consent)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "include_user_identity": req.include_user_identity,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
 }
 
 /// GET /peers
@@ -558,12 +605,75 @@ async fn events_sse(
 async fn presence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.agent.presence().await {
         Ok(agents) => {
-            let entries: Vec<String> = agents.iter().map(|a| format!("{a}")).collect();
+            let entries: Vec<String> = agents.iter().map(|a| hex::encode(a.as_bytes())).collect();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "agents": entries })),
             )
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
+    DiscoveredAgentEntry {
+        agent_id: hex::encode(agent.agent_id.as_bytes()),
+        machine_id: hex::encode(agent.machine_id.as_bytes()),
+        user_id: agent.user_id.map(|id| hex::encode(id.as_bytes())),
+        addresses: agent.addresses.into_iter().map(|a| a.to_string()).collect(),
+        announced_at: agent.announced_at,
+        last_seen: agent.last_seen,
+    }
+}
+
+/// GET /agents/discovered
+async fn discovered_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.agent.discovered_agents().await {
+        Ok(agents) => {
+            let entries: Vec<DiscoveredAgentEntry> =
+                agents.into_iter().map(discovered_agent_entry).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "agents": entries })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /agents/discovered/:agent_id
+async fn discovered_agent(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    match state.agent.discovered_agent(agent_id).await {
+        Ok(Some(agent)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "agent": discovered_agent_entry(agent),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "agent not found" })),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
