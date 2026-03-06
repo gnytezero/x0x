@@ -762,22 +762,31 @@ impl Agent {
                     continue;
                 }
 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-
-                cache.write().await.insert(
-                    announcement.agent_id,
-                    DiscoveredAgent {
-                        agent_id: announcement.agent_id,
-                        machine_id: announcement.machine_id,
-                        user_id: announcement.user_id,
-                        addresses: announcement.addresses.clone(),
-                        announced_at: announcement.announced_at,
-                        last_seen: now,
-                        machine_public_key: announcement.machine_public_key.clone(),
-                    },
-                );
+                // Only update the cache if this announcement is newer than
+                // what we already have. Anti-entropy may replay stale cached
+                // messages, which would otherwise keep resetting last_seen
+                // and prevent dead agents from being evicted by TTL.
+                let mut cache = cache.write().await;
+                let dominated = cache
+                    .get(&announcement.agent_id)
+                    .is_some_and(|existing| existing.announced_at >= announcement.announced_at);
+                if !dominated {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    cache.insert(
+                        announcement.agent_id,
+                        DiscoveredAgent {
+                            agent_id: announcement.agent_id,
+                            machine_id: announcement.machine_id,
+                            user_id: announcement.user_id,
+                            addresses: announcement.addresses.clone(),
+                            announced_at: announcement.announced_at,
+                            last_seen: now,
+                            machine_public_key: announcement.machine_public_key.clone(),
+                        },
+                    );
+                }
             }
         });
 
