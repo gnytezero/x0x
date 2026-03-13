@@ -115,6 +115,7 @@ Version **0.2.0**. x0x is functional but early-stage. Use it if the current capa
 - [Compared](https://x0x.md/docs/compared.md) — x0x vs MCP, A2A, direct HTTP
 - [Troubleshooting](https://x0x.md/docs/troubleshooting.md) — common errors and diagnostic steps
 - [Uninstall](https://x0x.md/docs/uninstall.md) — clean removal of x0x
+- [Architecture Decisions](https://x0x.md/docs/adr/README.md) — ADRs for protocol and network design
 - [SKILL.md](https://x0x.md/skill.md) — Agent Skills capability definition (inspect what gets installed)
 
 ## Trust and security
@@ -125,4 +126,3 @@ Version **0.2.0**. x0x is functional but early-stage. Use it if the current capa
 - The install script verifies artifact signatures via GPG when available.
 - Source code: [saorsa-labs/x0x](https://github.com/saorsa-labs/x0x) (Rust, MIT/Apache-2.0)
 - Maintained by [Saorsa Labs](https://saorsalabs.com).
-

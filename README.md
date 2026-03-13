@@ -169,6 +169,8 @@ Six geographically distributed bootstrap nodes maintain network reachability. Th
 
 All nodes support dual-stack IPv4 + IPv6.
 
+The long-term decentralization direction is documented in [ADR 0001](./docs/adr/0001-bootstrap-peers-are-seed-hints-only.md): bootstrap peers are seed hints only, never a privileged control plane.
+
 ---
 
 ## Skill-Led Installation
