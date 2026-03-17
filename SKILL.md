@@ -487,6 +487,33 @@ x0xd --check-updates
 
 # Run without startup update check
 x0xd --skip-update-check
+
+# Run a named instance (separate identity, data, and API port)
+x0xd --name alice
+
+# List running instances
+x0xd --list
+```
+
+#### Running Multiple Instances
+
+To run multiple x0x agents on the same machine, use the `--name` flag:
+
+```bash
+curl -sfL https://x0x.md | sh -s -- --name alice
+x0xd --name alice
+```
+
+Each named instance gets its own identity (AgentId), data directory, and API port (auto-assigned). To discover the API port of a named instance:
+
+```bash
+cat ~/.local/share/x0x-alice/api.port
+```
+
+To list all running instances:
+
+```bash
+x0xd --list
 ```
 
 #### REST API Endpoints

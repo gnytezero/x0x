@@ -12,6 +12,8 @@
 //! x0xd --check                          # validate config and exit
 //! x0xd --check-updates                  # check/apply updates and exit
 //! x0xd --skip-update-check              # start daemon without startup update check
+//! x0xd --name alice                     # run a named instance (separate identity)
+//! x0xd --list                           # list running instances
 //! ```
 
 use std::collections::HashMap;
@@ -100,6 +102,11 @@ struct DaemonConfig {
     /// is always fresh before it expires.
     #[serde(default = "default_rendezvous_validity_ms")]
     rendezvous_validity_ms: u64,
+
+    /// Instance name for multi-agent support.
+    /// When set, identity and data are scoped to this name.
+    #[serde(default)]
+    instance_name: Option<String>,
 }
 
 fn default_bind_address() -> SocketAddr {
@@ -222,6 +229,7 @@ impl Default for DaemonConfig {
             user_key_path: None,
             rendezvous_enabled: default_rendezvous_enabled(),
             rendezvous_validity_ms: default_rendezvous_validity_ms(),
+            instance_name: None,
         }
     }
 }
@@ -416,12 +424,33 @@ async fn main() -> Result<()> {
     let check_updates_only = args.contains(&"--check-updates".to_string());
     let skip_update_check = args.contains(&"--skip-update-check".to_string());
 
-    let config = match &config_path {
+    // Parse --name for multi-instance support
+    let instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
+        let name = args
+            .get(idx + 1)
+            .context("--name requires an instance name")?
+            .clone();
+        validate_instance_name(&name)?;
+        Some(name)
+    } else {
+        None
+    };
+
+    // Handle --list: discover running instances and exit
+    if args.contains(&"--list".to_string()) {
+        list_instances().await?;
+        return Ok(());
+    }
+
+    let mut config = match &config_path {
         Some(path) => load_config(path).await?,
         None => {
-            // Try default path, fall back to default config
+            let config_dir_name = match &instance_name {
+                Some(name) => format!("x0x-{name}"),
+                None => "x0x".to_string(),
+            };
             let default_path = dirs::config_dir()
-                .map(|d| d.join("x0x").join("config.toml"))
+                .map(|d| d.join(&config_dir_name).join("config.toml"))
                 .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
             if default_path.exists() {
                 load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
@@ -430,6 +459,24 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // CLI --name takes precedence over config file instance_name
+    let instance_name = instance_name.or_else(|| config.instance_name.clone());
+
+    // Apply instance-scoped defaults for data_dir and api_address when --name
+    // is active but the config didn't explicitly set instance-scoped values.
+    if let Some(ref name) = instance_name {
+        let default_data_dir = default_data_dir();
+        if config.data_dir == default_data_dir {
+            config.data_dir = dirs::data_dir()
+                .map(|d| d.join(format!("x0x-{name}")))
+                .unwrap_or_else(|| PathBuf::from(format!("/var/lib/x0x-{name}")));
+        }
+        if config.api_address == default_api_address() {
+            config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        }
+        config.instance_name = Some(name.clone());
+    }
 
     init_logging(&config.log_level, &config.log_format)?;
 
@@ -484,8 +531,26 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("Starting x0xd v{}", x0x::VERSION);
+    if let Some(ref name) = instance_name {
+        tracing::info!("Instance name: {name}");
+    }
     tracing::info!("API address: {}", config.api_address);
     tracing::info!("Bind address: {}", config.bind_address);
+
+    // Derive instance-scoped identity directory
+    let identity_dir = match &instance_name {
+        Some(name) => {
+            let dir = dirs::home_dir()
+                .context("home directory required for instance identity directory")?
+                .join(format!(".x0x-{name}"));
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .context("failed to create instance identity directory")?;
+            tracing::info!("Identity directory: {}", dir.display());
+            Some(dir)
+        }
+        None => None,
+    };
 
     // Create agent
     let network_config = NetworkConfig {
@@ -502,6 +567,12 @@ async fn main() -> Result<()> {
         .with_peer_cache_dir(config.data_dir.join("peers"))
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
+
+    if let Some(ref id_dir) = identity_dir {
+        builder = builder
+            .with_machine_key(id_dir.join("machine.key"))
+            .with_agent_key_path(id_dir.join("agent.key"));
+    }
 
     if let Some(ref user_key_path) = config.user_key_path {
         builder = builder.with_user_key_path(user_key_path);
@@ -646,15 +717,100 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.api_address)
         .await
         .context("failed to bind API address")?;
-    tracing::info!("API server listening on {}", config.api_address);
+    let actual_api_addr = listener.local_addr()?;
+    let port_file = config.data_dir.join("api.port");
+    tokio::fs::write(&port_file, actual_api_addr.to_string()).await?;
+    tracing::info!(
+        "API server listening on {actual_api_addr} (port file: {})",
+        port_file.display()
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("API server error")?;
 
+    // Clean up port file on shutdown
+    let _ = tokio::fs::remove_file(&port_file).await;
     state.agent.shutdown().await;
     tracing::info!("Shutdown complete");
+    Ok(())
+}
+
+fn validate_instance_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        anyhow::bail!("instance name must be 1-64 characters");
+    }
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid {
+        anyhow::bail!(
+            "instance name must start with alphanumeric and contain only alphanumeric or hyphens"
+        );
+    }
+    Ok(())
+}
+
+async fn list_instances() -> Result<()> {
+    let data_base = dirs::data_dir().context("cannot determine data directory")?;
+
+    // Collect candidate directories: x0x and x0x-*
+    let mut instances: Vec<(String, PathBuf)> = Vec::new();
+
+    let default_port_file = data_base.join("x0x").join("api.port");
+    if default_port_file.exists() {
+        instances.push(("(default)".to_string(), default_port_file));
+    }
+
+    if let Ok(mut entries) = tokio::fs::read_dir(&data_base).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(instance) = name_str.strip_prefix("x0x-") {
+                let port_file = entry.path().join("api.port");
+                if port_file.exists() {
+                    instances.push((instance.to_string(), port_file));
+                }
+            }
+        }
+    }
+
+    if instances.is_empty() {
+        println!("No running instances found.");
+        return Ok(());
+    }
+
+    let name_width = instances
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!("{:<name_width$}  {:<21}  {:<10}", "NAME", "API", "STATUS");
+    for (name, port_file) in &instances {
+        let addr = tokio::fs::read_to_string(port_file)
+            .await
+            .unwrap_or_default();
+        let addr = addr.trim().to_string();
+
+        let status = if !addr.is_empty() {
+            match reqwest::Client::new()
+                .get(format!("http://{addr}/health"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => "running",
+                _ => "stale",
+            }
+        } else {
+            "stale"
+        };
+        println!("{:<name_width$}  {:<21}  {:<10}", name, addr, status);
+    }
     Ok(())
 }
 

@@ -20,19 +20,36 @@ NC='\033[0m' # No Color
 
 REPO="saorsa-labs/x0x"
 RELEASE_URL="https://github.com/$REPO/releases/latest/download"
-INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
 BIN_DIR="$HOME/.local/bin"
 
-# Detect interactive mode: false when piped (curl | sh) or when -y is passed
+# Detect interactive mode and --name flag
 INTERACTIVE=true
+INSTANCE_NAME=""
 if ! [ -t 0 ]; then
     INTERACTIVE=false
 fi
-for arg in "$@"; do
+SKIP_NEXT=false
+for i in $(seq 1 $#); do
+    arg="${!i}"
+    if [ "$SKIP_NEXT" = true ]; then
+        SKIP_NEXT=false
+        continue
+    fi
     case "$arg" in
         -y|--yes) INTERACTIVE=false ;;
+        --name)
+            j=$((i + 1))
+            INSTANCE_NAME="${!j}"
+            SKIP_NEXT=true
+            ;;
     esac
 done
+
+if [ -n "$INSTANCE_NAME" ]; then
+    INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x-${INSTANCE_NAME}"
+else
+    INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
+fi
 
 echo -e "${BLUE}x0x Installation Script${NC}"
 echo -e "${BLUE}========================${NC}"
@@ -193,6 +210,19 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
+# Generate per-instance config if --name was provided
+if [ -n "$INSTANCE_NAME" ]; then
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/x0x-${INSTANCE_NAME}"
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$CONFIG_DIR/config.toml" ]; then
+        cat > "$CONFIG_DIR/config.toml" <<TOML
+# x0x instance configuration for: $INSTANCE_NAME
+instance_name = "$INSTANCE_NAME"
+TOML
+        echo -e "${GREEN}✓ Config created: $CONFIG_DIR/config.toml${NC}"
+    fi
+fi
+
 echo ""
 echo -e "${GREEN}✓ Installation complete${NC}"
 echo ""
@@ -203,13 +233,23 @@ fi
 echo ""
 echo "Next steps:"
 if [ -n "$PLATFORM" ]; then
-    echo "  1. Run x0xd:"
-    echo "       x0xd"
+    if [ -n "$INSTANCE_NAME" ]; then
+        echo "  1. Run x0xd:"
+        echo "       x0xd --name $INSTANCE_NAME"
+    else
+        echo "  1. Run x0xd:"
+        echo "       x0xd"
+    fi
     echo "     (x0xd creates your identity on first run and joins the global network)"
     echo "     (If x0xd is not found, ensure $BIN_DIR is in your PATH — see above)"
     echo ""
     echo "  2. Manage contacts:"
-    echo "       curl http://127.0.0.1:12700/contacts"
+    if [ -n "$INSTANCE_NAME" ]; then
+        echo "       # Port is auto-assigned — check the port file:"
+        echo "       cat ${XDG_DATA_HOME:-$HOME/.local/share}/x0x-${INSTANCE_NAME}/api.port"
+    else
+        echo "       curl http://127.0.0.1:12700/contacts"
+    fi
     echo ""
     echo "  3. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
     echo ""
