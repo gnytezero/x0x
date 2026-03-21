@@ -172,6 +172,30 @@ impl GossipRuntime {
             *guard = Some(peer_sync_handle);
         }
 
+        // Keepalive: send a SWIM Ping to every connected peer every 15 seconds.
+        // This prevents QUIC idle timeout (30s) from dropping direct connections
+        // that were established via auto-connect. Without this, connections with
+        // no application traffic are closed by QUIC after 30s of inactivity.
+        // See ADR-0002 for rationale.
+        let keepalive_membership = Arc::clone(&self.membership);
+        let keepalive_network = Arc::clone(&self.network);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+                let peers = keepalive_network.connected_peers().await;
+                for peer in peers {
+                    let gossip_peer = PeerId::new(peer.0);
+                    if let Err(e) = keepalive_membership.send_ping(gossip_peer).await {
+                        tracing::debug!(
+                            peer = %gossip_peer,
+                            "Keepalive ping failed: {e}"
+                        );
+                    }
+                }
+            }
+        });
+
         match self.dispatcher_handle.lock() {
             Ok(mut guard) => *guard = Some(handle),
             Err(_) => {
