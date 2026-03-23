@@ -672,7 +672,7 @@ impl Agent {
     /// Get the reachability information for a discovered agent.
     ///
     /// Returns `None` if the agent is not in the discovery cache.
-    /// Use [`Agent::discover_agent`] or wait for a heartbeat announcement
+    /// Use [`Agent::announce_identity`] or wait for a heartbeat announcement
     /// to populate the cache.
     pub async fn reachability(
         &self,

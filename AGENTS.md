@@ -60,18 +60,49 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 4. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
 5. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
 
+### Trust Model
+
+Each agent has a `ContactStore` that maps `AgentId` to `Contact`:
+- `TrustLevel`: `Blocked | Unknown | Known | Trusted`
+- `IdentityType`: `Anonymous | Known | Trusted | Pinned`
+- `machines: Vec<MachineRecord>` — tracks which machine IDs this agent has been seen on
+
+`TrustEvaluator::evaluate(&(agent_id, machine_id), &store)` → `TrustDecision`:
+- `RejectBlocked` — agent is blocked
+- `RejectMachineMismatch` — agent is pinned and this machine is not in the list
+- `Accept` — trusted or pinned to the right machine
+- `AcceptWithFlag` — known but not pinned
+- `Unknown` — not in store
+
+The identity listener applies trust evaluation to all incoming announcements.
+
+### Connectivity
+
+`ReachabilityInfo::from_discovered(&agent)` summarises NAT traversal options:
+- `likely_direct()`: safe to try a direct connection
+- `needs_coordination()`: NAT traversal coordination required
+
+`Agent::connect_to_agent(&agent_id).await` → `ConnectOutcome`:
+- `Direct(addr)` — connected directly
+- `Coordinated(addr)` — connected via NAT traversal
+- `Unreachable` — no path found
+- `NotFound` — agent not in discovery cache
+
 ### Module Dependency Flow
 
 ```
 lib.rs (Agent, AgentBuilder, TaskListHandle)
-  ├── identity.rs  ← Uses ant-quic ML-DSA-65 keypairs
-  ├── storage.rs   ← Bincode serialization to ~/.x0x/
-  ├── error.rs     ← IdentityError + NetworkError (thiserror)
-  ├── network.rs   ← Wraps ant-quic Node, implements GossipTransport
-  ├── bootstrap.rs ← Bootstrap retry logic
-  ├── gossip/      ← Wraps saorsa-gossip-* crates
-  ├── crdt/        ← TaskList, TaskItem, CheckboxState, Delta, Sync
-  └── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
+  ├── identity.rs    ← Uses ant-quic ML-DSA-65 keypairs
+  ├── storage.rs     ← Bincode serialization to ~/.x0x/
+  ├── error.rs       ← IdentityError + NetworkError (thiserror)
+  ├── network.rs     ← Wraps ant-quic Node, implements GossipTransport
+  ├── bootstrap.rs   ← Bootstrap retry logic
+  ├── contacts.rs    ← ContactStore: TrustLevel, IdentityType, MachineRecord
+  ├── trust.rs       ← TrustEvaluator: (AgentId, MachineId) → TrustDecision
+  ├── connectivity.rs ← ReachabilityInfo, ConnectOutcome
+  ├── gossip/        ← Wraps saorsa-gossip-* crates
+  ├── crdt/          ← TaskList, TaskItem, CheckboxState, Delta, Sync
+  └── mls/           ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
 ```
 
 ### Key API Surface
@@ -79,8 +110,8 @@ lib.rs (Agent, AgentBuilder, TaskListHandle)
 ```rust
 // Create agent (auto-generates keys, connects to bootstrap)
 let agent = Agent::builder()
-    .with_machine_key("/custom/path")     // optional
-    .with_agent_key(imported_keypair)      // optional
+    .with_machine_key("/custom/path")       // optional
+    .with_agent_key(imported_keypair)       // optional
     .with_user_key_path("~/.x0x/user.key") // optional, opt-in
     .build().await?;
 
@@ -89,10 +120,22 @@ let rx = agent.subscribe("topic").await?; // Gossip pub/sub
 agent.publish("topic", payload).await?;
 
 // Identity accessors
-agent.machine_id()       // MachineId
-agent.agent_id()         // AgentId
-agent.user_id()          // Option<UserId>
+agent.machine_id()        // MachineId (== ant-quic PeerId)
+agent.agent_id()          // AgentId
+agent.user_id()           // Option<UserId>
 agent.agent_certificate() // Option<&AgentCertificate>
+
+// Discovery
+agent.discovered_agents().await?          // Vec<DiscoveredAgent> (TTL-filtered)
+agent.reachability(&agent_id).await       // Option<ReachabilityInfo>
+
+// Connectivity
+agent.connect_to_agent(&agent_id).await?  // ConnectOutcome
+
+// Trust
+let store = agent.contacts().read().await;
+store.set_trust(&agent_id, TrustLevel::Trusted);
+store.pin_machine(&agent_id, &machine_id);
 ```
 
 ### Error Handling
@@ -130,11 +173,16 @@ Six workflows in `.github/workflows/`:
 
 ## Test Organization
 
-12 integration test files in `tests/`:
+16 integration test files in `tests/`:
 
 | File | Tests |
 |------|-------|
 | `identity_integration.rs` | Three-layer identity, keypair management, certificates |
+| `identity_unification_test.rs` | machine_id == ant-quic PeerId, key derivation |
+| `trust_evaluation_test.rs` | TrustEvaluator decisions, machine pinning, ContactStore |
+| `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache |
+| `connectivity_test.rs` | ReachabilityInfo heuristics, ConnectOutcome, connect_to_agent |
+| `identity_announcement_integration.rs` | Signature verification, TTL expiry, shard topics |
 | `crdt_integration.rs` | TaskList CRUD, state transitions |
 | `crdt_convergence_concurrent.rs` | Concurrent CRDT operations converging |
 | `crdt_partition_tolerance.rs` | Network partition and recovery |
@@ -145,7 +193,6 @@ Six workflows in `.github/workflows/`:
 | `comprehensive_integration.rs` | End-to-end workflows |
 | `scale_testing.rs` | Performance with many agents |
 | `presence_foaf_integration.rs` | Presence and friend-of-a-friend discovery |
-| `rendezvous_integration.rs` | Rendezvous services |
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 

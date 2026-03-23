@@ -148,13 +148,63 @@ Six workflows in `.github/workflows/`:
 - **build.yml**: PR validation
 - **sign-skill.yml**: GPG-signs `SKILL.md`
 
+## Trust Model (`contacts.rs`, `trust.rs`)
+
+Each agent maintains a `ContactStore` of known peers with:
+
+- `TrustLevel`: Blocked | Unknown | Known | Trusted
+- `IdentityType`: Anonymous | Known | Trusted | Pinned
+- `MachineRecord`: Tracks machine IDs an agent has been observed running on
+
+`TrustEvaluator` evaluates `(AgentId, MachineId)` pairs against the store:
+1. Blocked → `RejectBlocked`
+2. `Pinned` identity type + wrong machine → `RejectMachineMismatch`
+3. `Pinned` identity type + right machine → `Accept`
+4. `TrustLevel::Trusted` → `Accept`
+5. `TrustLevel::Known` → `AcceptWithFlag`
+6. Not in store → `Unknown`
+
+The identity listener applies trust evaluation to every incoming announcement. Blocked and machine-mismatched announcements are silently dropped.
+
+## Connectivity (`connectivity.rs`)
+
+`ReachabilityInfo` summarises how reachable a discovered agent is:
+- `likely_direct()`: true if `can_receive_direct: Some(true)`, or NAT type is FullCone/None/unknown, and at least one address is available
+- `needs_coordination()`: true if `can_receive_direct: Some(false)` or NAT type is Symmetric
+
+`Agent::connect_to_agent(agent_id)` strategy:
+1. Look up agent in discovery cache → `NotFound` if absent
+2. No addresses → `Unreachable`
+3. `likely_direct()` → try `network.connect_addr()` for each address → `Direct(addr)` on success
+4. `needs_coordination()` or direct failed → retry addresses, network layer handles NAT traversal → `Coordinated(addr)` on success
+5. All attempts failed → `Unreachable`
+
+Successful connections enrich the bootstrap cache via `add_from_connection()`.
+
+## Enhanced Announcements (`lib.rs`, `network.rs`)
+
+`IdentityAnnouncement` and `DiscoveredAgent` carry four optional NAT fields:
+- `nat_type: Option<String>` — e.g. "FullCone", "Symmetric", "None"
+- `can_receive_direct: Option<bool>` — whether inbound connections are accepted
+- `is_relay: Option<bool>` — whether the node is relaying for others
+- `is_coordinator: Option<bool>` — whether the node is coordinating NAT punch timing
+
+The sync `build_announcement()` leaves these as `None` (no network access). The async heartbeat queries `NetworkNode::node_status()` to populate them.
+
+**Protocol note**: These fields use bincode 1.x serialization. Old→new messages will fail to decode because bincode 1.x treats every field as required. This is a deliberate protocol version bump.
+
 ## Test Organization
 
-12 integration test files in `tests/`:
+16 integration test files in `tests/`:
 
 | File | Tests |
 |------|-------|
 | `identity_integration.rs` | Three-layer identity, keypair management, certificates |
+| `identity_unification_test.rs` | machine_id == ant-quic PeerId, announcement key derivation |
+| `trust_evaluation_test.rs` | TrustEvaluator decisions, machine pinning, ContactStore mutations |
+| `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache, reachability |
+| `connectivity_test.rs` | ReachabilityInfo heuristics, ConnectOutcome, connect_to_agent() |
+| `identity_announcement_integration.rs` | Signature verification, TTL expiry, shard topics |
 | `crdt_integration.rs` | TaskList CRUD, state transitions |
 | `crdt_convergence_concurrent.rs` | Concurrent CRDT operations converging |
 | `crdt_partition_tolerance.rs` | Network partition and recovery |
@@ -165,7 +215,6 @@ Six workflows in `.github/workflows/`:
 | `comprehensive_integration.rs` | End-to-end workflows |
 | `scale_testing.rs` | Performance with many agents |
 | `presence_foaf_integration.rs` | Presence and friend-of-a-friend discovery |
-| `rendezvous_integration.rs` | Rendezvous services |
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 
