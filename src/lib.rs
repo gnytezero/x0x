@@ -83,6 +83,12 @@ pub mod contacts;
 /// identity type and machine records to produce a [`trust::TrustDecision`].
 pub mod trust;
 
+/// Agent-to-agent connectivity helpers.
+///
+/// Provides `ReachabilityInfo` (built from a `DiscoveredAgent`) and
+/// `ConnectOutcome` for the result of `connect_to_agent()`.
+pub mod connectivity;
+
 /// Gossip overlay networking for x0x.
 pub mod gossip;
 
@@ -661,6 +667,104 @@ impl Agent {
     #[must_use]
     pub fn contacts(&self) -> &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>> {
         &self.contact_store
+    }
+
+    /// Get the reachability information for a discovered agent.
+    ///
+    /// Returns `None` if the agent is not in the discovery cache.
+    /// Use [`Agent::discover_agent`] or wait for a heartbeat announcement
+    /// to populate the cache.
+    pub async fn reachability(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<connectivity::ReachabilityInfo> {
+        let cache = self.identity_discovery_cache.read().await;
+        cache
+            .get(agent_id)
+            .map(connectivity::ReachabilityInfo::from_discovered)
+    }
+
+    /// Attempt to connect to an agent by its identity.
+    ///
+    /// Looks up the agent in the discovery cache, then tries to establish
+    /// a QUIC connection using the best available strategy:
+    ///
+    /// 1. **Direct** — if the agent reports `can_receive_direct: true` or
+    ///    has a traversable NAT type, try each known address in order.
+    /// 2. **Coordinated** — if direct fails or the agent reports a symmetric
+    ///    NAT, the outcome is `Coordinated` if any address was reachable via
+    ///    the network layer's NAT traversal.
+    /// 3. **Unreachable** — no address succeeded.
+    /// 4. **NotFound** — the agent is not in the discovery cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for internal failures (e.g. network not started).
+    /// Connectivity failures are reported as `ConnectOutcome::Unreachable`.
+    pub async fn connect_to_agent(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        // 1. Look up in discovery cache
+        let discovered = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent_id).cloned()
+        };
+
+        let agent = match discovered {
+            Some(a) => a,
+            None => return Ok(connectivity::ConnectOutcome::NotFound),
+        };
+
+        let info = connectivity::ReachabilityInfo::from_discovered(&agent);
+
+        if info.addresses.is_empty() {
+            return Ok(connectivity::ConnectOutcome::Unreachable);
+        }
+
+        let Some(ref network) = self.network else {
+            return Ok(connectivity::ConnectOutcome::Unreachable);
+        };
+
+        // 2. Try direct connection if likely to succeed
+        if info.likely_direct() {
+            for addr in &info.addresses {
+                match network.connect_addr(*addr).await {
+                    Ok(_peer_id) => {
+                        // Enrich bootstrap cache with this successful address
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            let peer_id = ant_quic::PeerId(agent.machine_id.0);
+                            bc.add_from_connection(peer_id, vec![*addr], None).await;
+                        }
+                        return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                    }
+                    Err(e) => {
+                        tracing::debug!("Direct connect to {} failed: {}", addr, e);
+                    }
+                }
+            }
+        }
+
+        // 3. If direct failed and coordination may help, try remaining addresses
+        //    The network layer handles NAT traversal internally via QUIC extension frames.
+        if info.needs_coordination() || !info.likely_direct() {
+            for addr in &info.addresses {
+                match network.connect_addr(*addr).await {
+                    Ok(_peer_id) => {
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            let peer_id = ant_quic::PeerId(agent.machine_id.0);
+                            bc.add_from_connection(peer_id, vec![*addr], None).await;
+                        }
+                        return Ok(connectivity::ConnectOutcome::Coordinated(*addr));
+                    }
+                    Err(e) => {
+                        tracing::debug!("Coordinated connect to {} failed: {}", addr, e);
+                    }
+                }
+            }
+        }
+
+        Ok(connectivity::ConnectOutcome::Unreachable)
     }
 
     /// Save the bootstrap cache and release resources.
