@@ -42,7 +42,7 @@ use x0x::network::NetworkConfig;
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::signature::verify_manifest_signature;
-use x0x::{Agent, Subscription, TaskListHandle};
+use x0x::{Agent, TaskListHandle};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -244,7 +244,7 @@ struct SseEvent {
 /// Shared state accessible from all route handlers.
 struct AppState {
     agent: Arc<Agent>,
-    subscriptions: RwLock<HashMap<String, Subscription>>,
+    subscriptions: RwLock<HashMap<String, String>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     contacts: Arc<RwLock<ContactStore>>,
     start_time: Instant,
@@ -645,6 +645,7 @@ async fn main() -> Result<()> {
         .route("/agent", get(agent_info))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
+        .route("/network/status", get(network_status))
         .route("/publish", post(publish))
         .route("/subscribe", post(subscribe))
         .route("/subscribe/:id", delete(unsubscribe))
@@ -1099,6 +1100,47 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthDa
     })
 }
 
+/// GET /network/status — NAT traversal diagnostics and connection stats.
+async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        );
+    };
+
+    let Some(status) = network.node_status().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "node not available" })),
+        );
+    };
+
+    let nat_type_str = format!("{:?}", status.nat_type);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "local_addr": status.local_addr.to_string(),
+            "external_addrs": status.external_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "nat_type": nat_type_str,
+            "has_public_ip": status.has_public_ip,
+            "can_receive_direct": status.can_receive_direct,
+            "connected_peers": status.connected_peers,
+            "direct_connections": status.direct_connections,
+            "relayed_connections": status.relayed_connections,
+            "hole_punch_success_rate": status.hole_punch_success_rate,
+            "is_relaying": status.is_relaying,
+            "relay_sessions": status.relay_sessions,
+            "is_coordinating": status.is_coordinating,
+            "coordination_sessions": status.coordination_sessions,
+            "avg_rtt_ms": status.avg_rtt.as_millis() as u64,
+            "uptime_secs": status.uptime.as_secs(),
+        })),
+    )
+}
+
 /// GET /agent
 async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<AgentData>> {
     Json(ApiResponse {
@@ -1197,6 +1239,12 @@ async fn subscribe(
             let sub_id = id.clone();
             tokio::spawn(async move {
                 while let Some(msg) = recv_sub.recv().await {
+                    tracing::info!(
+                        topic = %topic,
+                        sub_id = %sub_id,
+                        payload_len = msg.payload.len(),
+                        "[5/6 x0xd] received from subscriber channel, broadcasting to SSE"
+                    );
                     let event = SseEvent {
                         event_type: "message".to_string(),
                         data: serde_json::json!({
@@ -1208,23 +1256,25 @@ async fn subscribe(
                             "trust_level": msg.trust_level.map(|t| t.to_string()),
                         }),
                     };
-                    let _ = broadcast_tx.send(event);
+                    match broadcast_tx.send(event) {
+                        Ok(n) => tracing::info!(
+                            topic = %topic,
+                            receivers = n,
+                            "[5/6 x0xd] broadcast sent to {n} SSE receivers"
+                        ),
+                        Err(_) => tracing::warn!(
+                            topic = %topic,
+                            "[5/6 x0xd] broadcast send failed (no SSE receivers)"
+                        ),
+                    }
                 }
             });
 
-            // We've consumed the subscription in the spawned task;
-            // store a placeholder subscription for unsubscribe tracking.
-            // (The actual unsubscribe goes through PubSubManager::unsubscribe)
+            // Track the subscription ID and topic for unsubscribe.
+            // We don't create a second subscription — just record the
+            // topic so the DELETE handler can call unsubscribe().
             let mut subs = state.subscriptions.write().await;
-            // Create a new subscription for the unsubscribe path
-            match state.agent.subscribe(&req.topic).await {
-                Ok(new_sub) => {
-                    subs.insert(id.clone(), new_sub);
-                }
-                Err(_) => {
-                    // Non-fatal: the forwarding task is already running
-                }
-            }
+            subs.insert(id.clone(), req.topic.clone());
 
             (
                 StatusCode::OK,
@@ -1258,9 +1308,14 @@ async fn unsubscribe(
 async fn events_sse(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    tracing::info!("[6/6 x0xd] SSE client connected to /events");
     let rx = state.broadcast_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(event) => {
+            tracing::info!(
+                event_type = %event.event_type,
+                "[6/6 x0xd] SSE delivering event to client"
+            );
             let data = serde_json::to_string(&event).unwrap_or_default();
             Some(Ok(Event::default().event(event.event_type).data(data)))
         }

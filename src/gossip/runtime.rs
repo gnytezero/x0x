@@ -21,6 +21,7 @@ pub struct GossipRuntime {
     peer_id: PeerId,
     dispatcher_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     peer_sync_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    keepalive_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for GossipRuntime {
@@ -76,6 +77,7 @@ impl GossipRuntime {
             peer_id,
             dispatcher_handle: std::sync::Mutex::new(None),
             peer_sync_handle: std::sync::Mutex::new(None),
+            keepalive_handle: std::sync::Mutex::new(None),
         })
     }
 
@@ -128,6 +130,11 @@ impl GossipRuntime {
                 {
                     Ok((peer, stream_type, data)) => match stream_type {
                         GossipStreamType::PubSub => {
+                            tracing::info!(
+                                from = %peer,
+                                bytes = data.len(),
+                                "[2/6 runtime] dispatching PubSub message to handle_incoming"
+                            );
                             pubsub.handle_incoming(peer, data).await;
                         }
                         GossipStreamType::Membership => {
@@ -167,6 +174,34 @@ impl GossipRuntime {
             *guard = Some(peer_sync_handle);
         }
 
+        // Keepalive: send a SWIM Ping to every connected peer every 15 seconds.
+        // This prevents QUIC idle timeout (30s) from dropping direct connections
+        // that were established via auto-connect. Without this, connections with
+        // no application traffic are closed by QUIC after 30s of inactivity.
+        // See ADR-0002 for rationale.
+        let keepalive_membership = Arc::clone(&self.membership);
+        let keepalive_network = Arc::clone(&self.network);
+        let keepalive_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+                let peers = keepalive_network.connected_peers().await;
+                for peer in peers {
+                    let gossip_peer = PeerId::new(peer.0);
+                    if let Err(e) = keepalive_membership.send_ping(gossip_peer).await {
+                        tracing::debug!(
+                            peer = %gossip_peer,
+                            "Keepalive ping failed: {e}"
+                        );
+                    }
+                }
+            }
+        });
+
+        if let Ok(mut guard) = self.keepalive_handle.lock() {
+            *guard = Some(keepalive_handle);
+        }
+
         match self.dispatcher_handle.lock() {
             Ok(mut guard) => *guard = Some(handle),
             Err(_) => {
@@ -186,6 +221,11 @@ impl GossipRuntime {
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> NetworkResult<()> {
+        if let Ok(mut guard) = self.keepalive_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
         if let Ok(mut guard) = self.peer_sync_handle.lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();

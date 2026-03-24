@@ -975,8 +975,14 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
         let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let network = self.network.as_ref().map(std::sync::Arc::clone);
+        let own_agent_id = self.agent_id();
 
         tokio::spawn(async move {
+            // Track agents we've already initiated auto-connect to, preventing
+            // duplicate connection attempts from concurrent announcements.
+            let mut auto_connect_attempted = std::collections::HashSet::<identity::AgentId>::new();
+
             loop {
                 // Drain whichever subscription fires next; deduplicate by AgentId in cache.
                 let msg = tokio::select! {
@@ -1071,6 +1077,43 @@ impl Agent {
                         is_coordinator: announcement.is_coordinator,
                     },
                 );
+
+                // Auto-connect to discovered agents so pub/sub messages can route
+                // between peers that share bootstrap nodes but aren't directly connected.
+                // The gossip topology refresh (every 1s) will add the new peer to
+                // PlumTree topic trees once the QUIC connection is established.
+                if announcement.agent_id != own_agent_id
+                    && !announcement.addresses.is_empty()
+                    && !auto_connect_attempted.contains(&announcement.agent_id)
+                {
+                    if let Some(ref net) = &network {
+                        let ant_peer = ant_quic::PeerId(announcement.machine_id.0);
+                        if !net.is_connected(&ant_peer).await {
+                            auto_connect_attempted.insert(announcement.agent_id);
+                            let net = std::sync::Arc::clone(net);
+                            let addresses = announcement.addresses.clone();
+                            tokio::spawn(async move {
+                                for addr in &addresses {
+                                    match net.connect_addr(*addr).await {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                "Auto-connected to discovered agent at {addr}",
+                                            );
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!("Auto-connect to {addr} failed: {e}",);
+                                        }
+                                    }
+                                }
+                                tracing::debug!(
+                                    "Auto-connect exhausted all {} addresses for discovered agent",
+                                    addresses.len(),
+                                );
+                            });
+                        }
+                    }
+                }
             }
         });
 

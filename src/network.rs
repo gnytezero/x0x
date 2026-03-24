@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Ant-quic PeerId type alias
 type AntPeerId = ant_quic::PeerId;
@@ -212,7 +212,9 @@ impl NetworkNode {
         bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
-        let mut builder = NodeConfig::builder();
+        let mut builder = NodeConfig::builder()
+            .data_channel_capacity(1024)
+            .max_concurrent_uni_streams(10_000);
 
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
@@ -293,6 +295,13 @@ impl NetworkNode {
             .filter(|addr| !addr.ip().is_unspecified())
     }
 
+    /// Get the full node status from ant-quic, including NAT type,
+    /// external addresses, connection stats, and relay/coordinator state.
+    pub async fn node_status(&self) -> Option<ant_quic::NodeStatus> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.status().await)
+    }
+
     /// Get current network statistics.
     ///
     /// # Returns
@@ -322,16 +331,6 @@ impl NetworkNode {
             return 0;
         };
         node.status().await.connected_peers
-    }
-
-    /// Get the full node status from ant-quic.
-    ///
-    /// Returns `None` if the network node has not been started yet.
-    /// The status includes NAT type, relay capability, coordination status,
-    /// and connectivity metrics.
-    pub async fn node_status(&self) -> Option<ant_quic::NodeStatus> {
-        let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.status().await)
     }
 
     /// Subscribe to network events.
@@ -652,17 +651,17 @@ impl NetworkNode {
                         // Extract payload (everything after the type byte)
                         let payload = Bytes::copy_from_slice(&data[1..]);
 
-                        if let Err(e) = recv_tx.send((peer_id, stream_type, payload)).await {
-                            error!("Failed to forward message: {}", e);
-                            break;
-                        }
-
-                        debug!(
-                            "Forwarded {} bytes ({:?}) from peer {:?}",
+                        info!(
+                            "[1/6 network] recv: {} bytes ({:?}) from peer {:?}",
                             data.len() - 1,
                             stream_type,
                             peer_id
                         );
+
+                        if let Err(e) = recv_tx.send((peer_id, stream_type, payload)).await {
+                            error!("Failed to forward message: {}", e);
+                            break;
+                        }
                     }
                     Err(e) => {
                         debug!("Receive error: {}", e);
@@ -840,8 +839,8 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .await
             .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
 
-        debug!(
-            "Sent {} bytes ({:?}) to peer {:?}",
+        info!(
+            "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
             buf.len(),
             stream_type,
             peer

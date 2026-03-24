@@ -247,7 +247,7 @@ impl PubSubManager {
         // Plumtree registers subscribers on a spawned task; yield once so
         // immediate local publishes in the same task see this subscriber.
         tokio::task::yield_now().await;
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(10_000);
         let contacts = self.contacts.get().cloned();
 
         {
@@ -255,13 +255,29 @@ impl PubSubManager {
             *counts.entry(topic.clone()).or_insert(0) += 1;
         }
 
+        let sub_topic = topic.clone();
         tokio::spawn(async move {
             while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
+                tracing::info!(
+                    topic = %sub_topic,
+                    payload_len = encoded_payload.len(),
+                    "[4/6 pubsub] received from PlumTree, decoding"
+                );
                 let Some(message) = decode_for_delivery(encoded_payload, contacts.as_ref()).await
                 else {
+                    tracing::warn!(
+                        topic = %sub_topic,
+                        "[4/6 pubsub] decode_for_delivery returned None, skipping"
+                    );
                     continue;
                 };
+                tracing::info!(
+                    topic = %sub_topic,
+                    msg_topic = %message.topic,
+                    "[4/6 pubsub] decoded, forwarding to subscriber channel"
+                );
                 if tx.send(message).await.is_err() {
+                    tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
                     break;
                 }
             }
@@ -337,7 +353,6 @@ impl PubSubManager {
     /// for existing topics. Without this, a peer that connects after a topic
     /// is subscribed would never receive messages on that topic from this node.
     pub async fn refresh_topic_peers(&self) {
-        let topics: Vec<String> = self.topic_ref_counts.read().await.keys().cloned().collect();
         let peers: Vec<PeerId> = self
             .network
             .connected_peers()
@@ -345,9 +360,27 @@ impl PubSubManager {
             .into_iter()
             .map(|peer| PeerId::new(peer.0))
             .collect();
-        for topic in topics {
+
+        // Refresh locally subscribed topics.
+        let subscribed: Vec<String> = self.topic_ref_counts.read().await.keys().cloned().collect();
+        for topic in &subscribed {
             let topic_id = TopicId::from_entity(topic.as_bytes());
             self.plumtree.set_topic_peers(topic_id, peers.clone()).await;
+        }
+
+        // Also refresh pass-through topics (known to PlumTree but without local
+        // subscribers). Without this, nodes that relay gossip messages for topics
+        // they don't subscribe to would have empty eager sets and drop messages
+        // instead of forwarding them.
+        let all_plumtree_topics = self.plumtree.all_topic_ids().await;
+        let subscribed_ids: std::collections::HashSet<TopicId> = subscribed
+            .iter()
+            .map(|t| TopicId::from_entity(t.as_bytes()))
+            .collect();
+        for topic_id in all_plumtree_topics {
+            if !subscribed_ids.contains(&topic_id) {
+                self.plumtree.set_topic_peers(topic_id, peers.clone()).await;
+            }
         }
     }
 
