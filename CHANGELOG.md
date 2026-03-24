@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.3] - 2026-03-24
+
+### Added
+
+- **Complete SKILL.md quickstart guide** — an agent can now go from zero to a working daemon using only SKILL.md:
+  - Three install methods (curl script, from source, as library)
+  - Daemon startup, first-run behavior, key generation explained
+  - "Verify it's working" 3-step flow
+  - "Your first message" pub/sub walkthrough
+  - Full CLI reference (all flags)
+  - TOML config reference (all options with defaults)
+  - Storage locations for all persisted state
+  - Error response format with HTTP status code examples
+  - MLS group encryption curl examples (create, add member, encrypt, decrypt)
+
 ## [v0.5.2] - 2026-03-24
 
 ### Fixed
