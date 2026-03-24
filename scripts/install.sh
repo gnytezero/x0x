@@ -5,9 +5,11 @@
 # Non-interactive mode (piped or -y flag): uses safe defaults, never blocks.
 #
 # Examples:
-#   curl -sfL https://x0x.md | sh            # non-interactive (piped)
-#   bash install.sh                           # interactive
-#   bash install.sh -y                        # non-interactive (explicit)
+#   curl -sfL https://x0x.md | sh                        # non-interactive (piped)
+#   bash install.sh                                       # interactive
+#   bash install.sh -y                                    # non-interactive (explicit)
+#   bash install.sh --start --health                      # install, start daemon, wait for healthy
+#   curl -sfL https://x0x.md | bash -s -- --start --health  # one-liner: install + run + verify
 
 set -euo pipefail
 
@@ -22,9 +24,11 @@ REPO="saorsa-labs/x0x"
 RELEASE_URL="https://github.com/$REPO/releases/latest/download"
 BIN_DIR="$HOME/.local/bin"
 
-# Detect interactive mode and --name flag
+# Detect interactive mode and flags
 INTERACTIVE=true
 INSTANCE_NAME=""
+START_DAEMON=false
+WAIT_HEALTH=false
 if ! [ -t 0 ]; then
     INTERACTIVE=false
 fi
@@ -37,6 +41,8 @@ for i in $(seq 1 $#); do
     fi
     case "$arg" in
         -y|--yes) INTERACTIVE=false ;;
+        --start) START_DAEMON=true ;;
+        --health) WAIT_HEALTH=true ;;
         --name)
             j=$((i + 1))
             INSTANCE_NAME="${!j}"
@@ -45,10 +51,16 @@ for i in $(seq 1 $#); do
     esac
 done
 
+# Determine data directory (must match x0xd's `dirs::data_dir()` behavior)
+case "$(uname -s)" in
+    Darwin) DATA_BASE="${XDG_DATA_HOME:-$HOME/Library/Application Support}" ;;
+    *)      DATA_BASE="${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+esac
+
 if [ -n "$INSTANCE_NAME" ]; then
-    INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x-${INSTANCE_NAME}"
+    INSTALL_DIR="${DATA_BASE}/x0x-${INSTANCE_NAME}"
 else
-    INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
+    INSTALL_DIR="${DATA_BASE}/x0x"
 fi
 
 echo -e "${BLUE}x0x Installation Script${NC}"
@@ -230,9 +242,100 @@ echo "SKILL.md installed to: $INSTALL_DIR/SKILL.md"
 if [ -n "$PLATFORM" ]; then
     echo "x0xd installed to:     $BIN_DIR/x0xd"
 fi
+
+# ── Start daemon if --start was passed ────────────────────────────────────────
+
+if [ "$START_DAEMON" = true ] && [ -n "$PLATFORM" ]; then
+    echo ""
+
+    # Resolve the x0xd binary path
+    X0XD_BIN=""
+    if command -v x0xd &> /dev/null; then
+        X0XD_BIN="x0xd"
+    elif [ -x "$BIN_DIR/x0xd" ]; then
+        X0XD_BIN="$BIN_DIR/x0xd"
+    fi
+
+    if [ -z "$X0XD_BIN" ]; then
+        echo -e "${RED}✗ Cannot start daemon: x0xd not found in PATH or $BIN_DIR${NC}"
+        echo "  Add $BIN_DIR to your PATH and try again."
+    else
+        # Build the command
+        X0XD_CMD="$X0XD_BIN"
+        if [ -n "$INSTANCE_NAME" ]; then
+            X0XD_CMD="$X0XD_BIN --name $INSTANCE_NAME"
+        fi
+
+        echo "Starting daemon: $X0XD_CMD"
+        # Start in background with nohup so it survives the install script exiting
+        X0XD_LOG="$INSTALL_DIR/x0xd.log"
+        nohup $X0XD_CMD >> "$X0XD_LOG" 2>&1 &
+        X0XD_PID=$!
+        echo -e "${GREEN}✓ x0xd started (PID $X0XD_PID, log: $X0XD_LOG)${NC}"
+
+        # ── Wait for health if --health was passed ────────────────────────────
+
+        if [ "$WAIT_HEALTH" = true ]; then
+            # Determine the API address to poll
+            if [ -n "$INSTANCE_NAME" ]; then
+                # Named instances use a random port — wait for the port file
+                PORT_FILE="$INSTALL_DIR/api.port"
+                echo "Waiting for port file ($PORT_FILE)..."
+                HEALTH_TIMEOUT=30
+                ELAPSED=0
+                while [ ! -f "$PORT_FILE" ] && [ $ELAPSED -lt $HEALTH_TIMEOUT ]; do
+                    sleep 1
+                    ELAPSED=$((ELAPSED + 1))
+                done
+                if [ -f "$PORT_FILE" ]; then
+                    API_ADDR=$(cat "$PORT_FILE")
+                else
+                    echo -e "${RED}✗ Timed out waiting for port file after ${HEALTH_TIMEOUT}s${NC}"
+                    echo "  Check logs: cat $X0XD_LOG"
+                    API_ADDR=""
+                fi
+            else
+                API_ADDR="127.0.0.1:12700"
+                sleep 2  # give it a moment to start
+            fi
+
+            if [ -n "$API_ADDR" ]; then
+                echo "Waiting for health at http://${API_ADDR}/health ..."
+                HEALTH_TIMEOUT=30
+                ELAPSED=0
+                HEALTHY=false
+                while [ $ELAPSED -lt $HEALTH_TIMEOUT ]; do
+                    if curl -sf "http://${API_ADDR}/health" > /dev/null 2>&1; then
+                        HEALTHY=true
+                        break
+                    fi
+                    sleep 1
+                    ELAPSED=$((ELAPSED + 1))
+                done
+
+                if [ "$HEALTHY" = true ]; then
+                    HEALTH_JSON=$(curl -sf "http://${API_ADDR}/health" 2>/dev/null)
+                    echo -e "${GREEN}✓ Daemon is healthy${NC}"
+                    echo "  $HEALTH_JSON"
+                    echo ""
+                    echo "API: http://${API_ADDR}"
+                else
+                    echo -e "${RED}✗ Timed out waiting for healthy daemon after ${HEALTH_TIMEOUT}s${NC}"
+                    echo "  Check logs: cat $X0XD_LOG"
+                fi
+            fi
+        fi
+    fi
+elif [ "$START_DAEMON" = true ] && [ -z "$PLATFORM" ]; then
+    echo ""
+    echo -e "${YELLOW}⚠ --start ignored: no daemon binary was installed for this platform${NC}"
+fi
+
+# ── Next steps ────────────────────────────────────────────────────────────────
+
 echo ""
-echo "Next steps:"
-if [ -n "$PLATFORM" ]; then
+if [ "$START_DAEMON" != true ] && [ -n "$PLATFORM" ]; then
+    echo "Next steps:"
     if [ -n "$INSTANCE_NAME" ]; then
         echo "  1. Run x0xd:"
         echo "       x0xd --name $INSTANCE_NAME"
@@ -246,7 +349,7 @@ if [ -n "$PLATFORM" ]; then
     echo "  2. Manage contacts:"
     if [ -n "$INSTANCE_NAME" ]; then
         echo "       # Port is auto-assigned — check the port file:"
-        echo "       cat ${XDG_DATA_HOME:-$HOME/.local/share}/x0x-${INSTANCE_NAME}/api.port"
+        echo "       cat $INSTALL_DIR/api.port"
     else
         echo "       curl http://127.0.0.1:12700/contacts"
     fi
@@ -254,13 +357,16 @@ if [ -n "$PLATFORM" ]; then
     echo "  3. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
     echo ""
     echo "  4. Install SDK:"
-else
+elif [ -z "$PLATFORM" ]; then
+    echo "Next steps:"
     echo "  1. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
     echo ""
     echo "  2. Install SDK:"
 fi
-echo "     - Rust:       cargo add x0x"
-echo "     - TypeScript: npm install x0x"
-echo "     - Python:     pip install agent-x0x"
+if [ "$START_DAEMON" != true ] || [ -z "$PLATFORM" ]; then
+    echo "     - Rust:       cargo add x0x"
+    echo "     - TypeScript: npm install x0x"
+    echo "     - Python:     pip install agent-x0x"
+fi
 echo ""
 echo "Learn more: https://github.com/$REPO"
