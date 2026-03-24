@@ -255,6 +255,7 @@ struct AppState {
     subscriptions: RwLock<HashMap<String, String>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     contacts: Arc<RwLock<ContactStore>>,
+    api_address: SocketAddr,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
 }
@@ -385,6 +386,19 @@ struct HealthData {
     uptime_secs: u64,
 }
 
+/// Rich runtime status response.
+#[derive(Debug, Serialize)]
+struct StatusData {
+    status: String,
+    version: String,
+    uptime_secs: u64,
+    api_address: String,
+    external_addrs: Vec<String>,
+    agent_id: String,
+    peers: usize,
+    warnings: Vec<String>,
+}
+
 /// Agent identity response.
 #[derive(Debug, Serialize)]
 struct AgentData {
@@ -449,6 +463,7 @@ async fn main() -> Result<()> {
     let check_only = args.contains(&"--check".to_string());
     let check_updates_only = args.contains(&"--check-updates".to_string());
     let skip_update_check = args.contains(&"--skip-update-check".to_string());
+    let doctor_mode = args.iter().any(|arg| arg == "doctor" || arg == "--doctor");
 
     // Parse --name for multi-instance support
     let instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
@@ -505,6 +520,10 @@ async fn main() -> Result<()> {
     }
 
     init_logging(&config.log_level, &config.log_format)?;
+
+    if doctor_mode {
+        return run_doctor(&config).await;
+    }
 
     if check_only {
         println!("Configuration is valid");
@@ -636,6 +655,7 @@ async fn main() -> Result<()> {
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         contacts,
+        api_address: config.api_address,
         start_time: Instant::now(),
         broadcast_tx,
     });
@@ -725,6 +745,7 @@ async fn main() -> Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/agent", get(agent_info))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
@@ -863,6 +884,132 @@ async fn list_instances() -> Result<()> {
 async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
     tracing::info!("Received shutdown signal");
+}
+
+// ---------------------------------------------------------------------------
+// Doctor — local/runtime diagnostics
+// ---------------------------------------------------------------------------
+
+async fn run_doctor(config: &DaemonConfig) -> Result<()> {
+    let mut warnings = 0usize;
+    let mut failures = 0usize;
+
+    let print_pass = |msg: &str| println!("PASS  {msg}");
+    let mut print_warn = |msg: &str| {
+        warnings += 1;
+        println!("WARN  {msg}");
+    };
+    let mut print_fail = |msg: &str| {
+        failures += 1;
+        println!("FAIL  {msg}");
+    };
+
+    println!("x0xd doctor");
+    println!("-----------");
+
+    // Binary location
+    match std::env::current_exe() {
+        Ok(path) => print_pass(&format!("binary: {}", path.display())),
+        Err(err) => print_warn(&format!("could not determine binary path: {err}")),
+    }
+
+    // PATH check
+    let in_path = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("x0xd").exists()))
+        .unwrap_or(false);
+    if in_path {
+        print_pass("x0xd found on PATH");
+    } else {
+        print_warn("x0xd not found on PATH");
+    }
+
+    print_pass("configuration loaded");
+
+    // Probe daemon endpoints
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let base = format!("http://{}", config.api_address);
+    let mut daemon_reachable = false;
+
+    match client.get(format!("{base}/health")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            daemon_reachable = true;
+            print_pass(&format!("daemon reachable at {}", config.api_address));
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) if body.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
+                    print_pass("/health ok=true");
+                }
+                Ok(body) => print_warn(&format!("/health unexpected payload: {body}")),
+                Err(err) => print_warn(&format!("/health invalid JSON: {err}")),
+            }
+        }
+        Ok(resp) => print_warn(&format!("/health HTTP {}", resp.status())),
+        Err(err) => print_warn(&format!("daemon not reachable at {}: {err}", config.api_address)),
+    }
+
+    if daemon_reachable {
+        // /agent check
+        if let Ok(resp) = client.get(format!("{base}/agent")).send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let has_id = body
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|v| !v.is_empty());
+                    if has_id {
+                        print_pass("/agent returned agent_id");
+                    } else {
+                        print_warn("/agent response missing agent_id");
+                    }
+                }
+            }
+        }
+
+        // /status check
+        if let Ok(resp) = client.get(format!("{base}/status")).send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let state = body
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    print_pass(&format!("/status connectivity: {state}"));
+                }
+            }
+        }
+    } else {
+        // Check if port is free (daemon not running) or blocked (conflict)
+        match tokio::net::TcpListener::bind(config.api_address).await {
+            Ok(listener) => {
+                drop(listener);
+                print_warn(&format!(
+                    "daemon not running (port {} is free)",
+                    config.api_address.port()
+                ));
+            }
+            Err(err) => {
+                print_fail(&format!(
+                    "port {} in use by another process: {err}",
+                    config.api_address.port()
+                ));
+            }
+        }
+    }
+
+    println!("-----------");
+    if failures > 0 {
+        println!("FAIL  {failures} failure(s), {warnings} warning(s)");
+        anyhow::bail!("doctor detected failures")
+    } else if warnings > 0 {
+        println!("WARN  {warnings} warning(s)");
+        Ok(())
+    } else {
+        println!("PASS  all checks passed");
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,6 +1411,53 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthDa
             version: x0x::VERSION.to_string(),
             peers,
             uptime_secs: state.start_time.elapsed().as_secs(),
+        },
+    })
+}
+
+/// GET /status — rich runtime status with connectivity state machine.
+async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusData>> {
+    let uptime_secs = state.start_time.elapsed().as_secs();
+    let mut warnings = Vec::new();
+
+    let peers = match state.agent.peers().await {
+        Ok(peer_list) => peer_list.len(),
+        Err(err) => {
+            warnings.push(format!("failed to query peers: {err}"));
+            0
+        }
+    };
+
+    // Get external addresses from ant-quic's NodeStatus (what peers see us as).
+    let mut external_addrs = Vec::new();
+    if let Some(network) = state.agent.network() {
+        if let Some(ns) = network.node_status().await {
+            external_addrs = ns.external_addrs.iter().map(|a| a.to_string()).collect();
+        }
+    }
+
+    let connectivity = if !warnings.is_empty() {
+        "degraded"
+    } else if peers > 0 {
+        "connected"
+    } else if uptime_secs < 45 {
+        "connecting"
+    } else {
+        "isolated"
+    }
+    .to_string();
+
+    Json(ApiResponse {
+        ok: true,
+        data: StatusData {
+            status: connectivity,
+            version: x0x::VERSION.to_string(),
+            uptime_secs,
+            api_address: state.api_address.to_string(),
+            external_addrs,
+            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            peers,
+            warnings,
         },
     })
 }
