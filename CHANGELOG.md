@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.6.0] - 2026-03-24
+
+### Added
+
+- **WebSocket support** — bidirectional real-time communication for multi-app sessions:
+  - `GET /ws` — general purpose WebSocket (subscribe, publish, send_direct, ping)
+  - `GET /ws/direct` — WebSocket with auto-subscribe to direct messages
+  - `GET /ws/sessions` — list active sessions with shared subscription stats
+  - Session management with UUID IDs, per-session topic tracking
+  - Trust check on WebSocket send_direct (matches REST behavior)
+  - 30s server-side keepalive ping
+
+- **Shared subscription fan-out** — multiple WebSocket clients subscribing to the same topic share a single gossip subscription (1 forwarder, 1 broadcast channel) instead of creating N independent subscriptions. Subscription resources are cleaned up when the last session leaves a topic.
+
+- **OpenClaw install array** in SKILL.md — 7 install declarations (5 platform binaries + node + uv) for ClawHub auto-install.
+
+- **agent.json updated to v0.6.0** — added direct-messaging capability, daemon endpoint, 3 new tags.
+
+### Changed
+
+- **SKILL.md restructured** — 913 lines → 343 lines (~1601 tokens). Full API reference, vision, security, diagnostics, ecosystem, SDK docs moved to `docs/`. WebSocket protocol documented.
+
+- **6 new reference docs** — `docs/api-reference.md`, `docs/vision.md`, `docs/security.md`, `docs/diagnostics.md`, `docs/ecosystem.md`, `docs/sdk-quickstart.md`. All linked via GitHub URLs.
+
+- **`docs/api.md` updated** — comprehensive 36+ endpoint reference with WebSocket protocol, replacing old stub table.
+
 ## [v0.5.5] - 2026-03-24
 
 ### Added

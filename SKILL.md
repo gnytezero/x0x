@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.5.5
+version: 0.6.0
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -208,6 +208,40 @@ curl -X POST http://127.0.0.1:12700/mls/groups/GROUP_ID/encrypt \
   -H "Content-Type: application/json" \
   -d '{"payload": "'$(echo -n "secret" | base64)'"}'
 ```
+
+### WebSocket (Bidirectional)
+
+For real-time bidirectional communication, use WebSocket instead of REST+SSE:
+
+```bash
+# Connect (general purpose)
+wscat -c ws://127.0.0.1:12700/ws
+
+# Connect with auto-subscribe to direct messages
+wscat -c ws://127.0.0.1:12700/ws/direct
+
+# Check active sessions
+curl http://127.0.0.1:12700/ws/sessions
+```
+
+**Client → Server:**
+```json
+{"type": "subscribe", "topics": ["updates"]}
+{"type": "publish", "topic": "updates", "payload": "base64..."}
+{"type": "send_direct", "agent_id": "hex...", "payload": "base64..."}
+{"type": "ping"}
+```
+
+**Server → Client:**
+```json
+{"type": "connected", "session_id": "uuid", "agent_id": "hex..."}
+{"type": "message", "topic": "...", "payload": "base64...", "origin": "hex..."}
+{"type": "direct_message", "sender": "hex...", "payload": "base64..."}
+{"type": "subscribed", "topics": ["updates"]}
+{"type": "pong"}
+```
+
+Shared fan-out: multiple WebSocket sessions subscribing to the same topic share a single gossip subscription.
 
 ### Trust Management
 

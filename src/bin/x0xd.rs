@@ -260,6 +260,8 @@ struct AppState {
     mls_groups_path: PathBuf,
     /// Active WebSocket sessions.
     ws_sessions: RwLock<HashMap<String, WsSession>>,
+    /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).
+    ws_topics: RwLock<HashMap<String, SharedTopicState>>,
     api_address: SocketAddr,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
@@ -277,11 +279,18 @@ struct WsSession {
     subscribed_topics: HashSet<String>,
     /// Whether this session receives direct messages.
     receives_direct: bool,
-    /// Channel to send events to this session's writer task.
-    #[allow(dead_code)] // Used in Phase 3 fan-out routing
-    tx: mpsc::UnboundedSender<WsOutbound>,
-    /// Handles for spawned subscription forwarder tasks (aborted on cleanup).
+    /// Handles for spawned per-session forwarder tasks (aborted on cleanup).
     forwarder_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Shared state for a single gossip topic subscription shared across WS sessions.
+struct SharedTopicState {
+    /// Broadcast channel that all WS sessions for this topic tap.
+    channel: broadcast::Sender<WsOutbound>,
+    /// Session IDs currently subscribed to this topic.
+    subscribers: HashSet<String>,
+    /// Gossip forwarder task handle (aborted when last subscriber leaves).
+    forwarder: tokio::task::JoinHandle<()>,
 }
 
 /// Server → Client WebSocket message.
@@ -807,6 +816,7 @@ async fn main() -> Result<()> {
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
         ws_sessions: RwLock::new(HashMap::new()),
+        ws_topics: RwLock::new(HashMap::new()),
         api_address: config.api_address,
         start_time: Instant::now(),
         broadcast_tx,
@@ -3064,9 +3074,21 @@ async fn ws_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             })
         })
         .collect();
+
+    // Shared subscription stats
+    let topics = state.ws_topics.read().await;
+    let shared: HashMap<&str, usize> = topics
+        .iter()
+        .map(|(topic, ts)| (topic.as_str(), ts.subscribers.len()))
+        .collect();
+
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "sessions": entries })),
+        Json(serde_json::json!({
+            "ok": true,
+            "sessions": entries,
+            "shared_subscriptions": shared
+        })),
     )
 }
 
@@ -3088,7 +3110,6 @@ async fn handle_ws_connection(
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
-        tx: outbound_tx.clone(),
         forwarder_handles: Vec::new(),
     };
     state
@@ -3167,12 +3188,22 @@ async fn handle_ws_connection(
         }
     }
 
-    // Cleanup: remove session, abort all tasks (forwarders, writer, keepalive, direct)
-    if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
-        for h in session.forwarder_handles {
-            h.abort();
-        }
+    // Cleanup: remove session, abort per-session forwarders
+    let subscribed_topics =
+        if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
+            for h in session.forwarder_handles {
+                h.abort();
+            }
+            session.subscribed_topics
+        } else {
+            HashSet::new()
+        };
+
+    // Clean up shared subscriptions for topics where this was the last WS subscriber
+    for topic in &subscribed_topics {
+        cleanup_ws_topic_if_empty(&state, topic, &session_id).await;
     }
+
     writer.abort();
     keepalive.abort();
     if let Some(h) = direct_handle {
@@ -3180,6 +3211,26 @@ async fn handle_ws_connection(
     }
 
     tracing::info!(session_id = %session_id, "WebSocket session closed");
+}
+
+/// Remove a session from a shared topic subscription; clean up if last subscriber.
+async fn cleanup_ws_topic_if_empty(state: &AppState, topic: &str, session_id: &str) {
+    let mut ws_topics = state.ws_topics.write().await;
+    let should_remove = if let Some(ts) = ws_topics.get_mut(topic) {
+        ts.subscribers.remove(session_id);
+        ts.subscribers.is_empty()
+    } else {
+        false
+    };
+    if should_remove {
+        if let Some(ts) = ws_topics.remove(topic) {
+            ts.forwarder.abort();
+            tracing::debug!(
+                topic,
+                "Cleaned up shared WS subscription (last subscriber left)"
+            );
+        }
+    }
 }
 
 /// Dispatch an inbound WebSocket JSON command.
@@ -3205,30 +3256,74 @@ async fn handle_ws_command(
         }
 
         WsInbound::Subscribe { topics } => {
-            // Subscribe to each topic and spawn a forwarder, tracking handles
+            // Shared fan-out: one gossip subscription per topic, broadcast to all WS sessions
             let mut handles = Vec::new();
             for topic in &topics {
-                if let Ok(mut sub) = state.agent.subscribe(topic).await {
-                    let tx_clone = tx.clone();
-                    let topic_clone = topic.clone();
-                    let handle = tokio::spawn(async move {
-                        while let Some(msg) = sub.recv().await {
-                            let out = WsOutbound::Message {
-                                topic: topic_clone.clone(),
-                                payload: base64::engine::general_purpose::STANDARD
-                                    .encode(&msg.payload),
-                                origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
+                let broadcast_rx = {
+                    let mut ws_topics = state.ws_topics.write().await;
+                    if let Some(ts) = ws_topics.get_mut(topic) {
+                        // Existing shared channel — just subscribe and track
+                        ts.subscribers.insert(session_id.to_string());
+                        ts.channel.subscribe()
+                    } else {
+                        // First WS subscriber — create gossip sub + broadcast + forwarder
+                        let (broadcast_tx, broadcast_rx) = broadcast::channel::<WsOutbound>(256);
+                        let mut subscribers = HashSet::new();
+                        subscribers.insert(session_id.to_string());
+
+                        let forwarder =
+                            if let Ok(mut gossip_sub) = state.agent.subscribe(topic).await {
+                                let btx = broadcast_tx.clone();
+                                let topic_clone = topic.clone();
+                                tokio::spawn(async move {
+                                    while let Some(msg) = gossip_sub.recv().await {
+                                        let out = WsOutbound::Message {
+                                            topic: topic_clone.clone(),
+                                            payload: base64::engine::general_purpose::STANDARD
+                                                .encode(&msg.payload),
+                                            origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
+                                        };
+                                        let _ = btx.send(out);
+                                    }
+                                })
+                            } else {
+                                tokio::spawn(async {}) // no-op if subscribe failed
                             };
-                            if tx_clone.send(out).is_err() {
-                                break;
+
+                        ws_topics.insert(
+                            topic.clone(),
+                            SharedTopicState {
+                                channel: broadcast_tx,
+                                subscribers,
+                                forwarder,
+                            },
+                        );
+                        broadcast_rx
+                    }
+                };
+
+                // Per-session forwarder: broadcast channel → session outbound
+                let tx_clone = tx.clone();
+                let handle = tokio::spawn(async move {
+                    let mut rx = broadcast_rx;
+                    loop {
+                        match rx.recv().await {
+                            Ok(msg) => {
+                                if tx_clone.send(msg).is_err() {
+                                    break;
+                                }
                             }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("WS session lagged, skipped {n} messages");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
-                    });
-                    handles.push(handle);
-                }
+                    }
+                });
+                handles.push(handle);
             }
 
-            // Track in session state
+            // Store handles in session for cleanup
             if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
                 session.subscribed_topics.extend(topics.iter().cloned());
                 session.forwarder_handles.extend(handles);
@@ -3242,6 +3337,9 @@ async fn handle_ws_command(
                 for t in &topics {
                     session.subscribed_topics.remove(t);
                 }
+            }
+            for topic in &topics {
+                cleanup_ws_topic_if_empty(state, topic, session_id).await;
             }
             let _ = tx.send(WsOutbound::Unsubscribed { topics });
         }
