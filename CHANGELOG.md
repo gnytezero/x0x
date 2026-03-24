@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.2] - 2026-03-24
+
+### Fixed
+
+- **Documentation audit** — all 36 x0xd REST endpoints now documented in SKILL.md API reference (was missing MLS group endpoints and machine management endpoints)
+- **Stale "Incomplete APIs" notes removed** — CLAUDE.md and AGENTS.md no longer claim `create_task_list()` is unimplemented (it has been fully wired since v0.4.0)
+
 ## [v0.5.1] - 2026-03-24
 
 ### Added
