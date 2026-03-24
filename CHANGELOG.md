@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.4] - 2026-03-24
+
+### Fixed
+
+- **MLS group persistence** — switched from JSON to bincode format. JSON serialization failed because `MlsGroup.members` uses `HashMap<AgentId, ...>` and JSON requires string keys. Bincode handles byte-array keys natively. Groups now correctly survive daemon restarts.
+
+- **Storage path documentation** — SKILL.md now shows correct platform-specific paths (macOS: `~/Library/Application Support/x0x/`, Linux: `~/.local/share/x0x/`).
+
+- **Install script URL** — fixed from `https://x0x.md/install.sh` to `https://x0x.md` (the domain serves the script at the root).
+
+- **Install method references** — SKILL.md now references all three install scripts (`install.sh`, `install.ps1`, `install.py`) and links to `docs/install.md`.
+
 ## [v0.5.3] - 2026-03-24
 
 ### Added

@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. No servers, no intermediaries, no controllers. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.5.3
+version: 0.5.4
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -510,10 +510,16 @@ x0x is not just a library — it's a daemon (`x0xd`) that creates a persistent s
 ### Step 1: Install
 
 ```bash
-# Option A: Quick install script (downloads, verifies GPG signature, installs binary)
-curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
-# Or from the repo directly:
+# Option A: Quick install (Unix/macOS) — downloads binary, verifies GPG signature
+curl -sfL https://x0x.md | bash -s -- --start --health
+# Or from the cloned repo:
 bash scripts/install.sh --start --health
+
+# Option A2: PowerShell (Windows)
+# scripts/install.ps1
+
+# Option A3: Python installer (cross-platform)
+# python3 scripts/install.py
 
 # Option B: Build from source
 git clone https://github.com/saorsa-labs/x0x.git
@@ -527,6 +533,8 @@ cargo add x0x          # Rust
 npm install x0x        # Node.js
 pip install agent-x0x  # Python
 ```
+
+Detailed installation docs: [`docs/install.md`](docs/install.md) in the repository, or the install script source: [`scripts/install.sh`](scripts/install.sh).
 
 ### Step 2: Start the Daemon
 
@@ -622,16 +630,21 @@ rollout_window_minutes = 1440         # Stagger updates over 24 hours
 ### Storage Locations
 
 ```
-~/.local/share/x0x/
+<data_dir>/
   machine.key          # ML-DSA-65 machine keypair (auto-generated)
   agent.key            # ML-DSA-65 agent keypair (auto-generated)
   contacts.json        # Trust/contact store
-  mls_groups.json      # MLS group state (persisted)
+  mls_groups.bin       # MLS group state (persisted, bincode format)
   peer_cache/          # Bootstrap peer quality cache
   api.port             # Running instance discovery file
 ```
 
-Named instances use `~/.local/share/x0x-<name>/` instead.
+**Default `<data_dir>` by platform:**
+- **Linux**: `~/.local/share/x0x/`
+- **macOS**: `~/Library/Application Support/x0x/`
+- **Windows**: `C:\Users\<user>\AppData\Roaming\x0x\`
+
+Named instances use `<data_dir>-<name>/` instead (e.g. `~/.local/share/x0x-alice/` on Linux).
 
 ### From Package Managers (library usage, no daemon)
 

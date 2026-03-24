@@ -702,24 +702,22 @@ async fn main() -> Result<()> {
     );
 
     // Load MLS groups from disk (if any)
-    let mls_groups_path = config.data_dir.join("mls_groups.json");
-    let mls_groups = match tokio::fs::read_to_string(&mls_groups_path).await {
-        Ok(content) => {
-            match serde_json::from_str::<HashMap<String, x0x::mls::MlsGroup>>(&content) {
-                Ok(groups) => {
-                    tracing::info!(
-                        "Loaded {} MLS groups from {}",
-                        groups.len(),
-                        mls_groups_path.display()
-                    );
-                    groups
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse MLS groups file, starting fresh: {e}");
-                    HashMap::new()
-                }
+    let mls_groups_path = config.data_dir.join("mls_groups.bin");
+    let mls_groups = match tokio::fs::read(&mls_groups_path).await {
+        Ok(bytes) => match bincode::deserialize::<HashMap<String, x0x::mls::MlsGroup>>(&bytes) {
+            Ok(groups) => {
+                tracing::info!(
+                    "Loaded {} MLS groups from {}",
+                    groups.len(),
+                    mls_groups_path.display()
+                );
+                groups
             }
-        }
+            Err(e) => {
+                tracing::warn!("Failed to parse MLS groups file, starting fresh: {e}");
+                HashMap::new()
+            }
+        },
         Err(_) => {
             tracing::info!("No MLS groups file found, starting fresh");
             HashMap::new()
@@ -2640,7 +2638,7 @@ async fn direct_events_sse(
 // ---------------------------------------------------------------------------
 // MLS group encryption handlers
 //
-// NOTE: Groups are persisted to <data_dir>/mls_groups.json on every
+// NOTE: Groups are persisted to <data_dir>/mls_groups.bin on every
 // mutation (create, add/remove member). Loaded on startup.
 //
 // NOTE: Group operations have no ownership model — any caller on the local
@@ -2962,12 +2960,12 @@ async fn mls_decrypt(
 // Shared helpers for new endpoints
 // ---------------------------------------------------------------------------
 
-/// Persist MLS groups to disk.
+/// Persist MLS groups to disk (bincode format — handles non-string map keys).
 async fn save_mls_groups(state: &AppState) {
     let groups = state.mls_groups.read().await;
-    match serde_json::to_string_pretty(&*groups) {
-        Ok(json) => {
-            if let Err(e) = tokio::fs::write(&state.mls_groups_path, json).await {
+    match bincode::serialize(&*groups) {
+        Ok(bytes) => {
+            if let Err(e) = tokio::fs::write(&state.mls_groups_path, bytes).await {
                 tracing::error!("Failed to save MLS groups: {e}");
             }
         }
