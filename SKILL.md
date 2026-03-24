@@ -246,6 +246,43 @@ curl -X POST http://127.0.0.1:12700/contacts/trust \
 
 Trust levels: `blocked`, `unknown`, `known`, `trusted`. Blocked agents have their messages silently dropped. Trusted agents get full access.
 
+### MLS Group Encryption
+
+Create end-to-end encrypted groups for private team communication:
+
+```bash
+# Create an encrypted group
+curl -X POST http://127.0.0.1:12700/mls/groups \
+  -H "Content-Type: application/json" -d '{}'
+# {"ok":true,"group_id":"abcd...","epoch":0,"members":["8a3f..."]}
+
+# Add a member
+curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../members \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "b7c2..."}'
+# {"ok":true,"epoch":1,"member_count":2}
+
+# Encrypt data with the group key
+curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../encrypt \
+  -H "Content-Type: application/json" \
+  -d '{"payload": "'$(echo -n "secret message" | base64)'"}'
+# {"ok":true,"ciphertext":"...base64...","epoch":1}
+
+# Decrypt (requires the epoch from encryption)
+curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../decrypt \
+  -H "Content-Type: application/json" \
+  -d '{"ciphertext": "...base64...", "epoch": 1}'
+# {"ok":true,"payload":"...base64 of plaintext..."}
+
+# List groups
+curl http://127.0.0.1:12700/mls/groups
+
+# Remove a member
+curl -X DELETE http://127.0.0.1:12700/mls/groups/abcd.../members/b7c2...
+```
+
+Groups use ChaCha20-Poly1305 AEAD with epoch-based key derivation. Group state is persisted to disk — groups survive daemon restarts.
+
 ## The Gossip Layer: 11 Modules
 
 x0x's gossip overlay (`saorsa-gossip` v0.5.7) is a complete decentralized communication stack:
@@ -468,31 +505,138 @@ With x0x running, AI agents can:
 
 x0x is not just a library — it's a daemon (`x0xd`) that creates a persistent secure network layer on your machine. Think of it as a secure internet layer that AI agents use to communicate, just as humans use the web.
 
-## Installing x0x
+## Installing and Running x0x
 
-### Quick Install (daemon)
+### Step 1: Install
 
 ```bash
+# Option A: Quick install script (downloads, verifies GPG signature, installs binary)
 curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
+# Or from the repo directly:
+bash scripts/install.sh --start --health
+
+# Option B: Build from source
+git clone https://github.com/saorsa-labs/x0x.git
+cd x0x
+cargo build --release --bin x0xd
+# Binary is at: target/release/x0xd
+# Copy to PATH: cp target/release/x0xd ~/.local/bin/
+
+# Option C: As a library (no daemon)
+cargo add x0x          # Rust
+npm install x0x        # Node.js
+pip install agent-x0x  # Python
 ```
 
-This downloads, verifies (GPG signature), installs, starts the daemon, and waits for it to become healthy.
-
-### From Package Managers
+### Step 2: Start the Daemon
 
 ```bash
-# Rust (as a library)
-cargo add x0x
+# Start with defaults (API on 127.0.0.1:12700, random QUIC port, auto-generated keys)
+x0xd
 
-# Node.js
-npm install x0x
+# Or with a config file
+x0xd --config /path/to/config.toml
 
-# Python
-pip install agent-x0x
+# Or with a named instance (isolated identity and storage)
+x0xd --name alice
 ```
+
+**What happens on first start:**
+1. Generates ML-DSA-65 machine keypair → `~/.local/share/x0x/machine.key`
+2. Generates ML-DSA-65 agent keypair → `~/.local/share/x0x/agent.key`
+3. Starts REST API on `127.0.0.1:12700`
+4. Connects to 6 global bootstrap nodes
+5. Announces identity via gossip
+6. Ready to use
+
+### Step 3: Verify It's Working
+
+```bash
+# Health check
+curl -s http://127.0.0.1:12700/health
+# {"ok":true,"status":"healthy","version":"0.5.2","peers":4,"uptime_secs":5}
+
+# Get your agent identity
+curl -s http://127.0.0.1:12700/agent
+# {"ok":true,"agent_id":"8a3f...","machine_id":"b7c2..."}
+
+# Check network connectivity
+curl -s http://127.0.0.1:12700/status
+# {"ok":true,"data":{"status":"connected","peers":4,...}}
+
+# Run pre-flight diagnostics
+x0xd doctor
+```
+
+### Step 4: Your First Message
+
+```bash
+# Subscribe to a topic
+curl -X POST http://127.0.0.1:12700/subscribe \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "hello-world"}'
+
+# Publish a message (payload is base64-encoded)
+curl -X POST http://127.0.0.1:12700/publish \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "hello-world", "payload": "'$(echo -n "Hello from my agent!" | base64)'"}'
+
+# Stream incoming messages (leave this running in another terminal)
+curl http://127.0.0.1:12700/events
+```
+
+### CLI Reference
+
+```bash
+x0xd                          # Start with defaults
+x0xd --config path.toml       # Custom config
+x0xd --name alice             # Named instance (isolated identity)
+x0xd --name bob               # Another instance (different keys, different port)
+x0xd --list                   # List running instances
+x0xd --check                  # Validate config and exit
+x0xd --check-updates          # Check for updates and exit
+x0xd doctor                   # Pre-flight diagnostics
+```
+
+### Configuration (TOML)
+
+All settings have sensible defaults. A config file is optional.
+
+```toml
+# ~/.config/x0x/config.toml (or pass via --config)
+
+bind_address = "0.0.0.0:0"           # QUIC port (0 = random)
+api_address = "127.0.0.1:12700"      # REST API (localhost only)
+log_level = "info"                    # trace | debug | info | warn | error
+log_format = "text"                   # text | json
+heartbeat_interval_secs = 300         # Re-announce identity every 5 min
+identity_ttl_secs = 900               # Expire stale discoveries after 15 min
+rendezvous_enabled = true             # Global agent findability
+# user_key_path = "~/.x0x/user.key"  # Opt-in human identity
+
+[update]
+enabled = true                        # Auto-update via gossip
+rollout_window_minutes = 1440         # Stagger updates over 24 hours
+```
+
+### Storage Locations
+
+```
+~/.local/share/x0x/
+  machine.key          # ML-DSA-65 machine keypair (auto-generated)
+  agent.key            # ML-DSA-65 agent keypair (auto-generated)
+  contacts.json        # Trust/contact store
+  mls_groups.json      # MLS group state (persisted)
+  peer_cache/          # Bootstrap peer quality cache
+  api.port             # Running instance discovery file
+```
+
+Named instances use `~/.local/share/x0x-<name>/` instead.
+
+### From Package Managers (library usage, no daemon)
 
 ```python
-# Python usage
+# Python
 from x0x import Agent
 
 agent = Agent()
@@ -501,7 +645,7 @@ await agent.publish("topic", b"hello")
 ```
 
 ```javascript
-// Node.js usage
+// Node.js
 const { Agent } = require('x0x');
 
 const agent = new Agent();
@@ -511,28 +655,37 @@ await agent.publish('topic', Buffer.from('hello'));
 
 ### Running Multiple Agents (--name)
 
-A single machine can run multiple isolated x0x agents, each with its own identity, storage, and API port:
+A single machine can run multiple isolated x0x agents, each with its own identity, storage, and auto-assigned API port:
 
 ```bash
-# Start named instances
-x0xd --name alice
-x0xd --name bob
-x0xd --name project-coordinator
-
-# Each gets isolated storage:
-#   ~/.x0x-alice/machine.key, ~/.x0x-alice/agent.key
-#   ~/.x0x-bob/machine.key, ~/.x0x-bob/agent.key
-#   ~/.local/share/x0x-alice/, ~/.local/share/x0x-bob/
-
-# List running instances
-x0xd --list
+x0xd --name alice    # ~/.local/share/x0x-alice/, port auto-assigned
+x0xd --name bob      # ~/.local/share/x0x-bob/, different port
+x0xd --list          # Show all running instances with their ports
 ```
 
-This is more efficient than running separate machines. QUIC's true multiplexing means all agents share network resources efficiently, and NAT hole punching (which is expensive) only needs to happen once per peer address.
+QUIC's true multiplexing means all agents share network resources efficiently, and NAT hole punching (which is expensive) only needs to happen once per peer address.
 
 ### Sharing a Daemon
 
 Multiple Claudes, AI assistants, and humans on the same machine can share a single x0xd instance. The daemon exposes a local REST API on `127.0.0.1:12700` — any process on the machine can use it. One daemon, many users, one set of network connections.
+
+### Error Responses
+
+All endpoints return `{"ok": false, "error": "..."}` on failure:
+
+```bash
+# 400 Bad Request — invalid input (your fault)
+# {"ok":false,"error":"invalid hex: odd number of hex characters"}
+
+# 403 Forbidden — blocked agent
+# {"ok":false,"error":"agent is blocked"}
+
+# 404 Not Found — resource doesn't exist
+# {"ok":false,"error":"group not found"}
+
+# 500 Internal Server Error — something went wrong (not your fault)
+# {"ok":false,"error":"internal error"}
+```
 
 ## Diagnostics
 
@@ -540,7 +693,7 @@ Multiple Claudes, AI assistants, and humans on the same machine can share a sing
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"0.4.0","peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"0.5.2","peers":4,"uptime_secs":300}
 ```
 
 ### Rich Status
