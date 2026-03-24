@@ -32,8 +32,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use tokio::signal;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
@@ -257,9 +258,78 @@ struct AppState {
     contacts: Arc<RwLock<ContactStore>>,
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     mls_groups_path: PathBuf,
+    /// Active WebSocket sessions.
+    ws_sessions: RwLock<HashMap<String, WsSession>>,
     api_address: SocketAddr,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket types
+// ---------------------------------------------------------------------------
+
+/// State for a single WebSocket connection.
+struct WsSession {
+    /// Unique session identifier (UUID v4).
+    id: String,
+    /// Topics this session subscribed to.
+    subscribed_topics: HashSet<String>,
+    /// Whether this session receives direct messages.
+    receives_direct: bool,
+    /// Channel to send events to this session's writer task.
+    #[allow(dead_code)] // Used in Phase 3 fan-out routing
+    tx: mpsc::UnboundedSender<WsOutbound>,
+    /// Handles for spawned subscription forwarder tasks (aborted on cleanup).
+    forwarder_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Server → Client WebSocket message.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+enum WsOutbound {
+    #[serde(rename = "connected")]
+    Connected {
+        session_id: String,
+        agent_id: String,
+    },
+    #[serde(rename = "message")]
+    Message {
+        topic: String,
+        payload: String,
+        origin: Option<String>,
+    },
+    #[serde(rename = "direct_message")]
+    DirectMessage {
+        sender: String,
+        machine_id: String,
+        payload: String,
+        received_at: u64,
+    },
+    #[serde(rename = "subscribed")]
+    Subscribed { topics: Vec<String> },
+    #[serde(rename = "unsubscribed")]
+    Unsubscribed { topics: Vec<String> },
+    #[serde(rename = "pong")]
+    Pong,
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+/// Client → Server WebSocket command.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum WsInbound {
+    #[serde(rename = "subscribe")]
+    Subscribe { topics: Vec<String> },
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe { topics: Vec<String> },
+    #[serde(rename = "publish")]
+    Publish { topic: String, payload: String },
+    #[serde(rename = "send_direct")]
+    SendDirect { agent_id: String, payload: String },
+    #[serde(rename = "ping")]
+    Ping,
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +806,7 @@ async fn main() -> Result<()> {
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
+        ws_sessions: RwLock::new(HashMap::new()),
         api_address: config.api_address,
         start_time: Instant::now(),
         broadcast_tx,
@@ -871,6 +942,10 @@ async fn main() -> Result<()> {
         )
         .route("/mls/groups/:id/encrypt", post(mls_encrypt))
         .route("/mls/groups/:id/decrypt", post(mls_decrypt))
+        // WebSocket endpoints
+        .route("/ws", get(ws_handler))
+        .route("/ws/direct", get(ws_direct_handler))
+        .route("/ws/sessions", get(ws_sessions))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
@@ -2952,6 +3027,282 @@ async fn mls_decrypt(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "ok": false, "error": "decryption failed" })),
             )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket handlers
+// ---------------------------------------------------------------------------
+
+/// GET /ws — upgrade to WebSocket (general purpose).
+async fn ws_handler(
+    ws: axum::extract::WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, false))
+}
+
+/// GET /ws/direct — upgrade to WebSocket (auto-subscribes to direct messages).
+async fn ws_direct_handler(
+    ws: axum::extract::WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, true))
+}
+
+/// GET /ws/sessions — list active WebSocket sessions.
+async fn ws_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = state.ws_sessions.read().await;
+    let entries: Vec<serde_json::Value> = sessions
+        .values()
+        .map(|s| {
+            serde_json::json!({
+                "session_id": s.id,
+                "subscribed_topics": s.subscribed_topics.iter().collect::<Vec<_>>(),
+                "receives_direct": s.receives_direct,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "sessions": entries })),
+    )
+}
+
+/// Core WebSocket connection lifecycle.
+async fn handle_ws_connection(
+    socket: axum::extract::ws::WebSocket,
+    state: Arc<AppState>,
+    direct_mode: bool,
+) {
+    use axum::extract::ws::Message;
+    use futures::{SinkExt, StreamExt as FutStreamExt};
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<WsOutbound>();
+
+    // Register session
+    let session = WsSession {
+        id: session_id.clone(),
+        subscribed_topics: HashSet::new(),
+        receives_direct: direct_mode,
+        tx: outbound_tx.clone(),
+        forwarder_handles: Vec::new(),
+    };
+    state
+        .ws_sessions
+        .write()
+        .await
+        .insert(session_id.clone(), session);
+
+    tracing::info!(session_id = %session_id, direct_mode, "WebSocket session opened");
+
+    // Send "connected" frame
+    let agent_id = hex::encode(state.agent.agent_id().as_bytes());
+    let _ = outbound_tx.send(WsOutbound::Connected {
+        session_id: session_id.clone(),
+        agent_id,
+    });
+
+    // Spawn writer task: outbound_rx → ws_tx
+    let writer_session_id = session_id.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            if ws_tx.send(Message::Text(json)).await.is_err() {
+                break;
+            }
+        }
+        tracing::debug!(session_id = %writer_session_id, "WebSocket writer stopped");
+    });
+
+    // If direct mode, spawn a forwarder for direct messages
+    let direct_handle = if direct_mode {
+        let mut direct_rx = state.agent.subscribe_direct();
+        let tx = outbound_tx.clone();
+        let sid = session_id.clone();
+        Some(tokio::spawn(async move {
+            while let Some(msg) = direct_rx.recv().await {
+                let out = WsOutbound::DirectMessage {
+                    sender: hex::encode(msg.sender.as_bytes()),
+                    machine_id: hex::encode(msg.machine_id.as_bytes()),
+                    payload: base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                    received_at: msg.received_at,
+                };
+                if tx.send(out).is_err() {
+                    break;
+                }
+            }
+            tracing::debug!(session_id = %sid, "Direct message forwarder stopped");
+        }))
+    } else {
+        None
+    };
+
+    // Spawn keepalive pinger (30s interval)
+    let keepalive_tx = outbound_tx.clone();
+    let keepalive = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if keepalive_tx.send(WsOutbound::Pong).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Reader loop: ws_rx → dispatch commands
+    while let Some(Ok(msg)) = futures::StreamExt::next(&mut ws_rx).await {
+        match msg {
+            Message::Text(text) => {
+                handle_ws_command(&state, &session_id, &text, &outbound_tx).await;
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Cleanup: remove session, abort all tasks (forwarders, writer, keepalive, direct)
+    if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
+        for h in session.forwarder_handles {
+            h.abort();
+        }
+    }
+    writer.abort();
+    keepalive.abort();
+    if let Some(h) = direct_handle {
+        h.abort();
+    }
+
+    tracing::info!(session_id = %session_id, "WebSocket session closed");
+}
+
+/// Dispatch an inbound WebSocket JSON command.
+async fn handle_ws_command(
+    state: &AppState,
+    session_id: &str,
+    text: &str,
+    tx: &mpsc::UnboundedSender<WsOutbound>,
+) {
+    let cmd: WsInbound = match serde_json::from_str(text) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(WsOutbound::Error {
+                message: format!("invalid command: {e}"),
+            });
+            return;
+        }
+    };
+
+    match cmd {
+        WsInbound::Ping => {
+            let _ = tx.send(WsOutbound::Pong);
+        }
+
+        WsInbound::Subscribe { topics } => {
+            // Subscribe to each topic and spawn a forwarder, tracking handles
+            let mut handles = Vec::new();
+            for topic in &topics {
+                if let Ok(mut sub) = state.agent.subscribe(topic).await {
+                    let tx_clone = tx.clone();
+                    let topic_clone = topic.clone();
+                    let handle = tokio::spawn(async move {
+                        while let Some(msg) = sub.recv().await {
+                            let out = WsOutbound::Message {
+                                topic: topic_clone.clone(),
+                                payload: base64::engine::general_purpose::STANDARD
+                                    .encode(&msg.payload),
+                                origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
+                            };
+                            if tx_clone.send(out).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    handles.push(handle);
+                }
+            }
+
+            // Track in session state
+            if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
+                session.subscribed_topics.extend(topics.iter().cloned());
+                session.forwarder_handles.extend(handles);
+            }
+
+            let _ = tx.send(WsOutbound::Subscribed { topics });
+        }
+
+        WsInbound::Unsubscribe { topics } => {
+            if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
+                for t in &topics {
+                    session.subscribed_topics.remove(t);
+                }
+            }
+            let _ = tx.send(WsOutbound::Unsubscribed { topics });
+        }
+
+        WsInbound::Publish { topic, payload } => {
+            let bytes = match decode_base64_payload(&payload) {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = tx.send(WsOutbound::Error {
+                        message: "invalid base64 in payload".to_string(),
+                    });
+                    return;
+                }
+            };
+
+            if let Err(e) = state.agent.publish(&topic, bytes).await {
+                tracing::error!("ws publish failed: {e}");
+                let _ = tx.send(WsOutbound::Error {
+                    message: "publish failed".to_string(),
+                });
+            }
+        }
+
+        WsInbound::SendDirect { agent_id, payload } => {
+            let aid = match parse_agent_id_hex(&agent_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = tx.send(WsOutbound::Error { message: e });
+                    return;
+                }
+            };
+
+            // Trust check — reject blocked agents (matches REST /direct/send behavior)
+            {
+                let contacts = state.contacts.read().await;
+                if let Some(contact) = contacts.get(&aid) {
+                    if contact.trust_level == TrustLevel::Blocked {
+                        let _ = tx.send(WsOutbound::Error {
+                            message: "agent is blocked".to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+
+            let bytes = match decode_base64_payload(&payload) {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = tx.send(WsOutbound::Error {
+                        message: "invalid base64 in payload".to_string(),
+                    });
+                    return;
+                }
+            };
+
+            if let Err(e) = state.agent.send_direct(&aid, bytes).await {
+                tracing::error!("ws send_direct failed: {e}");
+                let _ = tx.send(WsOutbound::Error {
+                    message: "send failed".to_string(),
+                });
+            }
         }
     }
 }
