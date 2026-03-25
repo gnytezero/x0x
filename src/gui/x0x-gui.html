@@ -114,8 +114,9 @@ nav.open{left:0}
 <!-- OVERVIEW -->
 <div class="tab act" id="tab-overview">
 <h2>Overview</h2>
-<div class="grid g3 mb" id="ov-stats">
+<div class="grid g2 mb" style="grid-template-columns:repeat(4,1fr)" id="ov-stats">
 <div class="card"><div class="label">Status</div><div class="val" id="ov-status">—</div></div>
+<div class="card"><div class="label">Version</div><div class="val" id="ov-version">—</div></div>
 <div class="card"><div class="label">Peers</div><div class="val" id="ov-peers">0</div></div>
 <div class="card"><div class="label">Uptime</div><div class="val" id="ov-uptime">—</div></div>
 </div>
@@ -355,6 +356,7 @@ async function pollDash(){
   if(h&&h.ok){
     document.getElementById('ov-status').textContent=h.status;
     document.getElementById('ov-status').className='val '+(h.status==='healthy'?'gn':'og');
+    document.getElementById('ov-version').textContent=h.version||'—';
     document.getElementById('ov-uptime').textContent=fmtUp(h.uptime_secs);
     document.getElementById('ov-peers').textContent=h.peers!=null?h.peers:0;
     document.getElementById('st-peers').textContent=(h.peers||0)+' peers';
@@ -507,6 +509,7 @@ async function wsGroupChanged(){
     wsGroupChatTopic=g.chat_topic||'';
     if(wsGroupChatTopic)wsSubs([wsGroupChatTopic]);
     document.getElementById('ws-msgs').innerHTML='<div class="chat-msg"><div class="meta" style="color:var(--dm)">Joined '+esc(g.name||'group')+'</div></div>';
+    loadChatHistory();
   }
   const topic='x0x-board-'+wsGroup.slice(0,16);
   const existing=await api('/task-lists');
@@ -531,8 +534,33 @@ function wsSend(){
 }
 function addWsChat(from,text,own){
   const c=document.getElementById('ws-msgs'),d=document.createElement('div');d.className='chat-msg';
-  d.innerHTML='<div class="meta"><span class="who">'+(own?'you':esc(from))+'</span> <span>'+new Date().toLocaleTimeString()+'</span></div><div class="body">'+esc(text)+'</div>';
+  const ts=new Date().toLocaleTimeString();
+  d.innerHTML='<div class="meta"><span class="who">'+(own?'you':esc(from))+'</span> <span>'+ts+'</span></div><div class="body">'+esc(text)+'</div>';
   c.appendChild(d);c.scrollTop=c.scrollHeight;
+  // Persist to localStorage (last 100 messages per group)
+  if(wsGroup){
+    const key='x0x_chat_'+wsGroup;
+    try{
+      const hist=JSON.parse(localStorage.getItem(key)||'[]');
+      hist.push({from,text,own,ts});
+      if(hist.length>100)hist.splice(0,hist.length-100);
+      localStorage.setItem(key,JSON.stringify(hist));
+    }catch(e){}
+  }
+}
+function loadChatHistory(){
+  if(!wsGroup)return;
+  const key='x0x_chat_'+wsGroup;
+  try{
+    const hist=JSON.parse(localStorage.getItem(key)||'[]');
+    const c=document.getElementById('ws-msgs');
+    hist.forEach(m=>{
+      const d=document.createElement('div');d.className='chat-msg';
+      d.innerHTML='<div class="meta"><span class="who">'+(m.own?'you':esc(m.from))+'</span> <span>'+esc(m.ts)+'</span></div><div class="body">'+esc(m.text)+'</div>';
+      c.appendChild(d);
+    });
+    c.scrollTop=c.scrollHeight;
+  }catch(e){}
 }
 async function wsAddTask(){
   const inp=document.getElementById('ws-task-in'),t=inp.value.trim();if(!t||!boardListId)return;
