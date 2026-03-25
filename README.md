@@ -337,7 +337,7 @@ x0x presence
 x0x doctor
 
 # Check for updates
-x0x upgrade check
+x0x upgrade
 ```
 
 ---

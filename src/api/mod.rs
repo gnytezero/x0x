@@ -547,8 +547,8 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     // ── Upgrade ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
-        path: "/upgrade/check",
-        cli_name: "upgrade check",
+        path: "/upgrade",
+        cli_name: "upgrade",
         description: "Check for updates",
         category: "upgrade",
     },

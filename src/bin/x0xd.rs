@@ -1071,8 +1071,8 @@ async fn main() -> Result<()> {
         .route("/trust/evaluate", post(evaluate_trust))
         // MLS welcome
         .route("/mls/groups/:id/welcome", post(create_mls_welcome))
-        // Upgrade check
-        .route("/upgrade/check", get(check_upgrade))
+        // Upgrade
+        .route("/upgrade", get(check_upgrade))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         // WebSocket endpoints
@@ -4475,7 +4475,7 @@ async fn create_mls_welcome(
 // Upgrade check handler
 // ---------------------------------------------------------------------------
 
-/// GET /upgrade/check — check for available updates.
+/// GET /upgrade — check for available updates.
 async fn check_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let monitor = match x0x::upgrade::monitor::UpgradeMonitor::new(
         "saorsa-labs/x0x",

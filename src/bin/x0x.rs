@@ -157,10 +157,8 @@ enum Commands {
         sub: Option<TasksSub>,
     },
     /// Check for upgrades.
-    Upgrade {
-        #[command(subcommand)]
-        sub: UpgradeSub,
-    },
+    /// Check for updates and upgrade.
+    Upgrade,
     /// WebSocket session info.
     Ws {
         #[command(subcommand)]
@@ -577,11 +575,7 @@ enum TasksSub {
 }
 
 #[derive(Subcommand)]
-enum UpgradeSub {
-    /// Check for available updates.
-    Check,
-}
-
+// UpgradeSub removed — x0x upgrade is a single command now
 #[derive(Subcommand)]
 enum WsSub {
     /// List active WebSocket sessions.
@@ -892,9 +886,7 @@ async fn run(
                 commands::tasks::update(&client, &list_id, &task_id, "complete").await
             }
         },
-        Commands::Upgrade { sub } => match sub {
-            UpgradeSub::Check => commands::upgrade::check(&client).await,
-        },
+        Commands::Upgrade => commands::upgrade::check(&client).await,
         Commands::Ws { sub } => match sub {
             WsSub::Sessions => commands::ws::sessions(&client).await,
         },
