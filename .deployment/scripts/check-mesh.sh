@@ -21,7 +21,7 @@ declare -A NODES=(
 )
 
 HEALTH_PORT=12600
-QUIC_PORT=12000
+QUIC_PORT=5483
 EXPECTED_PEERS=5  # Each node should have 5 peers (6 total - self)
 
 echo "========================================="
@@ -59,12 +59,12 @@ for node in "${!NODES[@]}"; do
         echo -e "${RED}UNHEALTHY${NC} (health endpoint not responding)"
         
         # Check if service is running
-        service_status=$(ssh root@"$ip" "systemctl is-active x0x-bootstrap 2>/dev/null" || echo "unknown")
+        service_status=$(ssh root@"$ip" "systemctl is-active x0xd 2>/dev/null" || echo "unknown")
         echo "  Service status: $service_status"
         
         # Show last 5 log lines
         echo "  Recent logs:"
-        ssh root@"$ip" "journalctl -u x0x-bootstrap -n 5 --no-pager 2>/dev/null" | sed 's/^/    /' || echo "    (no logs available)"
+        ssh root@"$ip" "journalctl -u x0xd -n 5 --no-pager 2>/dev/null" | sed 's/^/    /' || echo "    (no logs available)"
         
         unhealthy_nodes=$((unhealthy_nodes + 1))
         continue
@@ -88,7 +88,7 @@ for node in "${!NODES[@]}"; do
         
         # Show last 5 log lines
         echo "  Recent logs:"
-        ssh root@"$ip" "journalctl -u x0x-bootstrap -n 5 --no-pager 2>/dev/null" | sed 's/^/    /' || echo "    (no logs available)"
+        ssh root@"$ip" "journalctl -u x0xd -n 5 --no-pager 2>/dev/null" | sed 's/^/    /' || echo "    (no logs available)"
     fi
 done
 

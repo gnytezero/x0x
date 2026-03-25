@@ -19,7 +19,7 @@ curl http://127.0.0.1:12700/status
 #   "version": "0.5.5",
 #   "uptime_secs": 300,
 #   "api_address": "127.0.0.1:12700",
-#   "external_addrs": ["203.0.113.5:12000"],
+#   "external_addrs": ["203.0.113.5:5483"],
 #   "agent_id": "8a3f...",
 #   "peers": 4,
 #   "warnings": []

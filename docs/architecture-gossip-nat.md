@@ -253,7 +253,7 @@ For each topic, PlumTree maintains two peer sets:
 │              │                              │              │
 │  Private:    │    Home Router               │              │
 │  192.168.x.x │   ┌──────────┐              │              │
-│  :random     ├───►│   NAT    │──────────────►  :12000     │
+│  :random     ├───►│   NAT    │──────────────►  :5483     │
 │              │    │          │  UDP outbound │              │
 │              │    │ Maps:    │  always works │              │
 │              │    │ priv:port│              │              │

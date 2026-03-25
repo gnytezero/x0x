@@ -62,8 +62,8 @@ for i in 1 2 3; do curl -sS http://127.0.0.1:12700/health; sleep 30; done
 ```
 
 ```bash
-# Verify bootstrap nodes are reachable over UDP/QUIC port 12000
-for host in bootstrap.x0x.sh ams.bootstrap.x0x.sh nyc.bootstrap.x0x.sh sgp.bootstrap.x0x.sh syd.bootstrap.x0x.sh fra.bootstrap.x0x.sh; do nc -zuv "$host" 12000; done
+# Verify bootstrap nodes are reachable over UDP/QUIC port 5483
+for host in bootstrap.x0x.sh ams.bootstrap.x0x.sh nyc.bootstrap.x0x.sh sgp.bootstrap.x0x.sh syd.bootstrap.x0x.sh fra.bootstrap.x0x.sh; do nc -zuv "$host" 5483; done
 ```
 
 Fix:
@@ -80,7 +80,7 @@ x0xd &
 ```
 
 ```bash
-# If UDP egress is blocked, run on a network that allows outbound UDP/12000
+# If UDP egress is blocked, run on a network that allows outbound UDP/5483
 # (verify after network change)
 curl -sS http://127.0.0.1:12700/health
 ```

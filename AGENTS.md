@@ -17,12 +17,12 @@ cargo nextest run --all-features --workspace              # Run all tests
 cargo nextest run --all-features -E 'test(identity)'      # Run tests matching "identity"
 cargo nextest run --all-features --test identity_integration  # Run a specific integration test file
 cargo doc --all-features --no-deps  # Build docs (CI uses RUSTDOCFLAGS="-D warnings")
-cargo build --all-features          # Build library + x0x-bootstrap binary
+cargo build --all-features          # Build library + x0xd + x0x binaries
 ```
 
 Cross-compile for Linux (VPS deployment):
 ```bash
-cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0x-bootstrap
+cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd
 ```
 
 ## Local Dependency Setup
@@ -55,7 +55,7 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 ### Network Stack (bottom to top)
 
 1. **Transport** (`network.rs`): Wraps `ant-quic::Node`. Implements `saorsa_gossip_transport::GossipTransport` trait. Handles PeerId conversion between ant-quic and gossip type systems.
-2. **Bootstrap** (`bootstrap.rs`): 6 hardcoded global nodes (port 12000). 3-round retry with exponential backoff (0s, 10s, 15s). Nodes are in `network.rs::DEFAULT_BOOTSTRAP_PEERS`.
+2. **Bootstrap** (`bootstrap.rs`): 6 hardcoded global nodes (port 5483). 3-round retry with exponential backoff (0s, 10s, 15s). Nodes are in `network.rs::DEFAULT_BOOTSTRAP_PEERS`.
 3. **Gossip** (`gossip/`): Thin orchestration over `saorsa-gossip-*` crates. `GossipRuntime` owns `PubSubManager` which provides topic-based pub/sub via epidemic broadcast.
 4. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
 5. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
@@ -189,12 +189,6 @@ Type aliases: `error::Result<T>` for identity, `error::NetworkResult<T>` for net
 
 Keypairs are serialized with **bincode** (compact binary), not JSON. Manual serialization via `storage.rs` with explicit `public_key`/`secret_key` fields. Default path: `~/.x0x/`.
 
-## Binary: x0x-bootstrap
-
-`src/bin/x0x-bootstrap.rs` — the bootstrap node binary deployed to 6 VPS nodes. Runs as coordinator/reflector/relay for NAT traversal. Config via `--config /etc/x0x/bootstrap.toml`. Health/metrics on `127.0.0.1:12600`. Machine key persisted in `/var/lib/x0x/machine.key`.
-
-Node deployment configs are in `.deployment/*.toml` (one per region).
-
 ## FFI Bindings
 
 - **Node.js** (`bindings/nodejs/`): napi-rs v3 with 7 platform packages + WASM fallback. Published as `x0x` on npm.
@@ -202,11 +196,10 @@ Node deployment configs are in `.deployment/*.toml` (one per region).
 
 ## CI/CD
 
-Six workflows in `.github/workflows/`:
+Five workflows in `.github/workflows/`:
 - **ci.yml**: fmt, clippy, nextest, doc (all jobs symlink `ant-quic` and `saorsa-gossip` from `.deps/`)
 - **security.yml**: `cargo audit`
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io/npm/PyPI
-- **build-bootstrap.yml**: Builds `x0x-bootstrap` for Linux
 - **build.yml**: PR validation
 - **sign-skill.yml**: GPG-signs `SKILL.md`
 

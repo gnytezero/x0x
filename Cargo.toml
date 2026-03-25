@@ -72,10 +72,6 @@ serde_json = "1.0"
 tempfile = "3.14"
 
 [[bin]]
-name = "x0x-bootstrap"
-path = "src/bin/x0x-bootstrap.rs"
-
-[[bin]]
 name = "x0xd"
 path = "src/bin/x0xd.rs"
 

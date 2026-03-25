@@ -38,7 +38,7 @@ main() {
     echo "================================================"
     echo
 
-    ssh root@"$ip" "journalctl -u x0x-bootstrap -n $lines --no-pager"
+    ssh root@"$ip" "journalctl -u x0xd -n $lines --no-pager"
 }
 
 main "$@"

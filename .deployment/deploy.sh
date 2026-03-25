@@ -7,7 +7,7 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY_PATH="$SCRIPT_DIR/../target/release/x0x-bootstrap"
+BINARY_PATH="$SCRIPT_DIR/../target/release/x0xd"
 
 # Node definitions
 declare -A NODES=(
@@ -41,7 +41,7 @@ log_error() {
 check_binary() {
     if [[ ! -f "$BINARY_PATH" ]]; then
         log_error "Binary not found at $BINARY_PATH"
-        log_info "Build it with: cargo zigbuild --release --target x86_64-unknown-linux-gnu -p x0x-bootstrap"
+        log_info "Build it with: cargo zigbuild --release --target x86_64-unknown-linux-gnu -p x0xd"
         exit 1
     fi
     log_info "Binary found: $BINARY_PATH"
@@ -62,13 +62,13 @@ deploy_node() {
 
     # Copy binary
     log_info "  Uploading binary..."
-    scp "$BINARY_PATH" root@"$ip":/opt/x0x/x0x-bootstrap || {
+    scp "$BINARY_PATH" root@"$ip":/opt/x0x/x0xd || {
         log_error "Failed to upload binary to $node_name"
         return 1
     }
 
     # Set executable permissions
-    ssh root@"$ip" 'chmod +x /opt/x0x/x0x-bootstrap' || {
+    ssh root@"$ip" 'chmod +x /opt/x0x/x0xd' || {
         log_error "Failed to set permissions on $node_name"
         return 1
     }
@@ -82,13 +82,13 @@ deploy_node() {
 
     # Copy systemd service
     log_info "  Installing systemd service..."
-    scp "$SCRIPT_DIR/x0x-bootstrap.service" root@"$ip":/etc/systemd/system/ || {
+    scp "$SCRIPT_DIR/x0xd.service" root@"$ip":/etc/systemd/system/ || {
         log_error "Failed to upload service file to $node_name"
         return 1
     }
 
     # Reload systemd and enable service
-    ssh root@"$ip" 'systemctl daemon-reload && systemctl enable x0x-bootstrap' || {
+    ssh root@"$ip" 'systemctl daemon-reload && systemctl enable x0xd' || {
         log_error "Failed to enable service on $node_name"
         return 1
     }
@@ -102,8 +102,8 @@ start_node() {
     local node_name=$1
     local ip=${NODES[$node_name]}
 
-    log_info "Starting x0x-bootstrap on $node_name..."
-    ssh root@"$ip" 'systemctl restart x0x-bootstrap' || {
+    log_info "Starting x0xd on $node_name..."
+    ssh root@"$ip" 'systemctl restart x0xd' || {
         log_error "Failed to start service on $node_name"
         return 1
     }
@@ -113,14 +113,14 @@ start_node() {
 
     # Check status
     local status
-    status=$(ssh root@"$ip" 'systemctl is-active x0x-bootstrap' || echo "failed")
+    status=$(ssh root@"$ip" 'systemctl is-active x0xd' || echo "failed")
 
     if [[ "$status" == "active" ]]; then
         log_info "  Service active on $node_name"
         return 0
     else
         log_error "  Service failed to start on $node_name"
-        ssh root@"$ip" 'journalctl -u x0x-bootstrap -n 20 --no-pager'
+        ssh root@"$ip" 'journalctl -u x0xd -n 20 --no-pager'
         return 1
     fi
 }

@@ -17,7 +17,7 @@ The underlying transport already supports a symmetric model. In `ant-quic`, any 
 - hard-coded bootstrap peers are treated as the default authority set for joining the network;
 - coordinator selection still bottoms out in configured bootstrap peers;
 - ordinary publicly reachable nodes are not promoted into the coordinator or relay pool by x0x policy; and
-- release propagation in the current self-update design privileges `x0x-bootstrap` nodes as the primary broadcasters.
+- release propagation in the current self-update design privileges `x0xd` nodes as the primary broadcasters.
 
 If those properties remain true in steady state, x0x is not meaningfully decentralized. It becomes a network that depends on a designated operator-managed class of nodes.
 
@@ -31,9 +31,9 @@ This means:
 2. Static bootstrap addresses MUST NOT remain the default authority set for coordinator or relay selection in steady state.
 3. Any ordinary node with suitable public reachability MUST be eligible to become a coordinator or relay candidate.
 4. Eligibility for coordination and relay duties MUST be based on signed, expiring capability advertisements plus local validation and scoring, not on operator-maintained allowlists.
-5. Release gossip MUST be treated as a hint only. No node, including `x0x-bootstrap`, is authoritative merely because it broadcast a release notification.
+5. Release gossip MUST be treated as a hint only. No node, including `x0xd`, is authoritative merely because it broadcast a release notification.
 6. A node MUST independently verify release artifacts before applying an update or rebroadcasting a release hint.
-7. The `x0x-bootstrap` binary, if retained, SHALL be understood as optional operator packaging for stable public seeds and observability, not as a protocol role required for correctness or liveness.
+7. The `x0xd` binary, if retained, SHALL be understood as optional operator packaging for stable public seeds and observability, not as a protocol role required for correctness or liveness.
 
 ## Consequences
 
@@ -87,10 +87,10 @@ What it prohibits is protocol dependence on a permanently privileged Saorsa-oper
 - Require each node to independently fetch and verify the canonical release artifact before apply or rebroadcast.
 - Allow any verifying node to rebroadcast release hints.
 
-### Phase 5: Re-scope `x0x-bootstrap`
+### Phase 5: Re-scope `x0xd`
 
-- Keep `x0x-bootstrap` only as optional operational packaging for stable public seeds, health endpoints, and managed restarts.
-- Do not require `x0x-bootstrap` for protocol correctness, reachability, or upgrade authority.
+- Keep `x0xd` only as optional operational packaging for stable public seeds, health endpoints, and managed restarts.
+- Do not require `x0xd` for protocol correctness, reachability, or upgrade authority.
 
 ## Acceptance Criteria
 
@@ -99,5 +99,5 @@ This ADR is satisfied only when all of the following are true:
 - a node can rejoin from cached peers without contacting the default seed list;
 - ordinary publicly reachable nodes can advertise signed coordinator and relay capability;
 - steady-state coordinator selection prefers validated dynamic peers over static seed hints;
-- release propagation does not depend on `x0x-bootstrap` nodes being the primary broadcasters; and
+- release propagation does not depend on `x0xd` nodes being the primary broadcasters; and
 - loss of the default Saorsa-operated seed set degrades cold-start convenience, not network legitimacy or steady-state operation.

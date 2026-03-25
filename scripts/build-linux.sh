@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-compile x0x-bootstrap for Linux x64 (VPS deployment)
+# Cross-compile x0xd for Linux x64 (VPS deployment)
 # Usage: ./scripts/build-linux.sh
 
 set -euo pipefail
@@ -36,7 +36,7 @@ if ! command -v strip >/dev/null 2>&1; then
 fi
 
 TARGET="x86_64-unknown-linux-gnu"
-BINARY_NAME="x0x-bootstrap"
+BINARY_NAME="x0xd"
 
 log_info "Building $BINARY_NAME for $TARGET..."
 

@@ -134,7 +134,7 @@ Groups use ChaCha20-Poly1305 with `MlsKeySchedule`-derived epoch keys.
 | `IDENTITY_TTL_SECS` | 900 (15 minutes) |
 | `IDENTITY_ANNOUNCE_TOPIC` | `"x0x.identity.announce.v1"` |
 | x0xd REST API port | 12700 |
-| Bootstrap nodes UDP port | 12000 |
+| Bootstrap nodes UDP port | 5483 |
 
 ## NAT Traversal Outcomes
 

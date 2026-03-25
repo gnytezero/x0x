@@ -111,8 +111,12 @@ struct DaemonConfig {
     instance_name: Option<String>,
 }
 
+/// Default QUIC port: 5483 (LIVE on a phone keypad).
+/// Every x0x node uses the same well-known port by default.
+pub const DEFAULT_QUIC_PORT: u16 = 5483;
+
 fn default_bind_address() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 0))
+    SocketAddr::from(([0, 0, 0, 0], DEFAULT_QUIC_PORT))
 }
 
 fn default_api_address() -> SocketAddr {
@@ -123,6 +127,17 @@ fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .map(|d| d.join("x0x"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/x0x"))
+}
+
+/// Shared cache directory used by ALL instances (not per-instance).
+/// This is always the base `x0x` dir, never `x0x-<name>`.
+fn shared_cache_dir() -> PathBuf {
+    let dir = dirs::data_dir()
+        .map(|d| d.join("x0x"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/x0x"));
+    // Ensure it exists
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 fn default_log_level() -> String {
@@ -766,7 +781,8 @@ async fn main() -> Result<()> {
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
         stats_interval: std::time::Duration::from_secs(60),
-        peer_cache_path: Some(config.data_dir.join("peers.cache")),
+        // Shared peer cache across ALL instances (not per-instance)
+        peer_cache_path: Some(shared_cache_dir().join("peers.cache")),
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,
@@ -774,7 +790,7 @@ async fn main() -> Result<()> {
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
-        .with_peer_cache_dir(config.data_dir.join("peers"))
+        .with_peer_cache_dir(shared_cache_dir().join("peers"))
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
 

@@ -86,12 +86,12 @@ x0x provides 6 global bootstrap nodes:
 
 | Location | URL | Protocol |
 |----------|-----|----------|
-| NYC, US | `quic://142.93.199.50:12000` | QUIC |
-| SFO, US | `quic://147.182.234.192:12000` | QUIC |
-| Helsinki, FI | `quic://65.21.157.229:12000` | QUIC |
-| Nuremberg, DE | `quic://116.203.101.172:12000` | QUIC |
-| Singapore, SG | `quic://149.28.156.231:12000` | QUIC |
-| Tokyo, JP | `quic://45.77.176.184:12000` | QUIC |
+| NYC, US | `quic://142.93.199.50:5483` | QUIC |
+| SFO, US | `quic://147.182.234.192:5483` | QUIC |
+| Helsinki, FI | `quic://65.21.157.229:5483` | QUIC |
+| Nuremberg, DE | `quic://116.203.101.172:5483` | QUIC |
+| Singapore, SG | `quic://149.28.156.231:5483` | QUIC |
+| Tokyo, JP | `quic://45.77.176.184:5483` | QUIC |
 
 Agents can connect to any bootstrap node to join the network. Once connected, they discover peers via gossip.
 

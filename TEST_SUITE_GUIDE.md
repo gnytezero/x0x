@@ -13,9 +13,9 @@ This document describes the comprehensive test suites created for the x0x produc
 **Status:** ✅ Ready to run - tests currently implemented features
 
 **What it tests:**
-- Service Health (systemd x0x-bootstrap.service status)
+- Service Health (systemd x0xd.service status)
 - Health API Endpoints (GET /health on port 12600)
-- QUIC Port Binding (UDP port 12000)
+- QUIC Port Binding (UDP port 5483)
 - Peer Discovery & Connections (connection events in logs)
 - Cryptographic Identity (MachineID & AgentID extraction and uniqueness)
 - NAT Traversal (address discovery events)
@@ -319,8 +319,8 @@ After running tests, the following files are generated:
 
 **Service not running:**
 ```bash
-ssh root@<IP> 'systemctl status x0x-bootstrap'
-ssh root@<IP> 'journalctl -u x0x-bootstrap -n 50'
+ssh root@<IP> 'systemctl status x0xd'
+ssh root@<IP> 'journalctl -u x0xd -n 50'
 ```
 
 **Health endpoint unreachable:**
@@ -331,13 +331,13 @@ ssh root@<IP> 'ss -tlpn | grep 12600'
 
 **QUIC port not bound:**
 ```bash
-ssh root@<IP> 'ss -ulpn | grep 12000'
-ssh root@<IP> 'journalctl -u x0x-bootstrap | grep "Bind address"'
+ssh root@<IP> 'ss -ulpn | grep 5483'
+ssh root@<IP> 'journalctl -u x0xd | grep "Bind address"'
 ```
 
 **No peer connections:**
 ```bash
-ssh root@<IP> 'journalctl -u x0x-bootstrap --since "10 minutes ago" | grep -i connect'
+ssh root@<IP> 'journalctl -u x0xd --since "10 minutes ago" | grep -i connect'
 ```
 
 ### Manual Test Execution
@@ -346,16 +346,16 @@ Run individual tests on a specific node:
 
 ```bash
 # Service health
-ssh root@142.93.199.50 'systemctl is-active x0x-bootstrap'
+ssh root@142.93.199.50 'systemctl is-active x0xd'
 
 # Health API
 ssh root@142.93.199.50 'curl -s http://127.0.0.1:12600/health | jq .'
 
 # Connection logs
-ssh root@142.93.199.50 'journalctl -u x0x-bootstrap --since "5 min ago" | grep -i connected'
+ssh root@142.93.199.50 'journalctl -u x0xd --since "5 min ago" | grep -i connected'
 
 # Identity
-ssh root@142.93.199.50 'journalctl -u x0x-bootstrap | grep -E "Machine ID:|Agent ID:"'
+ssh root@142.93.199.50 'journalctl -u x0xd | grep -E "Machine ID:|Agent ID:"'
 ```
 
 ---

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Installation script for x0x-bootstrap on VPS nodes
+# Installation script for x0xd on VPS nodes
 # Usage: ./install.sh [--binary path/to/binary] [--config path/to/config.toml]
-# Default: Uses /tmp/x0x-bootstrap and /tmp/bootstrap.toml if not specified
+# Default: Uses /tmp/x0xd and /tmp/bootstrap.toml if not specified
 
 set -euo pipefail
 
@@ -24,7 +24,7 @@ log_error() {
 }
 
 # Parse arguments
-BINARY_PATH="${1:-/tmp/x0x-bootstrap}"
+BINARY_PATH="${1:-/tmp/x0xd}"
 CONFIG_PATH="${2:-/tmp/bootstrap.toml}"
 
 if [[ ! -f "$BINARY_PATH" ]]; then
@@ -37,7 +37,7 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     exit 1
 fi
 
-log_info "Installing x0x-bootstrap..."
+log_info "Installing x0xd..."
 log_info "Binary: $BINARY_PATH"
 log_info "Config: $CONFIG_PATH"
 
@@ -58,9 +58,9 @@ chown -R x0x:x0x /var/lib/x0x
 
 # Copy binary
 log_info "Installing binary..."
-cp "$BINARY_PATH" /opt/x0x/x0x-bootstrap
-chmod +x /opt/x0x/x0x-bootstrap
-chown root:root /opt/x0x/x0x-bootstrap
+cp "$BINARY_PATH" /opt/x0x/x0xd
+chmod +x /opt/x0x/x0xd
+chown root:root /opt/x0x/x0xd
 
 # Copy config
 log_info "Installing config..."
@@ -70,11 +70,11 @@ chown root:root /etc/x0x/bootstrap.toml
 
 # Install systemd service
 log_info "Installing systemd service..."
-if [[ -f "/tmp/x0x-bootstrap.service" ]]; then
-    cp /tmp/x0x-bootstrap.service /etc/systemd/system/x0x-bootstrap.service
-    chmod 644 /etc/systemd/system/x0x-bootstrap.service
+if [[ -f "/tmp/x0xd.service" ]]; then
+    cp /tmp/x0xd.service /etc/systemd/system/x0xd.service
+    chmod 644 /etc/systemd/system/x0xd.service
 else
-    log_warn "Service file not found at /tmp/x0x-bootstrap.service"
+    log_warn "Service file not found at /tmp/x0xd.service"
     log_warn "Please install manually or run this script after uploading service file"
 fi
 
@@ -83,18 +83,18 @@ log_info "Reloading systemd..."
 systemctl daemon-reload
 
 # Enable service
-log_info "Enabling x0x-bootstrap service..."
-systemctl enable x0x-bootstrap
+log_info "Enabling x0xd service..."
+systemctl enable x0xd
 
 # Start service
-log_info "Starting x0x-bootstrap service..."
-systemctl start x0x-bootstrap
+log_info "Starting x0xd service..."
+systemctl start x0xd
 
 # Wait a moment for service to start
 sleep 2
 
 # Check status
-if systemctl is-active --quiet x0x-bootstrap; then
+if systemctl is-active --quiet x0xd; then
     log_info "Service is running"
 
     # Check health endpoint
@@ -110,13 +110,13 @@ if systemctl is-active --quiet x0x-bootstrap; then
     log_info "Installation complete!"
     log_info ""
     log_info "Commands:"
-    log_info "  Status:  systemctl status x0x-bootstrap"
-    log_info "  Logs:    journalctl -u x0x-bootstrap -f"
-    log_info "  Restart: systemctl restart x0x-bootstrap"
-    log_info "  Stop:    systemctl stop x0x-bootstrap"
+    log_info "  Status:  systemctl status x0xd"
+    log_info "  Logs:    journalctl -u x0xd -f"
+    log_info "  Restart: systemctl restart x0xd"
+    log_info "  Stop:    systemctl stop x0xd"
     log_info "  Health:  curl http://127.0.0.1:12600/health"
 else
     log_error "Service failed to start"
-    log_error "Check logs: journalctl -u x0x-bootstrap -n 50 --no-pager"
+    log_error "Check logs: journalctl -u x0xd -n 50 --no-pager"
     exit 1
 fi

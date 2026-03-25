@@ -15,12 +15,12 @@
 //! unless overridden with `AgentBuilder::with_network_config`.
 //!
 //! Default bootstrap nodes:
-//! - `142.93.199.50:12000` - NYC, US
-//! - `147.182.234.192:12000` - SFO, US
-//! - `65.21.157.229:12000` - Helsinki, FI
-//! - `116.203.101.172:12000` - Nuremberg, DE
-//! - `149.28.156.231:12000` - Singapore, SG
-//! - `45.77.176.184:12000` - Tokyo, JP
+//! - `142.93.199.50:5483` - NYC, US
+//! - `147.182.234.192:5483` - SFO, US
+//! - `65.21.157.229:5483` - Helsinki, FI
+//! - `116.203.101.172:5483` - Nuremberg, DE
+//! - `149.28.156.231:5483` - Singapore, SG
+//! - `45.77.176.184:5483` - Tokyo, JP
 
 use crate::error::{NetworkError, NetworkResult};
 use ant_quic::{Node, NodeConfig, TransportAddr};
@@ -40,7 +40,8 @@ type AntPeerId = ant_quic::PeerId;
 type GossipPeerId = saorsa_gossip_types::PeerId;
 
 /// Default port for x0x nodes (when specified).
-pub const DEFAULT_PORT: u16 = 12000;
+/// Default QUIC port: 5483 (LIVE on a phone keypad).
+pub const DEFAULT_PORT: u16 = 5483;
 
 /// Default health/metrics port.
 pub const DEFAULT_METRICS_PORT: u16 = 12600;
@@ -66,7 +67,7 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
 /// and rendezvous services.
 ///
-/// All nodes bind to `[::]:12000` (dual-stack: accepts both IPv4 and IPv6).
+/// All nodes bind to `[::]:5483` (dual-stack: accepts both IPv4 and IPv6).
 /// IPv6 addresses are included for nodes that have global IPv6 connectivity.
 ///
 /// Locations:
@@ -81,19 +82,19 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // IPv4
-    "142.93.199.50:12000",   // NYC
-    "147.182.234.192:12000", // SFO
-    "65.21.157.229:12000",   // Helsinki
-    "116.203.101.172:12000", // Nuremberg
-    "149.28.156.231:12000",  // Singapore
-    "45.77.176.184:12000",   // Tokyo
+    "142.93.199.50:5483",   // NYC
+    "147.182.234.192:5483", // SFO
+    "65.21.157.229:5483",   // Helsinki
+    "116.203.101.172:5483", // Nuremberg
+    "149.28.156.231:5483",  // Singapore
+    "45.77.176.184:5483",   // Tokyo
     // IPv6
-    "[2604:a880:400:d1:0:3:7db3:f001]:12000",         // NYC
-    "[2604:a880:4:1d0:0:1:6ba1:f000]:12000",          // SFO
-    "[2a01:4f9:c012:684b::1]:12000",                  // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:12000",                  // Nuremberg
-    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:12000",  // Singapore
-    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:12000", // Tokyo
+    "[2604:a880:400:d1:0:3:7db3:f001]:5483",         // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",          // SFO
+    "[2a01:4f9:c012:684b::1]:5483",                  // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:5483",                  // Nuremberg
+    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:5483",  // Singapore
+    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483", // Tokyo
 ];
 
 /// x0x network node configuration.

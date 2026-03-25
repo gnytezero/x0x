@@ -42,11 +42,11 @@ cleanup_node() {
 
     # Stop service
     log_info "  Stopping service..."
-    ssh root@"$ip" 'systemctl stop x0x-bootstrap || true' 2>/dev/null || true
+    ssh root@"$ip" 'systemctl stop x0xd || true' 2>/dev/null || true
 
     # Disable service
     log_info "  Disabling service..."
-    ssh root@"$ip" 'systemctl disable x0x-bootstrap || true' 2>/dev/null || true
+    ssh root@"$ip" 'systemctl disable x0xd || true' 2>/dev/null || true
 
     # Remove files
     log_info "  Removing files..."
@@ -54,7 +54,7 @@ cleanup_node() {
         rm -rf /opt/x0x
         rm -rf /etc/x0x
         rm -rf /var/lib/x0x
-        rm -f /etc/systemd/system/x0x-bootstrap.service
+        rm -f /etc/systemd/system/x0xd.service
     ' || {
         log_error "Failed to remove files from $node_name"
         return 1

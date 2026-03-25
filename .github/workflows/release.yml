@@ -35,42 +35,42 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cross: false
             archive: tar.gz
-            binary: x0x-bootstrap
+            binary: x0xd
 
           - platform: linux-x64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
             archive: tar.gz
-            binary: x0x-bootstrap
+            binary: x0xd
 
           - platform: linux-arm64-gnu
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
             archive: tar.gz
-            binary: x0x-bootstrap
+            binary: x0xd
 
           - platform: macos-x64
             os: macos-14
             target: x86_64-apple-darwin
             cross: false
             archive: tar.gz
-            binary: x0x-bootstrap
+            binary: x0xd
 
           - platform: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
             cross: false
             archive: tar.gz
-            binary: x0x-bootstrap
+            binary: x0xd
 
           - platform: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
             archive: zip
-            binary: x0x-bootstrap.exe
+            binary: x0xd.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -104,11 +104,11 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd --bin x0x
+        run: cargo build --release --target ${{ matrix.target }} --bin x0xd --bin x0x
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd --bin x0x
+        run: cross build --release --target ${{ matrix.target }} --bin x0xd --bin x0x
 
       # ---- macOS Code Signing & Notarization ----
       - name: Import macOS signing certificate
@@ -136,7 +136,7 @@ jobs:
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
-          for bin in ${{ matrix.binary }} x0xd x0x; do
+          for bin in x0xd x0x; do
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
@@ -152,7 +152,7 @@ jobs:
           MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
         run: |
-          for bin in ${{ matrix.binary }} x0xd x0x; do
+          for bin in x0xd x0x; do
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
@@ -184,10 +184,9 @@ jobs:
         run: |
           STAGING="x0x-${{ matrix.platform }}"
           mkdir -p "$STAGING"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGING/"
           # Include x0xd daemon and x0x CLI binaries
-          for extra in x0xd x0x; do
-            BIN="target/${{ matrix.target }}/release/${extra}"
+          for bin in x0xd x0x; do
+            BIN="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BIN" ]; then cp "$BIN" "$STAGING/"; fi
           done
           cp LICENSE* "$STAGING/" 2>/dev/null || true
@@ -201,7 +200,6 @@ jobs:
         run: |
           $staging = "x0x-${{ matrix.platform }}"
           New-Item -ItemType Directory -Path $staging -Force
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" -Destination $staging
           # Include x0xd daemon and x0x CLI binaries
           $x0xd = "target/${{ matrix.target }}/release/x0xd.exe"
           if (Test-Path $x0xd) { Copy-Item $x0xd -Destination $staging }
@@ -424,8 +422,7 @@ jobs:
 
             ### Binaries Included
 
-            - **x0x-bootstrap** — Bootstrap node for running network infrastructure
-            - **x0xd** — Local agent daemon with REST API (default: `127.0.0.1:12700`)
+            - **x0xd** — Agent daemon with REST API (default: `127.0.0.1:12700`)
 
             ### Installation
 
@@ -486,12 +483,12 @@ jobs:
 
             ### Bootstrap Nodes
 
-            - NYC, US: `quic://142.93.199.50:12000`
-            - SFO, US: `quic://147.182.234.192:12000`
-            - Helsinki, FI: `quic://65.21.157.229:12000`
-            - Nuremberg, DE: `quic://116.203.101.172:12000`
-            - Singapore, SG: `quic://149.28.156.231:12000`
-            - Tokyo, JP: `quic://45.77.176.184:12000`
+            - NYC, US: `quic://142.93.199.50:5483`
+            - SFO, US: `quic://147.182.234.192:5483`
+            - Helsinki, FI: `quic://65.21.157.229:5483`
+            - Nuremberg, DE: `quic://116.203.101.172:5483`
+            - Singapore, SG: `quic://149.28.156.231:5483`
+            - Tokyo, JP: `quic://45.77.176.184:5483`
 
             ---
 

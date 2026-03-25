@@ -1,10 +1,10 @@
-# x0x Bootstrap Configuration - Tokyo (saorsa-9)
+# x0x Node Configuration - Tokyo (saorsa-9)
 # Location: Tokyo, Japan (Vultr)
 # Public IPv4: 45.77.176.184
 # Public IPv6: 2401:c080:1000:4c32:5400:5ff:fed9:9737
 
 # QUIC transport bind address (dual-stack: accepts both IPv4 and IPv6)
-bind_address = "[::]:12000"
+bind_address = "[::]:5483"
 
 # Health/metrics endpoint (localhost only)
 health_address = "127.0.0.1:12600"
@@ -22,11 +22,11 @@ relay = true
 
 # Known peers (other 5 bootstrap nodes — IPv4 addresses for cross-node connectivity)
 known_peers = [
-    "142.93.199.50:12000",      # saorsa-2 (NYC)
-    "147.182.234.192:12000",    # saorsa-3 (SFO)
-    "65.21.157.229:12000",      # saorsa-6 (Helsinki)
-    "116.203.101.172:12000",    # saorsa-7 (Nuremberg)
-    "149.28.156.231:12000",     # saorsa-8 (Singapore)
+    "142.93.199.50:5483",      # saorsa-2 (NYC)
+    "147.182.234.192:5483",    # saorsa-3 (SFO)
+    "65.21.157.229:5483",      # saorsa-6 (Helsinki)
+    "116.203.101.172:5483",    # saorsa-7 (Nuremberg)
+    "149.28.156.231:5483",     # saorsa-8 (Singapore)
 ]
 
 # Logging

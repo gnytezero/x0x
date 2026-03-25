@@ -35,7 +35,7 @@ check_node() {
 
     # Check service status
     local status
-    status=$(ssh root@"$ip" 'systemctl is-active x0x-bootstrap' 2>/dev/null || echo "inactive")
+    status=$(ssh root@"$ip" 'systemctl is-active x0xd' 2>/dev/null || echo "inactive")
 
     if [[ "$status" != "active" ]]; then
         echo -e "${RED}SERVICE $status${NC}"

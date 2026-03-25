@@ -68,7 +68,7 @@ fi
 echo "Installing to $BIN..."
 mkdir -p "$BIN"
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
-for bin in x0xd x0x x0x-bootstrap; do
+for bin in x0xd x0x; do
     if [ -f "$TMP/x0x-${PLATFORM}/$bin" ]; then
         cp "$TMP/x0x-${PLATFORM}/$bin" "$BIN/$bin"
         chmod +x "$BIN/$bin"

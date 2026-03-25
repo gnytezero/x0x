@@ -17,7 +17,7 @@ This directory contains configuration files and deployment scripts for running x
 
 ## Port Allocation
 
-- **12000/UDP**: QUIC transport (x0x network)
+- **5483/UDP**: QUIC transport (x0x network)
 - **12600/TCP**: Health and metrics endpoint (localhost only)
 
 ## Prerequisites
@@ -30,7 +30,7 @@ brew install zig  # macOS
 
 # Build for Linux
 cd ../..  # Go to project root
-cargo zigbuild --release --target x86_64-unknown-linux-gnu -p x0x-bootstrap
+cargo zigbuild --release --target x86_64-unknown-linux-gnu -p x0xd
 ```
 
 2. **SSH access** to VPS nodes:
@@ -52,7 +52,7 @@ Deploy binary and configuration to nodes.
 ```
 
 **What it does:**
-1. Uploads binary to `/opt/x0x/x0x-bootstrap`
+1. Uploads binary to `/opt/x0x/x0xd`
 2. Uploads config to `/etc/x0x/bootstrap.toml`
 3. Installs systemd service
 4. Starts and enables service
@@ -144,7 +144,7 @@ Remove x0x deployment from nodes.
 
 Each node has a TOML configuration file specifying:
 
-- **Bind address**: Public IP + port 12000
+- **Bind address**: Public IP + port 5483
 - **Known peers**: The other 5 bootstrap nodes
 - **Machine key**: `/var/lib/x0x/machine.key` (auto-generated on first run)
 - **Data directory**: `/var/lib/x0x/data`
@@ -160,19 +160,19 @@ Each node has a TOML configuration file specifying:
 ssh root@142.93.199.50
 
 # Check status
-systemctl status x0x-bootstrap
+systemctl status x0xd
 
 # View logs
-journalctl -u x0x-bootstrap -f
+journalctl -u x0xd -f
 
 # Restart
-systemctl restart x0x-bootstrap
+systemctl restart x0xd
 
 # Stop
-systemctl stop x0x-bootstrap
+systemctl stop x0xd
 
 # Start
-systemctl start x0x-bootstrap
+systemctl start x0xd
 ```
 
 ### Health Endpoint
@@ -189,7 +189,7 @@ curl http://127.0.0.1:12600/metrics
 
 ```
 /opt/x0x/
-  x0x-bootstrap              # Binary (uploaded by deploy script)
+  x0xd              # Binary (uploaded by deploy script)
 
 /etc/x0x/
   bootstrap.toml             # Configuration (uploaded by deploy script)
@@ -199,7 +199,7 @@ curl http://127.0.0.1:12600/metrics
   data/                      # Runtime data
 
 /etc/systemd/system/
-  x0x-bootstrap.service      # Systemd service (uploaded by deploy script)
+  x0xd.service      # Systemd service (uploaded by deploy script)
 ```
 
 ## Troubleshooting
@@ -207,10 +207,10 @@ curl http://127.0.0.1:12600/metrics
 ### Service won't start
 ```bash
 # Check logs for errors
-ssh root@<IP> 'journalctl -u x0x-bootstrap -n 100 --no-pager'
+ssh root@<IP> 'journalctl -u x0xd -n 100 --no-pager'
 
 # Check if binary is executable
-ssh root@<IP> 'ls -la /opt/x0x/x0x-bootstrap'
+ssh root@<IP> 'ls -la /opt/x0x/x0xd'
 
 # Check if config is valid
 ssh root@<IP> 'cat /etc/x0x/bootstrap.toml'
@@ -219,9 +219,9 @@ ssh root@<IP> 'cat /etc/x0x/bootstrap.toml'
 ### Network connectivity issues
 ```bash
 # Test QUIC port is open
-ssh root@<IP> 'ss -tulpn | grep 12000'
+ssh root@<IP> 'ss -tulpn | grep 5483'
 
-# Check firewall (should allow UDP 12000)
+# Check firewall (should allow UDP 5483)
 ssh root@<IP> 'ufw status'
 ```
 
@@ -231,7 +231,7 @@ ssh root@<IP> 'ufw status'
 ssh root@<IP> 'grep known_peers /etc/x0x/bootstrap.toml'
 
 # Test UDP connectivity to peer
-ssh root@<IP> 'nc -vzu <peer_ip> 12000'
+ssh root@<IP> 'nc -vzu <peer_ip> 5483'
 ```
 
 ### Clean slate restart
@@ -246,7 +246,7 @@ ssh root@<IP> 'nc -vzu <peer_ip> 12000'
 1. **Never compile on VPS** - always build locally with `cargo zigbuild`
 2. **Health endpoint is localhost-only** - not exposed to public internet
 3. **Machine keys are generated once** - backup if needed before cleanup
-4. **Firewall rules** - ensure UDP 12000 is allowed
+4. **Firewall rules** - ensure UDP 5483 is allowed
 5. **Service runs as root** - required for port binding (consider dedicated user later)
 
 ## Monitoring
@@ -259,12 +259,12 @@ ssh root@<IP> 'nc -vzu <peer_ip> 12000'
 ### Monitor logs in real-time
 ```bash
 # On a specific node
-ssh root@<IP> 'journalctl -u x0x-bootstrap -f'
+ssh root@<IP> 'journalctl -u x0xd -f'
 ```
 
 ### Check resource usage
 ```bash
-ssh root@<IP> 'systemctl status x0x-bootstrap'
+ssh root@<IP> 'systemctl status x0xd'
 ```
 
 ## Next Steps
