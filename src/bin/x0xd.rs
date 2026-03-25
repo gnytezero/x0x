@@ -2925,6 +2925,9 @@ async fn create_named_group(
                 .insert(group_id_hex.clone(), group);
             save_mls_groups(&state).await;
 
+            let chat_topic = info.general_chat_topic();
+            let metadata_topic = info.metadata_topic.clone();
+
             // Store group info
             state
                 .named_groups
@@ -2932,13 +2935,40 @@ async fn create_named_group(
                 .await
                 .insert(group_id_hex.clone(), info.clone());
 
+            // Auto-subscribe to group topics so messages flow immediately
+            let _ = state.agent.subscribe(&chat_topic).await;
+            let _ = state.agent.subscribe(&metadata_topic).await;
+
+            // Announce creation on the chat topic
+            let agent_hex = hex::encode(agent_id.as_bytes());
+            let display = info
+                .display_names
+                .get(&agent_hex)
+                .cloned()
+                .unwrap_or_else(|| agent_hex[..8].to_string());
+            let announcement = serde_json::json!({
+                "type": "group_event",
+                "event": "created",
+                "agent_id": agent_hex,
+                "display_name": display,
+                "group_name": info.name,
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+            let _ = state
+                .agent
+                .publish(&chat_topic, announcement.to_string().into_bytes())
+                .await;
+
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "ok": true,
                     "group_id": group_id_hex,
                     "name": info.name,
-                    "chat_topic": info.general_chat_topic(),
+                    "chat_topic": chat_topic,
                 })),
             )
         }
@@ -3109,11 +3139,42 @@ async fn join_group_via_invite(
                 info.set_display_name(hex::encode(agent_id.as_bytes()), dn);
             }
 
+            let chat_topic = info.general_chat_topic();
+            let metadata_topic = info.metadata_topic.clone();
+
             state
                 .named_groups
                 .write()
                 .await
-                .insert(group_id_hex.clone(), info);
+                .insert(group_id_hex.clone(), info.clone());
+
+            // Auto-subscribe to group topics so messages flow immediately
+            let _ = state.agent.subscribe(&chat_topic).await;
+            let _ = state.agent.subscribe(&metadata_topic).await;
+
+            // Announce join on the chat topic so the creator sees us
+            let agent_hex = hex::encode(agent_id.as_bytes());
+            let display = info
+                .display_names
+                .get(&agent_hex)
+                .cloned()
+                .unwrap_or_else(|| agent_hex[..8].to_string());
+            let announcement = serde_json::json!({
+                "type": "group_event",
+                "event": "joined",
+                "agent_id": agent_hex,
+                "display_name": display,
+                "group_id": group_id_hex,
+                "group_name": invite.group_name,
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+            let _ = state
+                .agent
+                .publish(&chat_topic, announcement.to_string().into_bytes())
+                .await;
 
             (
                 StatusCode::OK,
@@ -3121,6 +3182,7 @@ async fn join_group_via_invite(
                     "ok": true,
                     "group_id": group_id_hex,
                     "group_name": invite.group_name,
+                    "chat_topic": chat_topic,
                 })),
             )
         }
