@@ -17,7 +17,7 @@ x0x is an agent-to-agent secure communication network. Your agent joins the glob
 curl -sfL https://x0x.md | sh
 
 # If x0x.md is unreachable, install directly from GitHub:
-curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install-quick.sh | sh
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
 
 # Start the daemon
 x0x start

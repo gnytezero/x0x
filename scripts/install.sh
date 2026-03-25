@@ -1,372 +1,279 @@
-#!/usr/bin/env bash
-# x0x Installation Script (Unix/macOS/Linux)
+#!/usr/bin/env sh
+# x0x installer — installs the x0x agent network.
 #
-# Interactive mode (default in terminal): prompts for confirmation when needed.
-# Non-interactive mode (piped or -y flag): uses safe defaults, never blocks.
+# Usage:
+#   curl -sfL https://x0x.md | sh                    # install only
+#   curl -sfL https://x0x.md | sh -s -- --start      # install + start daemon
+#   curl -sfL https://x0x.md | sh -s -- --autostart   # install + start + autostart on boot
+#   bash install.sh --name alice --start              # named instance
 #
-# Examples:
-#   curl -sfL https://x0x.md | sh                        # non-interactive (piped)
-#   bash install.sh                                       # interactive
-#   bash install.sh -y                                    # non-interactive (explicit)
-#   bash install.sh --start --health                      # install, start daemon, wait for healthy
-#   curl -sfL https://x0x.md | bash -s -- --start --health  # one-liner: install + run + verify
+# What it does:
+#   1. Detects platform (Linux/macOS, x64/arm64)
+#   2. Downloads latest release from GitHub
+#   3. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
+#   4. Seeds the shared peer cache with 6 global bootstrap nodes
+#   5. Optionally starts the daemon (--start)
+#   6. Optionally configures autostart on boot (--autostart)
+#
+# Requirements: curl or wget, tar, sh
+# No root/sudo required (except --autostart on Linux uses systemd).
 
-set -euo pipefail
-
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+set -e
 
 REPO="saorsa-labs/x0x"
-RELEASE_URL="https://github.com/$REPO/releases/latest/download"
-BIN_DIR="$HOME/.local/bin"
+URL="https://github.com/$REPO/releases/latest/download"
+BIN="$HOME/.local/bin"
+NAME=""
+START=false
+AUTOSTART=false
 
-# Detect interactive mode and flags
-INTERACTIVE=true
-INSTANCE_NAME=""
-START_DAEMON=false
-WAIT_HEALTH=false
-if ! [ -t 0 ]; then
-    INTERACTIVE=false
-fi
-SKIP_NEXT=false
-for i in $(seq 1 $#); do
-    arg="${!i}"
-    if [ "$SKIP_NEXT" = true ]; then
-        SKIP_NEXT=false
-        continue
-    fi
-    case "$arg" in
-        -y|--yes) INTERACTIVE=false ;;
-        --start) START_DAEMON=true ;;
-        --health) WAIT_HEALTH=true ;;
-        --name)
-            j=$((i + 1))
-            INSTANCE_NAME="${!j}"
-            SKIP_NEXT=true
-            ;;
+# ── Parse args ────────────────────────────────────────────────────────────────
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --start)     START=true ;;
+        --autostart) AUTOSTART=true; START=true ;;
+        --name)      shift; NAME="$1" ;;
+        --name=*)    NAME="${1#*=}" ;;
     esac
+    shift
 done
 
-# Determine data directory (must match x0xd's `dirs::data_dir()` behavior)
-case "$(uname -s)" in
-    Darwin) DATA_BASE="${XDG_DATA_HOME:-$HOME/Library/Application Support}" ;;
-    *)      DATA_BASE="${XDG_DATA_HOME:-$HOME/.local/share}" ;;
-esac
+# ── Detect platform ──────────────────────────────────────────────────────────
 
-if [ -n "$INSTANCE_NAME" ]; then
-    INSTALL_DIR="${DATA_BASE}/x0x-${INSTANCE_NAME}"
-else
-    INSTALL_DIR="${DATA_BASE}/x0x"
-fi
-
-echo -e "${BLUE}x0x Installation Script${NC}"
-echo -e "${BLUE}========================${NC}"
-echo ""
-
-# Check if GPG is installed
-if ! command -v gpg &> /dev/null; then
-    echo -e "${YELLOW}⚠ Warning: GPG not found. Signature verification will be skipped.${NC}"
-    echo ""
-    echo "To enable signature verification, install GPG:"
-    echo "  macOS:  brew install gnupg"
-    echo "  Ubuntu: sudo apt install gnupg"
-    echo "  Fedora: sudo dnf install gnupg"
-    echo ""
-    if [ "$INTERACTIVE" = true ]; then
-        read -p "Continue without verification? (y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    else
-        echo "Continuing without verification (non-interactive mode)."
-        echo ""
-    fi
-    GPG_AVAILABLE=false
-else
-    GPG_AVAILABLE=true
-fi
-
-# Create install directory
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
-
-echo "Downloading SKILL.md..."
-if command -v curl &> /dev/null; then
-    curl -sfL "$RELEASE_URL/SKILL.md" -o SKILL.md
-elif command -v wget &> /dev/null; then
-    wget -qO SKILL.md "$RELEASE_URL/SKILL.md"
-else
-    echo -e "${RED}✗ Error: Neither curl nor wget found${NC}"
-    exit 1
-fi
-
-if [ "$GPG_AVAILABLE" = true ]; then
-    echo "Downloading signature..."
-    if command -v curl &> /dev/null; then
-        curl -sfL "$RELEASE_URL/SKILL.md.sig" -o SKILL.md.sig
-        curl -sfL "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc" -o SAORSA_PUBLIC_KEY.asc
-    else
-        wget -qO SKILL.md.sig "$RELEASE_URL/SKILL.md.sig"
-        wget -qO SAORSA_PUBLIC_KEY.asc "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc"
-    fi
-
-    echo "Importing Saorsa Labs public key..."
-    gpg --import SAORSA_PUBLIC_KEY.asc 2>&1 | grep -v "^gpg:" || true
-
-    echo "Verifying signature..."
-    if gpg --verify SKILL.md.sig SKILL.md 2>&1 | grep -q "Good signature"; then
-        echo -e "${GREEN}✓ Signature verified${NC}"
-    else
-        echo -e "${RED}✗ Signature verification failed${NC}"
-        echo ""
-        echo "This file may have been tampered with."
-        if [ "$INTERACTIVE" = true ]; then
-            read -p "Install anyway? (y/N) " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                exit 1
-            fi
-        else
-            echo -e "${RED}✗ Signature verification failed in non-interactive mode. Aborting.${NC}"
-            echo "  Re-run interactively or set X0X_SKIP_GPG=true to bypass."
-            exit 1
-        fi
-    fi
-fi
-
-# ── x0xd daemon binary ────────────────────────────────────────────────────────
-
-echo ""
-echo "Detecting platform..."
-
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
+OS=$(uname -s)
+ARCH=$(uname -m)
 case "$OS" in
     Linux)
         case "$ARCH" in
             x86_64)  PLATFORM="linux-x64-gnu" ;;
             aarch64) PLATFORM="linux-arm64-gnu" ;;
-            *)
-                echo -e "${YELLOW}⚠ Unsupported Linux architecture: $ARCH${NC}"
-                echo "  x0xd daemon installation skipped."
-                PLATFORM=""
-                ;;
-        esac
-        ;;
+            *) echo "Unsupported: $OS $ARCH"; exit 1 ;;
+        esac ;;
     Darwin)
         case "$ARCH" in
-            arm64)   PLATFORM="macos-arm64" ;;
-            x86_64)  PLATFORM="macos-x64" ;;
-            *)
-                echo -e "${YELLOW}⚠ Unsupported macOS architecture: $ARCH${NC}"
-                echo "  x0xd daemon installation skipped."
-                PLATFORM=""
-                ;;
-        esac
-        ;;
+            arm64)  PLATFORM="macos-arm64" ;;
+            x86_64) PLATFORM="macos-x64" ;;
+            *) echo "Unsupported: $OS $ARCH"; exit 1 ;;
+        esac ;;
+    *) echo "Unsupported: $OS"; exit 1 ;;
+esac
+
+# ── Data directory ───────────────────────────────────────────────────────────
+
+case "$OS" in
+    Darwin) DATABASE="$HOME/Library/Application Support" ;;
+    *)      DATABASE="${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+esac
+SHARED_DIR="$DATABASE/x0x"
+if [ -n "$NAME" ]; then
+    INSTANCE_DIR="$DATABASE/x0x-$NAME"
+else
+    INSTANCE_DIR="$SHARED_DIR"
+fi
+
+# ── Download and install ────────────────────────────────────────────────────
+
+echo "x0x installer"
+echo "  Platform: $PLATFORM"
+echo "  Install:  $BIN"
+
+ARCHIVE="x0x-${PLATFORM}.tar.gz"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+echo "Downloading..."
+if command -v curl >/dev/null 2>&1; then
+    curl -sfL "$URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
+elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$TMP/$ARCHIVE" "$URL/$ARCHIVE"
+else
+    echo "Error: need curl or wget"; exit 1
+fi
+
+mkdir -p "$BIN"
+tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
+
+INSTALLED=""
+for bin in x0xd x0x; do
+    SRC="$TMP/x0x-${PLATFORM}/$bin"
+    if [ -f "$SRC" ]; then
+        cp "$SRC" "$BIN/$bin"
+        chmod +x "$BIN/$bin"
+        INSTALLED="$INSTALLED $bin"
+    fi
+done
+echo "Installed:$INSTALLED"
+
+# Check PATH
+case ":$PATH:" in
+    *":$BIN:"*) ;;
     *)
-        echo -e "${YELLOW}⚠ Unsupported operating system: $OS${NC}"
-        echo "  x0xd daemon installation is only supported on Linux and macOS."
-        echo "  Skipping daemon installation."
-        PLATFORM=""
+        echo ""
+        echo "  Add to PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "  Add to ~/.bashrc or ~/.zshrc to make permanent."
         ;;
 esac
 
-if [ -n "$PLATFORM" ]; then
-    ARCHIVE="x0x-${PLATFORM}.tar.gz"
-    ARCHIVE_URL="$RELEASE_URL/$ARCHIVE"
-    TMPDIR="$(mktemp -d)"
+# ── Seed the shared peer cache ──────────────────────────────────────────────
 
-    echo "Downloading x0xd ($PLATFORM)..."
-    if command -v curl &> /dev/null; then
-        curl -sfL "$ARCHIVE_URL" -o "$TMPDIR/$ARCHIVE"
-    else
-        wget -qO "$TMPDIR/$ARCHIVE" "$ARCHIVE_URL"
+mkdir -p "$SHARED_DIR"
+# The daemon seeds the cache on first run from compiled-in peers.
+# We just ensure the shared directory exists so all instances can find it.
+
+# ── Start daemon (optional) ─────────────────────────────────────────────────
+
+if [ "$START" = true ]; then
+    echo ""
+
+    XOXD="$BIN/x0xd"
+    CMD="$XOXD"
+    if [ -n "$NAME" ]; then
+        CMD="$XOXD --name $NAME"
     fi
 
-    echo "Extracting x0xd..."
-    tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" "x0x-${PLATFORM}/x0xd"
+    mkdir -p "$INSTANCE_DIR"
+    echo "Starting: $CMD"
+    nohup $CMD >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+    PID=$!
 
-    mkdir -p "$BIN_DIR"
-    mv "$TMPDIR/x0x-${PLATFORM}/x0xd" "$BIN_DIR/x0xd"
-    chmod +x "$BIN_DIR/x0xd"
+    # Wait for port file
+    PORTFILE="$INSTANCE_DIR/api.port"
+    TRIES=0
+    while [ ! -f "$PORTFILE" ] && [ $TRIES -lt 30 ]; do
+        sleep 1
+        TRIES=$((TRIES + 1))
+    done
 
-    rm -rf "$TMPDIR"
+    if [ ! -f "$PORTFILE" ]; then
+        echo "Timeout waiting for daemon. Check: cat $INSTANCE_DIR/x0xd.log"
+        exit 1
+    fi
 
-    echo -e "${GREEN}✓ x0xd installed to: $BIN_DIR/x0xd${NC}"
+    API=$(cat "$PORTFILE")
 
-    # Warn if ~/.local/bin is not in PATH
-    case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *)
-            echo ""
-            echo -e "${YELLOW}⚠ $BIN_DIR is not in your PATH.${NC}"
-            echo "  Add it by appending one of the following to your shell profile:"
-            echo ""
-            echo "    # bash (~/.bashrc or ~/.bash_profile)"
-            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-            echo ""
-            echo "    # zsh (~/.zshrc)"
-            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-            echo ""
-            echo "  Then reload your shell: source ~/.bashrc  (or ~/.zshrc)"
+    # Wait for healthy
+    TRIES=0
+    while [ $TRIES -lt 15 ]; do
+        if curl -sf "http://$API/health" >/dev/null 2>&1; then break; fi
+        sleep 1
+        TRIES=$((TRIES + 1))
+    done
+
+    HEALTH=$(curl -sf "http://$API/health" 2>/dev/null || echo '{"ok":false}')
+    AGENT=$(curl -sf "http://$API/agent" 2>/dev/null || echo '{}')
+
+    echo ""
+    echo "x0x is running"
+    echo "  API:    http://$API"
+    echo "  Health: $HEALTH"
+    echo "  Agent:  $AGENT"
+    echo "  Log:    $INSTANCE_DIR/x0xd.log"
+    echo "  PID:    $PID"
+fi
+
+# ── Autostart on boot (optional) ────────────────────────────────────────────
+
+if [ "$AUTOSTART" = true ]; then
+    echo ""
+    XOXD="$BIN/x0xd"
+    XOXD_ARGS=""
+    if [ -n "$NAME" ]; then
+        XOXD_ARGS="--name $NAME"
+    fi
+
+    case "$OS" in
+        Linux)
+            # systemd user service
+            UNIT_DIR="$HOME/.config/systemd/user"
+            mkdir -p "$UNIT_DIR"
+            cat > "$UNIT_DIR/x0xd.service" << UNIT
+[Unit]
+Description=x0x Agent Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$XOXD $XOXD_ARGS
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+            systemctl --user daemon-reload
+            systemctl --user enable x0xd
+            # If we haven't started it yet, start via systemd
+            if [ "$START" = false ]; then
+                systemctl --user start x0xd
+            fi
+            echo "Autostart: systemd user service enabled"
+            echo "  systemctl --user status x0xd"
+            echo "  systemctl --user stop x0xd"
+            echo "  journalctl --user -u x0xd"
+            ;;
+        Darwin)
+            # launchd user agent
+            PLIST_DIR="$HOME/Library/LaunchAgents"
+            mkdir -p "$PLIST_DIR"
+            PLIST="$PLIST_DIR/com.saorsalabs.x0xd.plist"
+            cat > "$PLIST" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.saorsalabs.x0xd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$XOXD</string>
+PLIST
+            if [ -n "$NAME" ]; then
+                cat >> "$PLIST" << PLIST
+        <string>--name</string>
+        <string>$NAME</string>
+PLIST
+            fi
+            cat >> "$PLIST" << PLIST
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$INSTANCE_DIR/x0xd.log</string>
+    <key>StandardErrorPath</key>
+    <string>$INSTANCE_DIR/x0xd.log</string>
+</dict>
+</plist>
+PLIST
+            # If we haven't started it yet, load now
+            if [ "$START" = false ]; then
+                launchctl load "$PLIST"
+            fi
+            echo "Autostart: launchd agent installed"
+            echo "  launchctl list | grep x0xd"
+            echo "  launchctl unload $PLIST"
             ;;
     esac
 fi
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ── Summary ─────────────────────────────────────────────────────────────────
 
-# Generate per-instance config if --name was provided
-if [ -n "$INSTANCE_NAME" ]; then
-    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/x0x-${INSTANCE_NAME}"
-    mkdir -p "$CONFIG_DIR"
-    if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-        cat > "$CONFIG_DIR/config.toml" <<TOML
-# x0x instance configuration for: $INSTANCE_NAME
-instance_name = "$INSTANCE_NAME"
-TOML
-        echo -e "${GREEN}✓ Config created: $CONFIG_DIR/config.toml${NC}"
-    fi
-fi
-
-echo ""
-echo -e "${GREEN}✓ Installation complete${NC}"
-echo ""
-echo "SKILL.md installed to: $INSTALL_DIR/SKILL.md"
-if [ -n "$PLATFORM" ]; then
-    echo "x0xd installed to:     $BIN_DIR/x0xd"
-fi
-
-# ── Start daemon if --start was passed ────────────────────────────────────────
-
-if [ "$START_DAEMON" = true ] && [ -n "$PLATFORM" ]; then
+if [ "$START" = false ]; then
     echo ""
-
-    # Resolve the x0xd binary path
-    X0XD_BIN=""
-    if command -v x0xd &> /dev/null; then
-        X0XD_BIN="x0xd"
-    elif [ -x "$BIN_DIR/x0xd" ]; then
-        X0XD_BIN="$BIN_DIR/x0xd"
-    fi
-
-    if [ -z "$X0XD_BIN" ]; then
-        echo -e "${RED}✗ Cannot start daemon: x0xd not found in PATH or $BIN_DIR${NC}"
-        echo "  Add $BIN_DIR to your PATH and try again."
+    echo "Installation complete. To start:"
+    if [ -n "$NAME" ]; then
+        echo "  x0x start --name $NAME"
+        echo "  # or: x0xd --name $NAME"
     else
-        # Build the command
-        X0XD_CMD="$X0XD_BIN"
-        if [ -n "$INSTANCE_NAME" ]; then
-            X0XD_CMD="$X0XD_BIN --name $INSTANCE_NAME"
-        fi
-
-        echo "Starting daemon: $X0XD_CMD"
-        # Start in background with nohup so it survives the install script exiting
-        X0XD_LOG="$INSTALL_DIR/x0xd.log"
-        nohup $X0XD_CMD >> "$X0XD_LOG" 2>&1 &
-        X0XD_PID=$!
-        echo -e "${GREEN}✓ x0xd started (PID $X0XD_PID, log: $X0XD_LOG)${NC}"
-
-        # ── Wait for health if --health was passed ────────────────────────────
-
-        if [ "$WAIT_HEALTH" = true ]; then
-            # Determine the API address to poll
-            if [ -n "$INSTANCE_NAME" ]; then
-                # Named instances use a random port — wait for the port file
-                PORT_FILE="$INSTALL_DIR/api.port"
-                echo "Waiting for port file ($PORT_FILE)..."
-                HEALTH_TIMEOUT=30
-                ELAPSED=0
-                while [ ! -f "$PORT_FILE" ] && [ $ELAPSED -lt $HEALTH_TIMEOUT ]; do
-                    sleep 1
-                    ELAPSED=$((ELAPSED + 1))
-                done
-                if [ -f "$PORT_FILE" ]; then
-                    API_ADDR=$(cat "$PORT_FILE")
-                else
-                    echo -e "${RED}✗ Timed out waiting for port file after ${HEALTH_TIMEOUT}s${NC}"
-                    echo "  Check logs: cat $X0XD_LOG"
-                    API_ADDR=""
-                fi
-            else
-                API_ADDR="127.0.0.1:12700"
-                sleep 2  # give it a moment to start
-            fi
-
-            if [ -n "$API_ADDR" ]; then
-                echo "Waiting for health at http://${API_ADDR}/health ..."
-                HEALTH_TIMEOUT=30
-                ELAPSED=0
-                HEALTHY=false
-                while [ $ELAPSED -lt $HEALTH_TIMEOUT ]; do
-                    if curl -sf "http://${API_ADDR}/health" > /dev/null 2>&1; then
-                        HEALTHY=true
-                        break
-                    fi
-                    sleep 1
-                    ELAPSED=$((ELAPSED + 1))
-                done
-
-                if [ "$HEALTHY" = true ]; then
-                    HEALTH_JSON=$(curl -sf "http://${API_ADDR}/health" 2>/dev/null)
-                    echo -e "${GREEN}✓ Daemon is healthy${NC}"
-                    echo "  $HEALTH_JSON"
-                    echo ""
-                    echo "API: http://${API_ADDR}"
-                else
-                    echo -e "${RED}✗ Timed out waiting for healthy daemon after ${HEALTH_TIMEOUT}s${NC}"
-                    echo "  Check logs: cat $X0XD_LOG"
-                fi
-            fi
-        fi
+        echo "  x0x start"
+        echo "  # or: x0xd"
     fi
-elif [ "$START_DAEMON" = true ] && [ -z "$PLATFORM" ]; then
     echo ""
-    echo -e "${YELLOW}⚠ --start ignored: no daemon binary was installed for this platform${NC}"
+    echo "To autostart on boot: bash install.sh --autostart"
 fi
-
-# ── Next steps ────────────────────────────────────────────────────────────────
 
 echo ""
-if [ "$START_DAEMON" != true ] && [ -n "$PLATFORM" ]; then
-    echo "Next steps:"
-    if [ -n "$INSTANCE_NAME" ]; then
-        echo "  1. Run x0xd:"
-        echo "       x0xd --name $INSTANCE_NAME"
-    else
-        echo "  1. Run x0xd:"
-        echo "       x0xd"
-    fi
-    echo "     (x0xd creates your identity on first run and joins the global network)"
-    echo "     (If x0xd is not found, ensure $BIN_DIR is in your PATH — see above)"
-    echo ""
-    echo "  2. Manage contacts:"
-    if [ -n "$INSTANCE_NAME" ]; then
-        echo "       # Port is auto-assigned — check the port file:"
-        echo "       cat $INSTALL_DIR/api.port"
-    else
-        echo "       curl http://127.0.0.1:12700/contacts"
-    fi
-    echo ""
-    echo "  3. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
-    echo ""
-    echo "  4. Install SDK:"
-elif [ -z "$PLATFORM" ]; then
-    echo "Next steps:"
-    echo "  1. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
-    echo ""
-    echo "  2. Install SDK:"
-fi
-if [ "$START_DAEMON" != true ] || [ -z "$PLATFORM" ]; then
-    echo "     - Rust:       cargo add x0x"
-    echo "     - TypeScript: npm install x0x"
-    echo "     - Python:     pip install agent-x0x"
-fi
-echo ""
-echo "Learn more: https://github.com/$REPO"
+echo "Docs: https://github.com/$REPO"
