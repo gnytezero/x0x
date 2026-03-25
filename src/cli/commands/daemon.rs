@@ -207,6 +207,171 @@ pub async fn instances() -> Result<()> {
     Ok(())
 }
 
+/// `x0x autostart` — configure daemon to start on boot.
+pub async fn autostart(name: Option<&str>) -> Result<()> {
+    let x0xd_path = find_x0xd()?;
+    let x0xd = x0xd_path.to_string_lossy();
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut args = Vec::new();
+        if let Some(n) = name {
+            args.push("--name".to_string());
+            args.push(n.to_string());
+        }
+        let args_str = args.join(" ");
+        let unit_dir = dirs::config_dir()
+            .context("cannot determine config directory")?
+            .join("systemd/user");
+        std::fs::create_dir_all(&unit_dir)?;
+
+        let unit_path = unit_dir.join("x0xd.service");
+        let unit = format!(
+            "[Unit]\n\
+             Description=x0x Agent Daemon\n\
+             After=network-online.target\n\
+             Wants=network-online.target\n\
+             \n\
+             [Service]\n\
+             Type=simple\n\
+             ExecStart={x0xd} {args_str}\n\
+             Restart=always\n\
+             RestartSec=5\n\
+             \n\
+             [Install]\n\
+             WantedBy=default.target\n"
+        );
+        std::fs::write(&unit_path, unit)?;
+
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .context("systemctl daemon-reload failed")?;
+        if !status.success() {
+            anyhow::bail!("systemctl daemon-reload failed");
+        }
+
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "x0xd"])
+            .status()
+            .context("systemctl enable failed")?;
+        if !status.success() {
+            anyhow::bail!("systemctl enable failed");
+        }
+
+        println!("Autostart enabled (systemd user service)");
+        println!("  systemctl --user start x0xd");
+        println!("  systemctl --user status x0xd");
+        println!("  systemctl --user stop x0xd");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_dir = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents");
+        std::fs::create_dir_all(&plist_dir)?;
+
+        let plist_path = plist_dir.join("com.saorsalabs.x0xd.plist");
+        let mut prog_args = format!("        <string>{x0xd}</string>\n");
+        if let Some(n) = name {
+            prog_args.push_str(&format!(
+                "        <string>--name</string>\n        <string>{n}</string>\n"
+            ));
+        }
+
+        let data_dir = if let Some(n) = name {
+            dirs::data_dir()
+                .context("cannot determine data directory")?
+                .join(format!("x0x-{n}"))
+        } else {
+            dirs::data_dir()
+                .context("cannot determine data directory")?
+                .join("x0x")
+        };
+        std::fs::create_dir_all(&data_dir)?;
+        let log_path = data_dir.join("x0xd.log");
+
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+                 <key>Label</key>\n\
+                 <string>com.saorsalabs.x0xd</string>\n\
+                 <key>ProgramArguments</key>\n\
+                 <array>\n\
+             {prog_args}\
+                 </array>\n\
+                 <key>RunAtLoad</key>\n\
+                 <true/>\n\
+                 <key>KeepAlive</key>\n\
+                 <true/>\n\
+                 <key>StandardOutPath</key>\n\
+                 <string>{}</string>\n\
+                 <key>StandardErrorPath</key>\n\
+                 <string>{}</string>\n\
+             </dict>\n\
+             </plist>\n",
+            log_path.display(),
+            log_path.display()
+        );
+        std::fs::write(&plist_path, plist)?;
+
+        println!("Autostart enabled (launchd agent)");
+        println!("  launchctl load {}", plist_path.display());
+        println!("  launchctl list | grep x0xd");
+        println!("  launchctl unload {}", plist_path.display());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        println!("Autostart not supported on this platform.");
+        println!("Run x0xd manually or configure your OS service manager.");
+    }
+
+    Ok(())
+}
+
+/// `x0x autostart --remove` — remove autostart configuration.
+pub async fn autostart_remove() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "x0xd"])
+            .status();
+        let unit_path = dirs::config_dir()
+            .context("cannot determine config directory")?
+            .join("systemd/user/x0xd.service");
+        if unit_path.exists() {
+            std::fs::remove_file(&unit_path)?;
+        }
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        println!("Autostart removed (systemd)");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents/com.saorsalabs.x0xd.plist");
+        if plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .status();
+            std::fs::remove_file(&plist_path)?;
+        }
+        println!("Autostart removed (launchd)");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    println!("Autostart not supported on this platform.");
+
+    Ok(())
+}
+
 /// Find the x0xd binary.
 fn find_x0xd() -> Result<std::path::PathBuf> {
     // Same directory as x0x binary.

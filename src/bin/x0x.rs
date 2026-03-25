@@ -59,6 +59,12 @@ enum Commands {
     Instances,
     /// Pre-flight diagnostics.
     Doctor,
+    /// Configure daemon to start on boot (systemd/launchd).
+    Autostart {
+        /// Remove autostart configuration.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Health check.
     Health,
     /// Runtime status with uptime and connectivity.
@@ -496,6 +502,13 @@ async fn run(
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
         }
+        Commands::Autostart { remove } => {
+            return if *remove {
+                commands::daemon::autostart_remove().await
+            } else {
+                commands::daemon::autostart(name).await
+            };
+        }
         _ => {}
     }
 
@@ -674,6 +687,9 @@ async fn run(
                 .await
         }
         Commands::Transfers => commands::files::transfers(&client).await,
-        Commands::Routes | Commands::Start { .. } | Commands::Instances => unreachable!(),
+        Commands::Routes
+        | Commands::Start { .. }
+        | Commands::Instances
+        | Commands::Autostart { .. } => unreachable!(),
     }
 }

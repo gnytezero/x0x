@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.8.1] - 2026-03-25
+
+### Added
+
+- **Unified install script** — single `scripts/install.sh` replaces both install.sh and install-quick.sh:
+  - `curl -sfL https://x0x.md | sh` — install only (x0xd + x0x CLI)
+  - `--start` — install + start daemon + wait for healthy
+  - `--autostart` — install + start + configure start-on-boot
+  - systemd user service (Linux) or launchd agent (macOS)
+
+- **`x0x autostart` CLI command** — configure daemon to start on boot from the command line:
+  - `x0x autostart` — enable (systemd on Linux, launchd on macOS)
+  - `x0x autostart --remove` — disable
+
+### Removed
+
+- `scripts/install-quick.sh` — merged into unified `scripts/install.sh`
+
 ## [v0.8.0] - 2026-03-25
 
 ### Breaking Changes

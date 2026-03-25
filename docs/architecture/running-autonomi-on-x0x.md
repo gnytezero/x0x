@@ -241,41 +241,106 @@ DHT for data. Gossip for coordination. Both over one transport.
 
 ---
 
-## Integration Path
+## Integration Path and Timeline
 
-### Phase 1: Unify on ant-quic
-- saorsa-core switches from `saorsa-transport` to `ant-quic` in Cargo.toml
-- One function rename (`fingerprint_public_key` → `derive_peer_id_from_public_key`)
-- All existing saorsa-core tests pass — same codebase, same behaviour
+We develop with AI-assisted coding (Claude Code), which compresses implementation timelines significantly. The estimates below reflect this — most phases are bounded by testing and validation, not writing code.
+
+### Phase 1: Unify on ant-quic — 1 day
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Change saorsa-core Cargo.toml dependency | Minutes | `saorsa-transport` → `ant-quic` |
+| Rename `fingerprint_public_key` → `derive_peer_id_from_public_key` | Minutes | One function, same signature |
+| Run saorsa-core test suite | Hours | Validation — the code hasn't changed |
+| Run saorsa-node test suite | Hours | Transitive dependency, should just work |
+
 - x0x continues using ant-quic as-is (no changes)
 - **Result:** Everyone on the same transport. ant-quic is the canonical crate.
+- **Confidence:** Very high. Same codebase, verified identical.
 
-### Phase 2: Identity Alignment
-- saorsa-core PeerId and x0x MachineId both derive from SHA-256(ML-DSA-65 pubkey)
-- Verify one keypair generates identical IDs in both systems
-- One key, one identity, everywhere
+### Phase 2: Identity Alignment — 1 day
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Verify PeerId derivation matches MachineId | Hours | Both are SHA-256(ML-DSA-65 pubkey) — write a cross-crate test |
+| Shared keypair loading from `~/.x0x/machine.key` | Hours | saorsa-core reads x0x's key format (bincode) |
+| Integration test: one key, two systems, same ID | Hours | The gate — doesn't ship until this passes |
+
 - **Result:** A node is the same peer in both the gossip and DHT layers.
+- **Confidence:** High. Same algorithm, same derivation — but needs verification test.
 
-### Phase 3: Gossip-Assisted Bootstrap
-- saorsa-node starts x0x agent on startup alongside the DHT
-- New nodes receive peer view via x0x gossip (seconds, not minutes)
-- DHT routing table seeded from gossip peer view
+### Phase 3: Gossip-Assisted Bootstrap — 2-3 days
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Add `x0x` dependency to saorsa-node | Minutes | Cargo.toml |
+| Start x0x Agent alongside DHT on node startup | Half day | ~50 lines in saorsa-node's main |
+| Gossip → DHT peer seeding (feed HyParView peers into Kademlia) | 1 day | Bridge code: subscribe to x0x presence, insert into DHT routing table |
+| Test: new node bootstraps via gossip, serves chunks within 10s | 1 day | Integration test against live bootstrap nodes |
+
 - x0x's 6 live bootstrap nodes serve both layers
 - **Result:** Cold-start problem eliminated.
+- **Confidence:** High. The gossip layer is tested; the bridge is new code but small.
 
-### Phase 4: Control Plane Integration
-- Membership events (join/leave) propagated via x0x gossip topics
-- Close-group coordination via MLS-encrypted gossip groups
-- EigenTrust scores inform x0x trust filtering; x0x revocations inform EigenTrust
-- Direct messaging as RPC transport for DHT queries
+### Phase 4: Control Plane Integration — 3-4 days
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Define gossip topics for network events (`x0x/nodes/join`, `x0x/nodes/leave`) | Half day | Topic schema + message types |
+| Membership event propagation via gossip | 1 day | Publish on DHT join/leave, subscribe on all nodes |
+| Close-group coordination via MLS groups | 1-2 days | Wire up existing MLS to close-group decisions |
+| EigenTrust ↔ ContactStore bridge | 1 day | Bidirectional: scores → trust levels, revocations → initial weights |
+| Integration tests: membership events propagate, trust converges | 1 day | Multi-node testnet |
+
 - **Result:** The network has a real-time coordination plane.
+- **Confidence:** Medium-high. Individual pieces exist and are tested; the integration is new.
 
-### Phase 5: Unified Node
-- Single binary: `saorsa-node` includes x0x agent
-- One process, one port range, one identity
-- CLI: `x0x` commands work alongside `saorsa-node` commands
-- Users and agents see one network, not two layers
-- **Result:** The complete Autonomi node.
+### Phase 5: Unified Node — 2-3 days
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Single binary build (saorsa-node embeds x0x) | Half day | Already depends on x0x from Phase 3 |
+| Unified CLI: `saorsa-node` commands + `x0x` subcommands | 1 day | Clap subcommand delegation |
+| Shared port management (one port range for QUIC) | Half day | Both layers share ant-quic Node instance |
+| End-to-end test: chunk store + retrieve through unified node | 1 day | The final gate |
+| Documentation and README updates | Half day | Reflect unified architecture |
+
+- **Result:** The complete Autonomi node with gossip coordination.
+- **Confidence:** High. Everything is built by this point; this phase is assembly.
+
+### Phase 6: Testnet Validation — 3-5 days
+
+| Task | Effort | Notes |
+|------|--------|-------|
+| Deploy unified nodes to existing 6 VPS bootstrap nodes | Half day | Same infrastructure x0x already runs on |
+| 9-node testnet: bootstrap, store, retrieve, gossip | 1-2 days | Using existing saorsa-testnet infrastructure |
+| Performance benchmarks: bootstrap time, chunk latency, gossip propagation | 1 day | Measure what we claimed |
+| Failure testing: kill nodes, network partitions, NAT edge cases | 1-2 days | Chaos testing on testnet |
+| Fix issues found | Included | Budgeted into each testing phase |
+
+- **Result:** Validated production-ready system.
+
+---
+
+### Total Timeline
+
+| Phase | Duration | Cumulative |
+|-------|----------|------------|
+| Phase 1: Unify on ant-quic | 1 day | **Day 1** |
+| Phase 2: Identity alignment | 1 day | **Day 2** |
+| Phase 3: Gossip-assisted bootstrap | 2-3 days | **Day 4-5** |
+| Phase 4: Control plane integration | 3-4 days | **Day 8-9** |
+| Phase 5: Unified node | 2-3 days | **Day 11-12** |
+| Phase 6: Testnet validation | 3-5 days | **Day 14-17** |
+
+**Total: 2-3 weeks to a tested, unified Autonomi node running on x0x.**
+
+This is aggressive but realistic because:
+- x0x is already built and tested (551 tests, live infrastructure)
+- ant-quic and saorsa-transport are the same codebase (no transport work)
+- saorsa-node is thin (~1000 LOC) and delegates to saorsa-core (small integration surface)
+- AI-assisted coding handles the boilerplate; human time goes to architecture decisions and testing
+- Existing testnet infrastructure (6 VPS nodes) can be reused immediately
 
 ---
 
