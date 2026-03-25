@@ -7,9 +7,9 @@
 //!
 //! ## Key Revocation
 //!
-//! When a peer's key is compromised, the [`ContactStore::revoke`] method
+//! When a peer's key is compromised, the `ContactStore::revoke` method
 //! permanently marks that key as revoked. Revoked keys are persisted to disk
-//! alongside contacts and cannot be un-revoked by calling [`ContactStore::set_trust`].
+//! alongside contacts and cannot be un-revoked by calling `ContactStore::set_trust`.
 //! The gossip layer checks revocation status before delivering messages.
 //!
 //! # Machine Records and Identity Pinning
