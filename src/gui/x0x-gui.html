@@ -471,12 +471,20 @@ async function pollGroups(){
   }).join('')||'<div style="color:var(--dm)">No groups yet</div>';
 }
 async function genInvite(gid,elId){
+  // If we already have an invite for this group, just copy it
+  if(savedInvites[gid]){
+    navigator.clipboard.writeText(savedInvites[gid]);
+    const el=document.getElementById(elId);
+    if(el){el.innerHTML=inviteHtml(savedInvites[gid])}
+    return;
+  }
+  // Generate new invite
   const r=await api('/groups/'+gid+'/invite',{method:'POST',body:JSON.stringify({})});
   if(r&&r.ok&&r.invite_link){
-    savedInvites[gid]=r.invite_link; // persist across re-renders
+    savedInvites[gid]=r.invite_link;
     const el=document.getElementById(elId);
     if(el)el.innerHTML=inviteHtml(r.invite_link);
-    navigator.clipboard.writeText(r.invite_link); // auto-copy
+    navigator.clipboard.writeText(r.invite_link);
   }else{
     const el=document.getElementById(elId);
     if(el)el.textContent='Failed to generate invite';
