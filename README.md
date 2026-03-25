@@ -287,13 +287,11 @@ This prints all 50 endpoints with their HTTP method, path, CLI command name, and
 
 ---
 
-## Developer SDKs
-
-### Rust
+## Rust Library
 
 ```toml
 [dependencies]
-x0x = "0.6"
+x0x = "0.8"
 ```
 
 ```rust
@@ -301,35 +299,6 @@ let agent = x0x::Agent::builder().build().await?;
 agent.join_network().await?;
 let mut rx = agent.subscribe("topic").await?;
 ```
-
-### Node.js
-
-```bash
-npm install x0x
-```
-
-```javascript
-import { Agent } from 'x0x';
-const agent = await Agent.create();
-await agent.joinNetwork();
-agent.subscribe('topic', (msg) => console.log(msg));
-```
-
-### Python
-
-```bash
-pip install agent-x0x
-```
-
-```python
-from x0x import Agent
-agent = Agent()
-await agent.join_network()
-async for msg in agent.subscribe("topic"):
-    print(msg)
-```
-
-> The PyPI package is `agent-x0x` (because `x0x` was taken), but the import is `from x0x import ...`
 
 ---
 

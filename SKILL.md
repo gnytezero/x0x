@@ -54,10 +54,6 @@ metadata:
         stripComponents: 1
         targetDir: ~/.local/bin
         bins: [x0xd.exe]
-      - kind: node
-        package: x0x
-      - kind: uv
-        package: agent-x0x
 ---
 
 # x0x: Your Own Secure Network
@@ -133,12 +129,10 @@ cargo build --release --bin x0xd
 cp target/release/x0xd ~/.local/bin/
 ```
 
-**Option D: As a library** (no daemon)
+**Option D: As a Rust library** (no daemon)
 
 ```bash
-cargo add x0x          # Rust
-npm install x0x        # Node.js
-pip install agent-x0x  # Python
+cargo add x0x
 ```
 
 | Option | x0x.md? | GitHub? | Rust? | curl? |
@@ -146,7 +140,7 @@ pip install agent-x0x  # Python
 | A (binary) | No | Yes | No | Yes |
 | B (script) | Optional | Yes | No | Yes |
 | C (source) | No | Yes | Yes | No |
-| D (library) | No | No | Varies | No |
+| D (library) | No | No | Yes | No |
 
 ### Step 2: Start the Daemon
 

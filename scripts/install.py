@@ -255,10 +255,6 @@ def main():
     print("  1. Review SKILL.md: cat", str(INSTALL_DIR / "SKILL.md"))
     print("  2. Start the daemon (creates your identity on first run):")
     print("       x0xd")
-    print("  3. Install SDK:")
-    print("     - Rust:       cargo add x0x")
-    print("     - TypeScript: npm install x0x")
-    print("     - Python:     pip install agent-x0x")
     print()
     print(f"Learn more: https://github.com/{REPO}")
 
