@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.9.2] - 2026-03-25
+
+### Added
+
+- **Group Workspace** — unified workspace with sub-tabs per group:
+  - **Chat** — group messaging via gossip pub/sub (was separate tab, now in workspace)
+  - **Board** — kanban board with To Do / In Progress / Done columns using CRDT task lists. Auto-creates a task list per group. Add tasks, claim, complete — all synced via gossip.
+  - **Files** — send files to group members via P2P file transfer with SHA-256 verification. Select recipient from contacts, pick file, send.
+
+- **Direct Messages tab** — chat directly with imported contacts. Import someone's card on Dashboard, they appear in DM contacts. Select a contact and send encrypted point-to-point messages.
+
+### Fixed
+
+- **Chat message echo** — own messages no longer appear twice. Gossip echoes from self are filtered out.
+- **Invite link copy UX** — invite links now persist after generation with a dedicated "Copy Link" button. Previously the link would vanish on focus change.
+
 ## [v0.9.1] - 2026-03-25
 
 ### Fixed

@@ -16,21 +16,17 @@ header .spacer{flex:1}
 .dot.on{background:var(--green)}
 .status{display:flex;align-items:center;gap:6px;font-size:.8rem;color:var(--dim)}
 .agent-tag{font-family:var(--mono);font-size:.75rem;color:var(--dim);background:var(--bg);padding:2px 8px;border-radius:4px}
-
-/* Nav */
 nav{display:flex;gap:0;border-bottom:1px solid var(--border);background:var(--card)}
 nav button{background:none;border:none;color:var(--dim);padding:10px 20px;font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
 nav button:hover{color:var(--text)}
 nav button.active{color:var(--cyan);border-bottom-color:var(--cyan)}
-
-/* Main content */
 main{flex:1;overflow-y:auto;padding:20px}
-.page{display:none}
-.page.active{display:block}
+.page{display:none}.page.active{display:block}
 h2{font-size:1rem;font-weight:600;color:var(--text);margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px}
 h3{font-size:.9rem;color:var(--dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
 .grid{display:grid;gap:12px;margin-bottom:20px}
 .grid-4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.grid-3{grid-template-columns:repeat(3,1fr)}
 .grid-2{grid-template-columns:repeat(auto-fit,minmax(350px,1fr))}
 .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
 .card-label{font-size:.7rem;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
@@ -41,29 +37,22 @@ h3{font-size:.9rem;color:var(--dim);margin-bottom:8px;text-transform:uppercase;l
 .badge-orange{background:rgba(255,107,53,.12);color:var(--orange)}
 .badge-red{background:rgba(255,68,96,.12);color:var(--red)}
 .badge-gray{background:rgba(106,106,128,.15);color:var(--dim)}
-
-/* Forms */
 input,textarea,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:.85rem;font-family:inherit;width:100%}
 input:focus,textarea:focus{outline:none;border-color:var(--cyan)}
 .btn{padding:8px 16px;border:none;border-radius:6px;font-size:.85rem;font-weight:600;cursor:pointer;transition:opacity .15s}
-.btn:hover{opacity:.85}
-.btn-cyan{background:var(--cyan);color:#000}
+.btn:hover{opacity:.85}.btn-cyan{background:var(--cyan);color:#000}
 .btn-sm{padding:5px 12px;font-size:.75rem}
+.btn-orange{background:var(--orange);color:#000}
+.btn-green{background:var(--green);color:#000}
 .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-
-/* Table */
 table{width:100%;border-collapse:collapse}
 th{text-align:left;font-size:.7rem;color:var(--dim);text-transform:uppercase;padding:8px;border-bottom:1px solid var(--border)}
 td{padding:8px;border-bottom:1px solid rgba(30,30,46,.5);font-size:.85rem}
 tr:hover td{background:rgba(0,212,255,.02)}
 .clickable{cursor:pointer;color:var(--cyan)}.clickable:hover{text-decoration:underline}
-
-/* Toast */
 .toast{position:fixed;bottom:24px;right:24px;background:var(--cyan);color:#000;padding:8px 18px;border-radius:8px;font-weight:600;font-size:.85em;opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}
 .toast.show{opacity:1}
-
-/* Chat */
-.chat-area{display:flex;flex-direction:column;height:calc(100vh - 200px);min-height:300px}
+.chat-area{display:flex;flex-direction:column;height:calc(100vh - 260px);min-height:250px}
 .messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:4px}
 .msg{max-width:75%;padding:8px 12px;border-radius:8px;font-size:.85rem;line-height:1.4;word-break:break-word}
 .msg.own{align-self:flex-end;background:#141428;border:1px solid #1c1c3a}
@@ -74,32 +63,45 @@ tr:hover td{background:rgba(0,212,255,.02)}
 .sys-msg{text-align:center;color:var(--dim);font-size:.75rem;padding:4px 0;font-style:italic}
 .chat-input{display:flex;gap:8px;padding:12px;border-top:1px solid var(--border);background:var(--card)}
 .chat-input input{flex:1}
-
-/* Empty state */
 .empty{text-align:center;color:var(--dim);padding:40px 20px;font-size:.9rem}
-
-/* Responsive */
-@media(max-width:600px){.grid-4{grid-template-columns:1fr 1fr}.grid-2{grid-template-columns:1fr}nav{overflow-x:auto;flex-wrap:nowrap}nav button{white-space:nowrap;padding:10px 14px;font-size:.8rem}}
+/* Sub-tabs for group workspace */
+.subtabs{display:flex;gap:0;margin-bottom:12px;border-bottom:1px solid var(--border)}
+.subtabs button{background:none;border:none;color:var(--dim);padding:8px 16px;font-size:.8rem;cursor:pointer;border-bottom:2px solid transparent}
+.subtabs button:hover{color:var(--text)}
+.subtabs button.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+.subpage{display:none}.subpage.active{display:block}
+/* Kanban columns */
+.kanban{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.kanban-col{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;min-height:200px}
+.kanban-col h4{font-size:.8rem;color:var(--dim);text-transform:uppercase;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.task-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px;font-size:.82rem}
+.task-card .title{font-weight:600;margin-bottom:4px}
+.task-card .meta{font-size:.7rem;color:var(--dim)}
+.task-card .actions{margin-top:6px;display:flex;gap:4px}
+/* DM */
+.dm-list{max-height:200px;overflow-y:auto}
+.dm-contact{padding:8px;border-radius:6px;cursor:pointer;transition:background .15s;display:flex;align-items:center;gap:8px}
+.dm-contact:hover{background:rgba(0,212,255,.05)}
+.dm-contact.active{background:rgba(0,212,255,.1);border:1px solid var(--cyan)}
+@media(max-width:600px){.grid-4{grid-template-columns:1fr 1fr}.grid-2,.grid-3{grid-template-columns:1fr}.kanban{grid-template-columns:1fr}nav{overflow-x:auto;flex-wrap:nowrap}nav button{white-space:nowrap;padding:10px 14px;font-size:.8rem}}
 </style>
 </head>
 <body>
 <div id="toast" class="toast">Copied</div>
-
 <header>
   <h1>x0x</h1>
   <span class="spacer"></span>
   <span class="agent-tag" id="agentTag">—</span>
   <span class="status"><span class="dot" id="dot"></span><span id="statusText">Connecting…</span></span>
 </header>
-
 <nav id="nav">
   <button class="active" data-page="dashboard">Dashboard</button>
   <button data-page="groups">Groups</button>
-  <button data-page="chat">Chat</button>
+  <button data-page="workspace">Workspace</button>
+  <button data-page="dm">Direct Messages</button>
   <button data-page="network">Network</button>
   <button data-page="help">Help</button>
 </nav>
-
 <main>
   <!-- ═══ DASHBOARD ═══ -->
   <div class="page active" id="page-dashboard">
@@ -120,9 +122,7 @@ tr:hover td{background:rgba(0,212,255,.02)}
       </div>
       <div>
         <h3>Discovered Agents <span class="badge badge-cyan" id="d-agent-count">0</span></h3>
-        <div class="card" style="max-height:200px;overflow-y:auto">
-          <div id="d-agents" class="empty">No agents discovered</div>
-        </div>
+        <div class="card" style="max-height:200px;overflow-y:auto"><div id="d-agents" class="empty">No agents discovered</div></div>
       </div>
     </div>
     <div class="grid grid-2">
@@ -160,17 +160,68 @@ tr:hover td{background:rgba(0,212,255,.02)}
     <div id="g-list" class="empty">No groups yet</div>
   </div>
 
-  <!-- ═══ CHAT ═══ -->
-  <div class="page" id="page-chat">
-    <div class="row" style="margin-bottom:8px">
-      <select id="c-group" onchange="switchChatGroup()" style="max-width:250px"><option value="">Select a group…</option></select>
-      <span class="mono" style="color:var(--dim);font-size:.75rem" id="c-topic">—</span>
+  <!-- ═══ WORKSPACE (Chat + Board + Files per group) ═══ -->
+  <div class="page" id="page-workspace">
+    <div class="row" style="margin-bottom:4px">
+      <select id="w-group" onchange="switchWorkspaceGroup()" style="max-width:250px"><option value="">Select a group…</option></select>
+      <span class="mono" style="color:var(--dim);font-size:.75rem" id="w-group-name"></span>
     </div>
-    <div class="chat-area">
-      <div class="messages" id="c-messages"><div class="sys-msg">Select a group to start chatting</div></div>
-      <div class="chat-input">
-        <input id="c-input" placeholder="Type a message…" disabled>
-        <button class="btn btn-cyan" id="c-send" onclick="sendChat()" disabled>Send</button>
+    <div class="subtabs" id="w-subtabs">
+      <button class="active" data-sub="chat" onclick="switchSubTab('chat')">Chat</button>
+      <button data-sub="board" onclick="switchSubTab('board')">Board</button>
+      <button data-sub="files" onclick="switchSubTab('files')">Files</button>
+    </div>
+    <!-- Chat sub-tab -->
+    <div class="subpage active" id="sub-chat">
+      <div class="chat-area">
+        <div class="messages" id="c-messages"><div class="sys-msg">Select a group to start chatting</div></div>
+        <div class="chat-input">
+          <input id="c-input" placeholder="Type a message…" disabled>
+          <button class="btn btn-cyan" id="c-send" onclick="sendChat()" disabled>Send</button>
+        </div>
+      </div>
+    </div>
+    <!-- Board sub-tab -->
+    <div class="subpage" id="sub-board">
+      <div class="row"><input id="b-task-title" placeholder="New task…" style="max-width:300px" disabled><button class="btn btn-sm btn-cyan" onclick="addBoardTask()" id="b-add-btn" disabled>Add Task</button></div>
+      <div class="kanban">
+        <div class="kanban-col"><h4 style="color:var(--cyan)">To Do</h4><div id="b-todo"></div></div>
+        <div class="kanban-col"><h4 style="color:var(--orange)">In Progress</h4><div id="b-progress"></div></div>
+        <div class="kanban-col"><h4 style="color:var(--green)">Done</h4><div id="b-done"></div></div>
+      </div>
+    </div>
+    <!-- Files sub-tab -->
+    <div class="subpage" id="sub-files">
+      <div class="card">
+        <p style="color:var(--dim);margin-bottom:12px">Share files with group members via secure P2P transfer.</p>
+        <div class="row">
+          <select id="f-target" style="max-width:250px"><option value="">Select recipient…</option></select>
+          <input type="file" id="f-file" style="max-width:250px">
+          <button class="btn btn-sm btn-cyan" onclick="sendGroupFile()">Send</button>
+        </div>
+        <h3 style="margin-top:16px">Transfers</h3>
+        <div id="f-transfers" class="empty">No transfers</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ DIRECT MESSAGES ═══ -->
+  <div class="page" id="page-dm">
+    <h2>Direct Messages</h2>
+    <div class="grid grid-2">
+      <div>
+        <h3>Contacts</h3>
+        <div class="card dm-list" id="dm-contacts"><div class="empty">Import a contact card to start messaging</div></div>
+      </div>
+      <div>
+        <h3 id="dm-chat-header">Select a contact</h3>
+        <div class="chat-area" style="height:calc(100vh - 280px)">
+          <div class="messages" id="dm-messages"><div class="sys-msg">Select a contact to send a direct message</div></div>
+          <div class="chat-input">
+            <input id="dm-input" placeholder="Type a message…" disabled>
+            <button class="btn btn-cyan" id="dm-send" onclick="sendDm()" disabled>Send</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -202,18 +253,12 @@ tr:hover td{background:rgba(0,212,255,.02)}
   <div class="page" id="page-help">
     <h2>x0x — Agent-to-Agent Network</h2>
     <div class="card" style="margin-bottom:16px">
-      <p style="color:var(--dim);line-height:1.6;margin-bottom:12px">
-        x0x is a gossip network for AI agents and humans. Built on post-quantum cryptography (ML-DSA-65, ML-KEM-768), QUIC transport with native NAT traversal, and CRDT-based collaboration.
-      </p>
-      <p style="color:var(--dim);line-height:1.6">
-        This GUI connects to x0xd running on localhost. All data stays local; groups use MLS encryption. Any web page that can call the REST API is an x0x app — HTML files are the universal runtime for both humans and AI agents.
-      </p>
+      <p style="color:var(--dim);line-height:1.6;margin-bottom:12px">x0x is a gossip network for AI agents and humans. Built on post-quantum cryptography (ML-DSA-65, ML-KEM-768), QUIC transport with native NAT traversal, and CRDT-based collaboration.</p>
+      <p style="color:var(--dim);line-height:1.6">This GUI connects to x0xd running on localhost. All data stays local; groups use MLS encryption. Any web page that can call the REST API is an x0x app — HTML files are the universal runtime for both humans and AI agents.</p>
     </div>
     <h3>Example Apps</h3>
     <div class="card" style="margin-bottom:16px">
-      <p style="color:var(--dim);line-height:1.6;margin-bottom:12px">
-        These example apps ship with x0x in <code>examples/apps/</code>. Open them in any browser while x0xd is running. They're starting points — let your imagination (or your agent's imagination) take over.
-      </p>
+      <p style="color:var(--dim);line-height:1.6;margin-bottom:12px">These example apps ship with x0x in <code>examples/apps/</code>. Open them in any browser while x0xd is running. They're starting points — let your imagination (or your agent's imagination) take over.</p>
       <table>
         <thead><tr><th>App</th><th>What it does</th><th>x0x features</th></tr></thead>
         <tbody>
@@ -224,46 +269,33 @@ tr:hover td{background:rgba(0,212,255,.02)}
           <tr><td class="mono">x0x-swarm.html</td><td>AI agent task delegation</td><td>Pub/sub + CRDTs, the killer AI demo</td></tr>
         </tbody>
       </table>
-      <p style="color:var(--dim);font-size:.8rem;margin-top:12px;line-height:1.5">
-        Any HTML file that calls <code>fetch("http://localhost:12700/...")</code> is an x0x app. AI agents can generate them, publish them to the network, and other agents can discover and run them. The browser is the universal runtime.
-      </p>
+      <p style="color:var(--dim);font-size:.8rem;margin-top:12px;line-height:1.5">Any HTML file that calls <code>fetch("http://localhost:12700/...")</code> is an x0x app. AI agents can generate them, publish them to the network, and other agents can discover and run them. The browser is the universal runtime.</p>
     </div>
     <h3>CLI Quick Reference</h3>
     <div class="card">
-      <table>
-        <thead><tr><th>Command</th><th>Description</th></tr></thead>
+      <table><thead><tr><th>Command</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td class="mono">x0x start</td><td>Start the daemon</td></tr>
           <tr><td class="mono">x0x gui</td><td>Open this GUI</td></tr>
-          <tr><td class="mono">x0x health</td><td>Health check</td></tr>
-          <tr><td class="mono">x0x agent</td><td>Show identity</td></tr>
-          <tr><td class="mono">x0x peers</td><td>List gossip peers</td></tr>
-          <tr><td class="mono">x0x agents list</td><td>Discovered agents</td></tr>
+          <tr><td class="mono">x0x agent card --name "You"</td><td>Generate shareable identity card</td></tr>
+          <tr><td class="mono">x0x agent import &lt;link&gt;</td><td>Import someone's card</td></tr>
           <tr><td class="mono">x0x group create &lt;name&gt;</td><td>Create a named group</td></tr>
           <tr><td class="mono">x0x group invite &lt;id&gt;</td><td>Generate invite link</td></tr>
           <tr><td class="mono">x0x group join &lt;link&gt;</td><td>Join via invite</td></tr>
-          <tr><td class="mono">x0x publish &lt;topic&gt; &lt;msg&gt;</td><td>Publish to gossip</td></tr>
-          <tr><td class="mono">x0x subscribe &lt;topic&gt;</td><td>Subscribe to topic</td></tr>
-          <tr><td class="mono">x0x direct send &lt;id&gt; &lt;msg&gt;</td><td>Direct message</td></tr>
-          <tr><td class="mono">x0x store create &lt;name&gt; &lt;topic&gt;</td><td>Create KV store</td></tr>
-          <tr><td class="mono">x0x store put &lt;id&gt; &lt;key&gt; &lt;val&gt;</td><td>Put value</td></tr>
-          <tr><td class="mono">x0x tasks create &lt;name&gt; &lt;topic&gt;</td><td>Create task list</td></tr>
-          <tr><td class="mono">x0x routes</td><td>Show all API endpoints</td></tr>
+          <tr><td class="mono">x0x store put &lt;id&gt; &lt;key&gt; &lt;val&gt;</td><td>Put value in KV store</td></tr>
+          <tr><td class="mono">x0x direct send &lt;id&gt; &lt;msg&gt;</td><td>Direct message an agent</td></tr>
+          <tr><td class="mono">x0x routes</td><td>Show all 70 API endpoints</td></tr>
         </tbody>
       </table>
     </div>
-    <h3 style="margin-top:16px">API Endpoint Count</h3>
-    <div class="card"><span id="h-endpoint-count" class="mono" style="font-size:1.2rem;font-weight:700;color:var(--cyan)">—</span> <span style="color:var(--dim)">REST endpoints available</span></div>
   </div>
 </main>
-
 <script>
-const API = location.origin;
-const WS_URL = location.origin.replace("http","ws") + "/ws";
-let ws = null, myAgentId = "", connected = false;
-let currentChatGroup = null, chatTopics = new Map();
+const API=location.origin;
+const WS_URL=location.origin.replace("http","ws")+"/ws";
+let ws=null,myAgentId="",connected=false;
+let currentWsGroup=null,chatTopics=new Map(),currentDmAgent=null,boardListId=null;
 
-// ─── Utilities ───
 function $(id){return document.getElementById(id)}
 function shortId(id){return id?id.slice(0,8)+"…":"—"}
 function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
@@ -284,6 +316,13 @@ document.querySelectorAll("nav button").forEach(btn=>{
   });
 });
 
+function switchSubTab(name){
+  document.querySelectorAll("#w-subtabs button").forEach(b=>b.classList.remove("active"));
+  document.querySelectorAll(".subpage").forEach(p=>p.classList.remove("active"));
+  document.querySelector('#w-subtabs button[data-sub="'+name+'"]').classList.add("active");
+  $("sub-"+name).classList.add("active");
+}
+
 // ─── Status ───
 function setStatus(on,text){$("dot").className="dot"+(on?" on":"");$("statusText").textContent=text;connected=on}
 
@@ -294,22 +333,34 @@ function connectWs(){
     const msg=JSON.parse(ev.data);
     if(msg.type==="connected"){myAgentId=msg.agent_id||"";$("agentTag").textContent=shortId(myAgentId);setStatus(true,"Connected")}
     else if(msg.type==="message"){handleGossipMsg(msg)}
+    else if(msg.type==="direct_message"){handleDirectMsg(msg)}
   };
   ws.onclose=()=>{setStatus(false,"Disconnected");setTimeout(connectWs,3000)};
   ws.onerror=()=>{};
 }
 
 function handleGossipMsg(msg){
-  if(!msg.topic||!currentChatGroup)return;
-  const info=chatTopics.get(currentChatGroup);
+  if(!msg.topic||!currentWsGroup)return;
+  const info=chatTopics.get(currentWsGroup);
   if(!info||msg.topic!==info.topic)return;
+  // Skip our own echoed messages — we already added them locally when sending
+  if(msg.origin===myAgentId)return;
   const data=b64d(msg.payload);
   if(!data)return;
-  const own=msg.origin===myAgentId;
-  addChatMsg(data.sender_name||shortId(msg.origin),data.text||"",own);
+  addChatMsg("c-messages",data.sender_name||shortId(msg.origin),data.text||"",false);
 }
 
-// ─── Dashboard polling ───
+function handleDirectMsg(msg){
+  if(!currentDmAgent)return;
+  const sender=msg.sender||"";
+  if(sender!==currentDmAgent)return;
+  const data=b64d(msg.payload);
+  if(data&&data.text){
+    addChatMsg("dm-messages",data.sender_name||shortId(sender),data.text,false);
+  }
+}
+
+// ─── Dashboard ───
 async function pollDashboard(){
   const h=await api("/health");
   if(!h||!h.ok){setStatus(false,"x0xd not reachable");return}
@@ -318,10 +369,8 @@ async function pollDashboard(){
   $("d-version").textContent=h.version||"—";
   $("d-peers").textContent=h.peers!=null?h.peers:"—";
   $("d-uptime").textContent=fmtUptime(h.uptime_secs);
-
   const a=await api("/agent");
   if(a&&a.ok){$("d-agent").textContent=a.agent_id||"—";$("d-machine").textContent=a.machine_id||"—";if(!myAgentId)myAgentId=a.agent_id||""}
-
   const d=await api("/agents/discovered");
   if(d&&d.agents){
     $("d-agent-count").textContent=d.agents.length;
@@ -330,26 +379,27 @@ async function pollDashboard(){
   }
 }
 
-// ─── Network polling ───
+// ─── Network ───
 async function pollNetwork(){
   const n=await api("/network/status");
   if(n&&n.ok){
-    // NAT type removed — unreliable to determine definitively
-    $("n-addrs").textContent=(n.external_addrs||[]).join(", ")||"none";
+    const addrs=(n.external_addrs||[]);
+    $("n-addrs").innerHTML=addrs.length?addrs.map(a=>'<div>'+esc(a)+'</div>').join(""):"none detected";
     $("n-conns").textContent=(n.direct_connections!=null?n.direct_connections:"—")+" / "+(n.relayed_connections!=null?n.relayed_connections:"—");
     $("n-rtt").textContent=n.avg_rtt_ms!=null?Math.round(n.avg_rtt_ms)+" ms":"N/A";
   }
   const p=await api("/peers");
-  if(p&&p.peers){
-    $("n-peer-count").textContent=p.peers.length;
-    $("n-peers").innerHTML=p.peers.length?p.peers.map(p=>'<span class="clickable" onclick="copyText(this)" title="'+p.id+'">'+shortId(p.id)+"</span>").join("<br>"):"No peers";
-  }
+  if(p&&p.peers){$("n-peer-count").textContent=p.peers.length;$("n-peers").innerHTML=p.peers.length?p.peers.map(p=>'<span class="clickable" onclick="copyText(this)" title="'+p.id+'">'+shortId(p.id)+"</span>").join("<br>"):"No peers"}
   const c=await api("/contacts");
   if(c&&c.contacts){
     $("n-contact-count").textContent=c.contacts.length;
     const body=$("n-contacts");
     if(c.contacts.length)body.innerHTML=c.contacts.map(c=>"<tr><td class='mono clickable' onclick='copyText(this)'>"+shortId(c.agent_id)+"</td><td>"+trustBadge(c.trust_level)+"</td><td>"+(c.label||"—")+"</td></tr>").join("");
     else body.innerHTML='<tr><td colspan="3" class="empty">No contacts</td></tr>';
+    // Update DM contacts list
+    updateDmContacts(c.contacts);
+    // Update file recipient dropdown
+    updateFileTargets(c.contacts);
   }
 }
 
@@ -358,133 +408,185 @@ async function pollGroups(){
   const g=await api("/groups");
   if(!g||!g.groups)return;
   const el=$("g-list");
-  const sel=$("c-group");
   if(!g.groups.length){el.innerHTML='<div class="empty">No groups yet — create one or join via invite</div>';return}
-  el.innerHTML=g.groups.map(gr=>{
-    return'<div class="card" style="margin-bottom:8px"><div class="row"><strong>'+esc(gr.name)+'</strong><span class="badge badge-cyan" style="margin-left:8px">'+gr.member_count+' member'+(gr.member_count!==1?"s":"")+'</span></div><div class="mono" style="font-size:.7rem;color:var(--dim);margin-bottom:6px">'+gr.group_id+'</div><div class="row"><button class="btn btn-sm btn-cyan" onclick="generateInvite(\''+gr.group_id+'\')">Generate Invite</button><span id="invite-'+gr.group_id+'" class="mono" style="font-size:.7rem;color:var(--dim);margin-left:8px;word-break:break-all"></span></div></div>';
-  }).join("");
-  // Update chat group selector
-  const current=sel.value;
+  el.innerHTML=g.groups.map(gr=>'<div class="card" style="margin-bottom:8px"><div class="row"><strong>'+esc(gr.name)+'</strong><span class="badge badge-cyan" style="margin-left:8px">'+gr.member_count+' member'+(gr.member_count!==1?"s":"")+'</span></div><div class="mono" style="font-size:.7rem;color:var(--dim);margin-bottom:6px">'+gr.group_id+'</div><div class="row"><button class="btn btn-sm btn-cyan" onclick="generateInvite(\''+gr.group_id+'\')">Generate Invite</button><button class="btn btn-sm" style="display:none;background:var(--card);border:1px solid var(--cyan);color:var(--cyan)" id="copy-invite-'+gr.group_id+'" onclick="copyInvite(\''+gr.group_id+'\')">Copy Link</button></div><div id="invite-'+gr.group_id+'" class="mono" style="font-size:.65rem;color:var(--dim);margin-top:4px;word-break:break-all;user-select:all;display:none"></div></div>').join("");
+  // Update workspace group selector
+  const sel=$("w-group");const current=sel.value;
   sel.innerHTML='<option value="">Select a group…</option>';
-  g.groups.forEach(gr=>{
-    const opt=document.createElement("option");
-    opt.value=gr.group_id;opt.textContent=gr.name;
-    sel.appendChild(opt);
-  });
+  g.groups.forEach(gr=>{const opt=document.createElement("option");opt.value=gr.group_id;opt.textContent=gr.name;sel.appendChild(opt)});
   if(current)sel.value=current;
 }
-
-async function createGroup(){
-  const name=$("g-name").value.trim();
-  if(!name)return;
-  const dn=$("g-display").value.trim()||undefined;
-  const body={name};
-  if(dn)body.display_name=dn;
-  const r=await api("/groups",{method:"POST",body:JSON.stringify(body)});
-  if(r&&r.ok){$("g-name").value="";$("g-display").value="";pollGroups()}
-}
-
-async function joinGroup(){
-  const link=$("g-invite-link").value.trim();
-  if(!link)return;
-  const r=await api("/groups/join",{method:"POST",body:JSON.stringify({invite:link})});
-  if(r&&r.ok){$("g-invite-link").value="";pollGroups()}
-  else if(r&&r.error){alert("Join failed: "+r.error)}
-}
-
-async function generateInvite(groupId){
-  const r=await api("/groups/"+groupId+"/invite",{method:"POST",body:JSON.stringify({})});
+async function createGroup(){const name=$("g-name").value.trim();if(!name)return;const dn=$("g-display").value.trim()||undefined;const body={name};if(dn)body.display_name=dn;const r=await api("/groups",{method:"POST",body:JSON.stringify(body)});if(r&&r.ok){$("g-name").value="";$("g-display").value="";pollGroups()}}
+async function joinGroup(){const link=$("g-invite-link").value.trim();if(!link)return;const r=await api("/groups/join",{method:"POST",body:JSON.stringify({invite:link})});if(r&&r.ok){$("g-invite-link").value="";pollGroups()}else if(r&&r.error){alert("Join failed: "+r.error)}}
+async function generateInvite(gid){
+  const r=await api("/groups/"+gid+"/invite",{method:"POST",body:JSON.stringify({})});
   if(r&&r.ok){
-    const el=$("invite-"+groupId);
-    if(el){el.textContent=r.invite_link;navigator.clipboard.writeText(r.invite_link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)})}
+    const el=$("invite-"+gid);
+    const copyBtn=$("copy-invite-"+gid);
+    if(el){el.textContent=r.invite_link;el.style.display="block"}
+    if(copyBtn){copyBtn.style.display="inline-flex";copyBtn.dataset.link=r.invite_link}
+    // Auto-copy on first generate
+    navigator.clipboard.writeText(r.invite_link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)});
+  }
+}
+function copyInvite(gid){
+  const btn=$("copy-invite-"+gid);
+  if(btn&&btn.dataset.link){
+    navigator.clipboard.writeText(btn.dataset.link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)});
   }
 }
 
-// ─── Chat ───
-function switchChatGroup(){
-  const groupId=$("c-group").value;
-  if(!groupId){currentChatGroup=null;$("c-input").disabled=true;$("c-send").disabled=true;return}
-  currentChatGroup=groupId;
+// ─── Workspace ───
+async function switchWorkspaceGroup(){
+  const gid=$("w-group").value;
+  if(!gid){currentWsGroup=null;$("c-input").disabled=true;$("c-send").disabled=true;$("b-task-title").disabled=true;$("b-add-btn").disabled=true;return}
+  currentWsGroup=gid;
   $("c-messages").innerHTML='<div class="sys-msg">Joined group chat</div>';
   $("c-input").disabled=false;$("c-send").disabled=false;
-
-  // Subscribe to group's general chat topic
-  api("/groups/"+groupId).then(g=>{
-    if(g&&g.ok){
-      const topic=g.chat_topic;
-      chatTopics.set(groupId,{topic});
-      $("c-topic").textContent=topic;
-      if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:"subscribe",topics:[topic]}))}
-    }
-  });
+  $("b-task-title").disabled=false;$("b-add-btn").disabled=false;
+  // Subscribe to chat topic
+  const g=await api("/groups/"+gid);
+  if(g&&g.ok){
+    chatTopics.set(gid,{topic:g.chat_topic});
+    $("w-group-name").textContent=g.name;
+    if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:"subscribe",topics:[g.chat_topic]}))}
+  }
+  // Create/load task list for this group
+  const boardTopic="x0x-board-"+gid.slice(0,16);
+  const existing=await api("/task-lists");
+  const found=(existing&&existing.task_lists||[]).find(t=>t.id===boardTopic);
+  if(!found){await api("/task-lists",{method:"POST",body:JSON.stringify({name:"Board: "+($("w-group").selectedOptions[0]?.textContent||gid.slice(0,8)),topic:boardTopic})})}
+  boardListId=boardTopic;
+  pollBoard();
 }
 
-function addChatMsg(sender,text,own){
+// ─── Chat ───
+function addChatMsg(containerId,sender,text,own){
   const el=document.createElement("div");
   el.className="msg "+(own?"own":"other");
   const now=new Date();
   el.innerHTML='<div class="msg-sender">'+esc(sender)+'</div><div>'+esc(text)+'</div><div class="msg-time">'+now.getHours().toString().padStart(2,"0")+":"+now.getMinutes().toString().padStart(2,"0")+"</div>";
-  $("c-messages").appendChild(el);
-  $("c-messages").scrollTop=$("c-messages").scrollHeight;
+  $(containerId).appendChild(el);
+  $(containerId).scrollTop=$(containerId).scrollHeight;
 }
-
 function sendChat(){
   const text=$("c-input").value.trim();
-  if(!text||!currentChatGroup||!ws||ws.readyState!==1)return;
-  const info=chatTopics.get(currentChatGroup);
-  if(!info)return;
-  const payload={text,sender_name:shortId(myAgentId),timestamp:Date.now()};
-  ws.send(JSON.stringify({type:"publish",topic:info.topic,payload:b64e(payload)}));
-  addChatMsg(shortId(myAgentId),text,true);
+  if(!text||!currentWsGroup||!ws||ws.readyState!==1)return;
+  const info=chatTopics.get(currentWsGroup);if(!info)return;
+  ws.send(JSON.stringify({type:"publish",topic:info.topic,payload:b64e({text,sender_name:shortId(myAgentId),timestamp:Date.now()})}));
+  addChatMsg("c-messages",shortId(myAgentId),text,true);
   $("c-input").value="";$("c-input").focus();
 }
 $("c-input").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});
+
+// ─── Board (Kanban) ───
+async function pollBoard(){
+  if(!boardListId)return;
+  const r=await api("/task-lists/"+boardListId+"/tasks");
+  if(!r||!r.tasks)return;
+  const todo=r.tasks.filter(t=>t.state==="Empty");
+  const prog=r.tasks.filter(t=>t.state&&t.state.startsWith&&(t.state.startsWith("Claimed")||t.state.startsWith("claimed")));
+  const done=r.tasks.filter(t=>t.state&&(t.state.startsWith("Done")||t.state.startsWith("done")));
+  $("b-todo").innerHTML=todo.length?todo.map(t=>taskCard(t,"claim")).join(""):'<div style="color:var(--dim);font-size:.8rem;padding:8px">No tasks</div>';
+  $("b-progress").innerHTML=prog.length?prog.map(t=>taskCard(t,"complete")).join(""):'<div style="color:var(--dim);font-size:.8rem;padding:8px">No tasks</div>';
+  $("b-done").innerHTML=done.length?done.map(t=>taskCard(t,null)).join(""):'<div style="color:var(--dim);font-size:.8rem;padding:8px">No tasks</div>';
+}
+function taskCard(t,action){
+  let btn="";
+  if(action==="claim")btn='<button class="btn btn-sm btn-orange" onclick="boardAction(\''+t.id+'\',\'claim\')">Claim</button>';
+  if(action==="complete")btn='<button class="btn btn-sm btn-green" onclick="boardAction(\''+t.id+'\',\'complete\')">Done</button>';
+  return'<div class="task-card"><div class="title">'+esc(t.title)+'</div>'+(t.assignee?'<div class="meta">'+shortId(t.assignee)+'</div>':'')+(btn?'<div class="actions">'+btn+'</div>':'')+'</div>';
+}
+async function addBoardTask(){
+  const title=$("b-task-title").value.trim();if(!title||!boardListId)return;
+  await api("/task-lists/"+boardListId+"/tasks",{method:"POST",body:JSON.stringify({title})});
+  $("b-task-title").value="";pollBoard();
+}
+async function boardAction(tid,action){
+  if(!boardListId)return;
+  await api("/task-lists/"+boardListId+"/tasks/"+tid,{method:"PATCH",body:JSON.stringify({action})});
+  pollBoard();
+}
+$("b-task-title").addEventListener("keydown",e=>{if(e.key==="Enter")addBoardTask()});
+setInterval(()=>{if(boardListId)pollBoard()},3000);
+
+// ─── Files ───
+function updateFileTargets(contacts){
+  const sel=$("f-target");const prev=sel.value;
+  sel.innerHTML='<option value="">Select recipient…</option>';
+  (contacts||[]).forEach(c=>{if(c.trust_level!=="Blocked"){const o=document.createElement("option");o.value=c.agent_id;o.textContent=(c.label||shortId(c.agent_id));sel.appendChild(o)}});
+  if(prev)sel.value=prev;
+}
+async function sendGroupFile(){
+  const target=$("f-target").value;const fileInput=$("f-file");
+  if(!target||!fileInput.files.length)return;
+  const file=fileInput.files[0];
+  const buf=await file.arrayBuffer();
+  const hash=await crypto.subtle.digest("SHA-256",buf);
+  const sha256=Array.from(new Uint8Array(hash)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  const r=await api("/files/send",{method:"POST",body:JSON.stringify({agent_id:target,filename:file.name,size:file.size,sha256})});
+  if(r&&r.ok){fileInput.value="";pollTransfers()}
+}
+async function pollTransfers(){
+  const r=await api("/files/transfers");
+  const el=$("f-transfers");
+  if(!r||!r.transfers||!r.transfers.length){el.innerHTML='<div class="empty">No transfers</div>';return}
+  el.innerHTML=r.transfers.map(t=>{
+    const pct=t.total_size>0?Math.round(100*t.bytes_transferred/t.total_size):0;
+    const dir=t.direction==="Sending"?"↑":"↓";
+    return'<div style="padding:8px;border-bottom:1px solid var(--border)"><span>'+dir+' '+esc(t.filename)+' <span class="badge badge-'+(t.status==="Complete"?"green":t.status==="InProgress"?"cyan":"orange")+'">'+t.status+'</span> '+pct+'%</span></div>';
+  }).join("");
+}
+setInterval(pollTransfers,3000);
+
+// ─── Direct Messages ───
+function updateDmContacts(contacts){
+  const el=$("dm-contacts");
+  const valid=(contacts||[]).filter(c=>c.trust_level!=="Blocked");
+  if(!valid.length){el.innerHTML='<div class="empty">Import a contact card to start messaging</div>';return}
+  el.innerHTML=valid.map(c=>{
+    const active=currentDmAgent===c.agent_id?" active":"";
+    return'<div class="dm-contact'+active+'" onclick="selectDmContact(\''+c.agent_id+'\',\''+esc(c.label||"")+'\')">'+'<span class="badge badge-cyan" style="font-size:.9rem">'+esc((c.label||shortId(c.agent_id))[0]||"?")+'</span>'+'<span>'+esc(c.label||shortId(c.agent_id))+'</span></div>';
+  }).join("");
+}
+function selectDmContact(agentId,label){
+  currentDmAgent=agentId;
+  $("dm-chat-header").textContent="Chat with "+(label||shortId(agentId));
+  $("dm-messages").innerHTML='<div class="sys-msg">Direct message with '+shortId(agentId)+'</div>';
+  $("dm-input").disabled=false;$("dm-send").disabled=false;
+  // Subscribe to direct messages via WebSocket
+  if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:"subscribe_direct"}))}
+  updateDmContacts(null); // refresh highlighting
+  pollNetwork(); // refresh contact list
+}
+function sendDm(){
+  const text=$("dm-input").value.trim();
+  if(!text||!currentDmAgent)return;
+  const payload=btoa(JSON.stringify({text,sender_name:shortId(myAgentId),ts:Date.now()}));
+  api("/direct/send",{method:"POST",body:JSON.stringify({agent_id:currentDmAgent,payload})});
+  addChatMsg("dm-messages",shortId(myAgentId),text,true);
+  $("dm-input").value="";$("dm-input").focus();
+}
+$("dm-input").addEventListener("keydown",e=>{if(e.key==="Enter")sendDm()});
 
 // ─── Identity Card ───
 async function generateCard(){
   const name=$("d-display-name").value.trim()||"Agent";
   const r=await api("/agent/card?display_name="+encodeURIComponent(name)+"&include_groups=true");
-  if(r&&r.link){
-    const el=$("d-card-link");
-    el.textContent=r.link;
-    el.style.display="block";
-    navigator.clipboard.writeText(r.link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)});
-  }
+  if(r&&r.link){const el=$("d-card-link");el.textContent=r.link;el.style.display="block";navigator.clipboard.writeText(r.link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)})}
 }
-
 async function importCard(){
-  const link=$("d-import-card").value.trim();
-  if(!link)return;
+  const link=$("d-import-card").value.trim();if(!link)return;
   const r=await api("/agent/card/import",{method:"POST",body:JSON.stringify({card:link,trust_level:"known"})});
-  const el=$("d-import-result");
-  el.style.display="block";
-  if(r&&r.ok){
-    el.style.color="var(--green)";
-    el.textContent="Imported: "+r.display_name+" ("+r.trust_level+")";
-    $("d-import-card").value="";
-    pollDashboard();
-  } else {
-    el.style.color="var(--red)";
-    el.textContent="Error: "+(r&&r.error||"import failed");
-  }
-}
-
-// ─── Help ───
-async function loadHelp(){
-  // Count endpoints from routes
-  try{const r=await api("/health");if(r)$("h-endpoint-count").textContent="63+"}catch{}
+  const el=$("d-import-result");el.style.display="block";
+  if(r&&r.ok){el.style.color="var(--green)";el.textContent="Imported: "+r.display_name+" ("+r.trust_level+")";$("d-import-card").value="";pollDashboard();pollNetwork()}
+  else{el.style.color="var(--red)";el.textContent="Error: "+(r&&r.error||"import failed")}
 }
 
 // ─── Init ───
 async function init(){
-  await pollDashboard();
-  connectWs();
-  pollGroups();
-  pollNetwork();
-  loadHelp();
-  setInterval(pollDashboard,5000);
-  setInterval(pollGroups,5000);
-  setInterval(pollNetwork,5000);
+  await pollDashboard();connectWs();pollGroups();pollNetwork();
+  setInterval(pollDashboard,5000);setInterval(pollGroups,5000);setInterval(pollNetwork,5000);
 }
 init();
 </script>
