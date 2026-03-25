@@ -25,17 +25,17 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 
 ## Task 1: Create Bootstrap Node Binary
 
-**Goal**: Create x0x-bootstrap binary with coordinator/reflector capabilities
+**Goal**: Create x0xd binary with coordinator/reflector capabilities
 
 **Files**:
-- `crates/x0x-bootstrap/Cargo.toml` (new)
-- `crates/x0x-bootstrap/src/main.rs` (new)
-- `crates/x0x-bootstrap/src/config.rs` (new)
+- `crates/x0xd/Cargo.toml` (new)
+- `crates/x0xd/src/main.rs` (new)
+- `crates/x0xd/src/config.rs` (new)
 
 **Requirements**:
 1. Binary accepts `--config` flag for TOML config file
 2. Config includes:
-   - Bind address (0.0.0.0:12000)
+   - Bind address (0.0.0.0:5483)
    - Health endpoint (127.0.0.1:12600)
    - Coordinator role (true)
    - Reflector role (true)
@@ -71,7 +71,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 - `.deployment/bootstrap-tokyo.toml` (new)
 
 **Requirements**:
-1. Each config specifies its bind address (IP:12000)
+1. Each config specifies its bind address (IP:5483)
 2. Each config lists other 5 nodes as known peers
 3. Health endpoint at 127.0.0.1:12600
 4. Log level: info
@@ -83,21 +83,21 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 - Validate peer lists are complete
 
 **Validation**:
-- `cargo run --bin x0x-bootstrap -- --config .deployment/bootstrap-nyc.toml --check`
+- `cargo run --bin x0xd -- --config .deployment/bootstrap-nyc.toml --check`
 
 ---
 
 ## Task 3: Create Systemd Service Unit
 
-**Goal**: Create systemd service for x0x-bootstrap
+**Goal**: Create systemd service for x0xd
 
 **Files**:
-- `.deployment/x0x-bootstrap.service` (new)
+- `.deployment/x0xd.service` (new)
 - `.deployment/install.sh` (new)
 
 **Requirements**:
 1. Service runs as `x0x` user
-2. Binary at `/opt/x0x/x0x-bootstrap`
+2. Binary at `/opt/x0x/x0xd`
 3. Config at `/etc/x0x/bootstrap.toml`
 4. Working directory: `/var/lib/x0x`
 5. Restart policy: always (with backoff)
@@ -108,7 +108,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 **install.sh**:
 - Create `x0x` user if doesn't exist
 - Create directories: `/opt/x0x`, `/etc/x0x`, `/var/lib/x0x`
-- Copy binary to `/opt/x0x/x0x-bootstrap`
+- Copy binary to `/opt/x0x/x0xd`
 - Copy config to `/etc/x0x/bootstrap.toml`
 - Install systemd service
 - Enable and start service
@@ -125,7 +125,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 
 ## Task 4: Cross-Compile for Linux x64
 
-**Goal**: Build x0x-bootstrap for Linux x64 (VPS target)
+**Goal**: Build x0xd for Linux x64 (VPS target)
 
 **Files**:
 - `.github/workflows/build-bootstrap.yml` (new)
@@ -133,7 +133,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 
 **Requirements**:
 1. Use `cargo zigbuild --target x86_64-unknown-linux-gnu --release`
-2. Binary output: `target/x86_64-unknown-linux-gnu/release/x0x-bootstrap`
+2. Binary output: `target/x86_64-unknown-linux-gnu/release/x0xd`
 3. Strip debug symbols
 4. Verify binary is statically linked (check ldd)
 5. GitHub workflow for automated builds on push to main
@@ -143,8 +143,8 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 - Check binary size (should be <30MB stripped)
 
 **Validation**:
-- `cargo zigbuild --target x86_64-unknown-linux-gnu --release -p x0x-bootstrap`
-- `file target/x86_64-unknown-linux-gnu/release/x0x-bootstrap` (ELF 64-bit)
+- `cargo zigbuild --target x86_64-unknown-linux-gnu --release -p x0xd`
+- `file target/x86_64-unknown-linux-gnu/release/x0xd` (ELF 64-bit)
 
 ---
 
@@ -156,13 +156,13 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 - `scripts/deploy-single.sh` (new)
 
 **Requirements**:
-1. SCP binary to saorsa-2:/opt/x0x/x0x-bootstrap
+1. SCP binary to saorsa-2:/opt/x0x/x0xd
 2. SCP config to saorsa-2:/etc/x0x/bootstrap.toml (bootstrap-nyc.toml)
-3. SCP service to saorsa-2:/etc/systemd/system/x0x-bootstrap.service
+3. SCP service to saorsa-2:/etc/systemd/system/x0xd.service
 4. SSH run install.sh
-5. Verify service is running: `systemctl status x0x-bootstrap`
+5. Verify service is running: `systemctl status x0xd`
 6. Verify health endpoint: `curl http://127.0.0.1:12600/health`
-7. Check logs: `journalctl -u x0x-bootstrap -n 50 --no-pager`
+7. Check logs: `journalctl -u x0xd -n 50 --no-pager`
 
 **Tests**:
 - Connect to health endpoint returns 200
@@ -252,7 +252,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 
 **Requirements**:
 1. Add `DEFAULT_BOOTSTRAP_PEERS` constant with all 6 addresses
-2. Format: `[IP]:[PORT]` (e.g., "142.93.199.50:12000")
+2. Format: `[IP]:[PORT]` (e.g., "142.93.199.50:5483")
 3. Agent::builder() uses these by default unless overridden
 4. Document in rustdoc and SDK docs
 
@@ -269,7 +269,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 
 ## Completion Criteria
 
-- [ ] All 6 VPS nodes running x0x-bootstrap
+- [ ] All 6 VPS nodes running x0xd
 - [ ] Full mesh connectivity (each node has 5 peers)
 - [ ] Health endpoints responding
 - [ ] No errors in journalctl logs
@@ -282,7 +282,7 @@ Deploy production-ready x0x nodes to Saorsa Labs VPS infrastructure. These nodes
 ## Rollback Plan
 
 If deployment fails:
-1. Stop services: `ssh root@<IP> 'systemctl stop x0x-bootstrap'`
+1. Stop services: `ssh root@<IP> 'systemctl stop x0xd'`
 2. Remove binaries: `ssh root@<IP> 'rm -rf /opt/x0x/*'`
 3. Clean logs: `ssh root@<IP> 'journalctl --vacuum-time=1d'`
 

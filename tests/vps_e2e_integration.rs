@@ -8,8 +8,8 @@
 //!
 //! - **VPS e2e** (`#[ignore = "requires live VPS bootstrap nodes"]`):
 //!   Same tests but with VPS bootstrap nodes added. Must be run from a
-//!   machine with UDP access to port 12000 on the VPS nodes (not behind
-//!   restrictive NAT). Run from a VPS or with UDP 12000 open.
+//!   machine with UDP access to port 5483 on the VPS nodes (not behind
+//!   restrictive NAT). Run from a VPS or with UDP 5483 open.
 //!
 //! Run local tests:
 //! ```bash
@@ -374,10 +374,10 @@ async fn test_local_user_identity_discovery() {
 
 // ---------------------------------------------------------------------------
 // VPS variants (same tests but with live bootstrap nodes)
-// Must be run from a machine with UDP access to port 12000.
+// Must be run from a machine with UDP access to port 5483.
 // ---------------------------------------------------------------------------
 
-#[ignore = "requires live VPS bootstrap nodes (UDP port 12000 must be accessible)"]
+#[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vps_identity_announcement_and_discovery() {
     let dir_a = TempDir::new().unwrap();
@@ -425,7 +425,7 @@ async fn test_vps_identity_announcement_and_discovery() {
     assert!(!entry.machine_public_key.is_empty());
 }
 
-#[ignore = "requires live VPS bootstrap nodes (UDP port 12000 must be accessible)"]
+#[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vps_late_join_heartbeat_discovery() {
     let dir_a = TempDir::new().unwrap();
@@ -467,7 +467,7 @@ async fn test_vps_late_join_heartbeat_discovery() {
     );
 }
 
-#[ignore = "requires live VPS bootstrap nodes (UDP port 12000 must be accessible)"]
+#[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vps_rendezvous_find_agent() {
     let dir_a = TempDir::new().unwrap();
@@ -511,7 +511,7 @@ async fn test_vps_rendezvous_find_agent() {
     );
 }
 
-#[ignore = "requires live VPS bootstrap nodes (UDP port 12000 must be accessible)"]
+#[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vps_user_identity_discovery() {
     let dir_a = TempDir::new().unwrap();

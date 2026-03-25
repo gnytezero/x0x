@@ -2,13 +2,13 @@
 
 **Date**: 2026-02-06
 **Status**: BLOCKED (External Dependency)
-**Blocker**: x0x-bootstrap binary (requires CI build or Linux native compilation)
+**Blocker**: x0xd binary (requires CI build or Linux native compilation)
 
 ---
 
 ## Executive Summary
 
-Milestone 3 is 40% complete. All infrastructure, configuration, and SDK integration is ready for deployment. The blocker is a single external dependency: the x0x-bootstrap binary must be built on Linux (via GitHub Actions CI or local Linux environment) before VPS deployment and integration testing can proceed.
+Milestone 3 is 40% complete. All infrastructure, configuration, and SDK integration is ready for deployment. The blocker is a single external dependency: the x0xd binary must be built on Linux (via GitHub Actions CI or local Linux environment) before VPS deployment and integration testing can proceed.
 
 ---
 
@@ -19,7 +19,7 @@ Milestone 3 is 40% complete. All infrastructure, configuration, and SDK integrat
 **✅ Completed Tasks (6/10)**:
 
 #### Task 1: Bootstrap Node Binary
-- Binary source at `src/bin/x0x-bootstrap.rs`
+- Binary source at `src/bin/x0xd.rs`
 - Coordinator, reflector, relay roles
 - Health endpoint (port 12600)
 - Graceful shutdown
@@ -126,7 +126,7 @@ Milestone 3 is 40% complete. All infrastructure, configuration, and SDK integrat
 ```
 .deployment/
 ├── bootstrap-*.toml (6 configs)
-├── x0x-bootstrap.service (systemd)
+├── x0xd.service (systemd)
 ├── install.sh (installation automation)
 ├── deploy.sh (automated deployment to all nodes)
 ├── health-check.sh (network health monitoring)
@@ -150,7 +150,7 @@ git push origin main
 gh run list --workflow=build-bootstrap.yml
 
 # Once complete, download artifact
-gh run download <run-id> -n x0x-bootstrap-linux-x64
+gh run download <run-id> -n x0xd-linux-x64
 
 # Continue with deployment
 .deployment/deploy.sh all
@@ -167,17 +167,17 @@ gh run download <run-id> -n x0x-bootstrap-linux-x64
 # Option B1: Docker
 docker run -it --rm -v $(pwd):/workspace rust:latest
 cd /workspace
-cargo build --release --bin x0x-bootstrap
+cargo build --release --bin x0xd
 exit
 
 # Option B2: Linux VM/server
 ssh user@linux-machine
 git clone <repo>
 cd x0x
-cargo build --release --bin x0x-bootstrap
+cargo build --release --bin x0xd
 
 # Then deploy
-scp target/release/x0x-bootstrap root@saorsa-2:/tmp/
+scp target/release/x0xd root@saorsa-2:/tmp/
 .deployment/deploy.sh all
 ```
 
@@ -196,7 +196,7 @@ Skip deployment for now and work on documentation tasks that don't require the t
 - **Build Method**: CI (ubuntu-latest) or native Linux
 - **Size**: ~6-10MB (stripped)
 - **Format**: ELF 64-bit
-- **Output**: `target/x86_64-unknown-linux-gnu/release/x0x-bootstrap` or CI artifact
+- **Output**: `target/x86_64-unknown-linux-gnu/release/x0xd` or CI artifact
 
 ### Why macOS Cross-Compilation Failed
 - OpenSSL-sys dependency issues during cross-compilation
@@ -221,7 +221,7 @@ Skip deployment for now and work on documentation tasks that don't require the t
 This will:
 1. Upload binary to all 6 VPS nodes
 2. Install systemd service
-3. Start x0x-bootstrap on each node
+3. Start x0xd on each node
 4. Verify health endpoints
 
 ### Verification
@@ -312,6 +312,6 @@ e591506 feat(phase-3.1): task 2 - create deployment configuration
 ---
 
 **Milestone 3 Status**: 40% COMPLETE, BLOCKED
-**Action Required**: Trigger CI build for x0x-bootstrap binary
+**Action Required**: Trigger CI build for x0xd binary
 **ETA to Unblock**: 5-15 minutes
 **Autonomous Resume**: Yes (after binary available)

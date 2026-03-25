@@ -247,9 +247,9 @@ Transitioning to testnet deployment and integration testing.
 
 ### Tasks Completed (10/10)
 
-1. ✅ **Bootstrap Binary**: `src/bin/x0x-bootstrap.rs` (266 lines) with health endpoint, graceful shutdown
+1. ✅ **Bootstrap Binary**: `src/bin/x0xd.rs` (266 lines) with health endpoint, graceful shutdown
 2. ✅ **Configuration Files**: 6 TOML configs for each VPS node (.deployment/*.toml)
-3. ✅ **Systemd Service**: x0x-bootstrap.service with auto-restart, security hardening
+3. ✅ **Systemd Service**: x0xd.service with auto-restart, security hardening
 4. ✅ **Build Infrastructure**: scripts/build-linux.sh for cross-compilation (cargo-zigbuild)
 5. ✅ **Deployment NYC**: saorsa-2 (142.93.199.50) deployed and healthy
 6. ✅ **Deployment SFO**: saorsa-3 (147.182.234.192) deployed and healthy
@@ -261,12 +261,12 @@ Transitioning to testnet deployment and integration testing.
 ### Deployment Summary
 
 **All 6 VPS Nodes Active:**
-- 142.93.199.50:12000 (NYC, US) - DigitalOcean
-- 147.182.234.192:12000 (SFO, US) - DigitalOcean
-- 65.21.157.229:12000 (Helsinki, FI) - Hetzner
-- 116.203.101.172:12000 (Nuremberg, DE) - Hetzner
-- 149.28.156.231:12000 (Singapore, SG) - Vultr
-- 45.77.176.184:12000 (Tokyo, JP) - Vultr
+- 142.93.199.50:5483 (NYC, US) - DigitalOcean
+- 147.182.234.192:5483 (SFO, US) - DigitalOcean
+- 65.21.157.229:5483 (Helsinki, FI) - Hetzner
+- 116.203.101.172:5483 (Nuremberg, DE) - Hetzner
+- 149.28.156.231:5483 (Singapore, SG) - Vultr
+- 45.77.176.184:5483 (Tokyo, JP) - Vultr
 
 **Health Status**: All nodes returning `{"status":"healthy","peers":0}`
 (Peer counting is TODO - nodes ARE connected per join_network logs)
@@ -285,12 +285,12 @@ Transitioning to testnet deployment and integration testing.
 
 **Deployment** (14 files, ~1,200 lines):
 - 6 TOML configs (bootstrap-*.toml)
-- systemd service unit (x0x-bootstrap.service)
+- systemd service unit (x0xd.service)
 - 5 deployment scripts (deploy.sh, install.sh, health-check.sh, logs.sh, cleanup.sh)
 - Cross-compilation script (build-linux.sh)
 - README.md with full documentation
 
-**Binary**: x0x-bootstrap (2.5MB stripped, ELF 64-bit)
+**Binary**: x0xd (2.5MB stripped, ELF 64-bit)
 
 ### Next Phase
 
@@ -309,19 +309,19 @@ Transitioning to testnet deployment and integration testing.
 **Testnet Deployment** ✅
 
 All 10 tasks completed (Grade A+):
-- [x] Task 1-2: x0x-bootstrap binary and coordinator config (266 lines)
+- [x] Task 1-2: x0xd binary and coordinator config (266 lines)
 - [x] Task 3-4: Cross-compilation and systemd service
 - [x] Task 5-6: Deployment scripts and VPS deployment
 - [x] Task 7-8: Health monitoring and bootstrap address embedding
 - [x] Task 9-10: Documentation and verification
 
 **Global Network Status:**
-- NYC (142.93.199.50:12000) ✅ HEALTHY
-- SFO (147.182.234.192:12000) ✅ HEALTHY
-- Helsinki (65.21.157.229:12000) ✅ HEALTHY
-- Nuremberg (116.203.101.172:12000) ✅ HEALTHY
-- Singapore (149.28.156.231:12000) ✅ HEALTHY
-- Tokyo (45.77.176.184:12000) ✅ HEALTHY
+- NYC (142.93.199.50:5483) ✅ HEALTHY
+- SFO (147.182.234.192:5483) ✅ HEALTHY
+- Helsinki (65.21.157.229:5483) ✅ HEALTHY
+- Nuremberg (116.203.101.172:5483) ✅ HEALTHY
+- Singapore (149.28.156.231:5483) ✅ HEALTHY
+- Tokyo (45.77.176.184:5483) ✅ HEALTHY
 
 **Deliverables**: Binary (2.5MB), 6 configs, systemd service, 5 scripts (~650 lines), docs (376 lines)
 **Build**: 281/281 tests passing, zero warnings

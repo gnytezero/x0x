@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.8.0] - 2026-03-25
+
+### Breaking Changes
+
+- **Default QUIC port: 5483** (was random/12000). All x0x nodes now use the same well-known port. If you know an IP, connect to `IP:5483`. Port 5483 = LIVE on a phone keypad.
+
+- **x0x-bootstrap binary removed.** Every x0x node is a bootstrap node. No special binary needed. The 6 VPS infrastructure nodes now run standard `x0xd` on port 5483.
+
+### Added
+
+- **Shared peer cache** — all named instances (default, alice, bob) share one `peers.cache` file at the platform data dir root. ant-quic's BootstrapCache handles concurrent access via atomic writes + file locking.
+
+- **Compiled-in seed peers** — 6 Saorsa Labs nodes pre-configured as seeds. On first run with empty cache, these are loaded automatically. After first connection, cache grows naturally with quality-scored peers.
+
+### Changed
+
+- `DEFAULT_BOOTSTRAP_PEERS` updated to port 5483 (was 12000)
+- All 6 VPS nodes migrated from `x0x-bootstrap` to `x0xd`
+- All docs, CI, tests, deployment scripts updated to port 5483
+- `build-bootstrap.yml` workflow deleted
+
+### Architecture
+
+Every node in ant-quic v0.13.0+ is symmetric P2P: any node can coordinate NAT traversal, relay via MASQUE (RFC 9298), and reflect addresses. The separate bootstrap binary was unnecessary complexity. What makes a node a "bootstrap" is simply being reachable and known — which is what the peer cache provides.
+
 ## [v0.7.0] - 2026-03-25
 
 ### Added

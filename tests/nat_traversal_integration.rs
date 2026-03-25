@@ -11,12 +11,12 @@ use x0x::{network::NetworkConfig, Agent};
 
 /// Global VPS bootstrap nodes (from Phase 3.1 deployment)
 const VPS_NODES: &[&str] = &[
-    "142.93.199.50:12000",   // saorsa-2 (NYC)
-    "147.182.234.192:12000", // saorsa-3 (SFO)
-    "65.21.157.229:12000",   // saorsa-6 (Helsinki)
-    "116.203.101.172:12000", // saorsa-7 (Nuremberg)
-    "149.28.156.231:12000",  // saorsa-8 (Singapore)
-    "45.77.176.184:12000",   // saorsa-9 (Tokyo)
+    "142.93.199.50:5483",   // saorsa-2 (NYC)
+    "147.182.234.192:5483", // saorsa-3 (SFO)
+    "65.21.157.229:5483",   // saorsa-6 (Helsinki)
+    "116.203.101.172:5483", // saorsa-7 (Nuremberg)
+    "149.28.156.231:5483",  // saorsa-8 (Singapore)
+    "45.77.176.184:5483",   // saorsa-9 (Tokyo)
 ];
 
 /// Helper to create agent with VPS bootstrap nodes.

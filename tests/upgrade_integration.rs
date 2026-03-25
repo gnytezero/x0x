@@ -341,12 +341,12 @@ fn end_to_end_sign_write_verify() {
     let dir = TempDir::new().unwrap();
 
     let binary_data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
-    let binary_path = dir.path().join("x0x-bootstrap");
+    let binary_path = dir.path().join("x0xd");
     std::fs::write(&binary_path, &binary_data).unwrap();
 
     let sig = sign_with_context(&sk, &binary_data).expect("sign");
 
-    let sig_path = dir.path().join("x0x-bootstrap.sig");
+    let sig_path = dir.path().join("x0xd.sig");
     std::fs::write(&sig_path, &sig).unwrap();
 
     let sig_from_file = std::fs::read(&sig_path).unwrap();
