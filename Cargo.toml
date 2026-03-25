@@ -60,6 +60,7 @@ zeroize = "1.8.2"
 futures = { version = "0.3", features = ["alloc"] }
 async-stream = "0.3.6"
 uuid = { version = "1.20.0", features = ["v4"] }
+which = "7"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
@@ -81,6 +82,10 @@ path = "src/bin/x0xd.rs"
 [[bin]]
 name = "x0x-keygen"
 path = "src/bin/x0x-keygen.rs"
+
+[[bin]]
+name = "x0x"
+path = "src/bin/x0x.rs"
 
 [workspace]
 members = [

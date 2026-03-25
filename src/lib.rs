@@ -107,6 +107,15 @@ pub mod direct;
 /// Self-update system with ML-DSA-65 signature verification and staged rollout.
 pub mod upgrade;
 
+/// File transfer protocol types and state management.
+pub mod files;
+
+/// Shared API endpoint registry consumed by both x0xd and the x0x CLI.
+pub mod api;
+
+/// CLI infrastructure and command implementations.
+pub mod cli;
+
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,

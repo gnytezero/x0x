@@ -127,6 +127,12 @@ Type aliases: `error::Result<T>` for identity, `error::NetworkResult<T>` for net
 
 Keypairs are serialized with **bincode** (compact binary), not JSON. Manual serialization via `storage.rs` with explicit `public_key`/`secret_key` fields. Default path: `~/.x0x/`.
 
+## Binary: x0x (CLI)
+
+`src/bin/x0x.rs` — unified CLI that controls a running `x0xd` daemon. Every REST endpoint is mapped to a CLI subcommand. Shared endpoint registry in `src/api/mod.rs` ensures routes and CLI commands stay in sync. CLI modules in `src/cli/`.
+
+Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x groups`, `x0x tasks`, `x0x routes` (prints all 50 endpoints).
+
 ## Binary: x0x-bootstrap
 
 `src/bin/x0x-bootstrap.rs` — the bootstrap node binary deployed to 6 VPS nodes. Runs as coordinator/reflector/relay for NAT traversal. Config via `--config /etc/x0x/bootstrap.toml`. Health/metrics on `127.0.0.1:12600`. Machine key persisted in `/var/lib/x0x/machine.key`.

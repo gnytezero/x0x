@@ -265,6 +265,10 @@ struct AppState {
     api_address: SocketAddr,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
+    /// Active file transfers.
+    file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,
+    /// Channel to trigger graceful shutdown from the /shutdown endpoint.
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +834,7 @@ async fn main() -> Result<()> {
     // start immediately. Network-dependent endpoints will return errors
     // until join completes, which is better than blocking the entire API.
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let agent = Arc::new(agent);
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
@@ -843,6 +848,8 @@ async fn main() -> Result<()> {
         api_address: config.api_address,
         start_time: Instant::now(),
         broadcast_tx,
+        file_transfers: RwLock::new(HashMap::new()),
+        shutdown_tx,
     });
 
     // Join network in background — API is available immediately
@@ -1001,6 +1008,13 @@ async fn main() -> Result<()> {
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
         .route("/ws/sessions", get(ws_sessions))
+        .route("/shutdown", post(shutdown_handler))
+        // File transfer endpoints
+        .route("/files/send", post(file_send_handler))
+        .route("/files/transfers", get(file_transfers_handler))
+        .route("/files/transfers/:id", get(file_transfer_status_handler))
+        .route("/files/accept/:id", post(file_accept_handler))
+        .route("/files/reject/:id", post(file_reject_handler))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
@@ -1018,7 +1032,16 @@ async fn main() -> Result<()> {
     );
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    tracing::info!("Received Ctrl+C shutdown signal");
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("Received API shutdown request");
+                }
+            }
+        })
         .await
         .context("API server error")?;
 
@@ -1106,9 +1129,150 @@ async fn list_instances() -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = signal::ctrl_c().await;
-    tracing::info!("Received shutdown signal");
+/// POST /shutdown — trigger graceful daemon shutdown.
+async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    tracing::info!("Shutdown requested via API");
+    let _ = state.shutdown_tx.send(()).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "message": "shutting down"})),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// File transfer endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /files/send — initiate a file transfer to an agent.
+async fn file_send_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id = body.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let filename = body
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unnamed");
+    let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let sha256 = body.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+
+    if agent_id.is_empty() || sha256.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "agent_id and sha256 are required"})),
+        );
+    }
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let transfer = x0x::files::TransferState {
+        transfer_id: transfer_id.clone(),
+        direction: x0x::files::TransferDirection::Sending,
+        remote_agent_id: agent_id.to_string(),
+        filename: filename.to_string(),
+        total_size: size,
+        bytes_transferred: 0,
+        status: x0x::files::TransferStatus::Pending,
+        sha256: sha256.to_string(),
+        error: None,
+        started_at: now,
+    };
+
+    state
+        .file_transfers
+        .write()
+        .await
+        .insert(transfer_id.clone(), transfer);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "transfer_id": transfer_id})),
+    )
+}
+
+/// GET /files/transfers — list all file transfers.
+async fn file_transfers_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let transfers = state.file_transfers.read().await;
+    let list: Vec<&x0x::files::TransferState> = transfers.values().collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "transfers": list})),
+    )
+}
+
+/// GET /files/transfers/:id — get a single transfer's status.
+async fn file_transfer_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let transfers = state.file_transfers.read().await;
+    match transfers.get(&id) {
+        Some(t) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "transfer": t})),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "transfer not found"})),
+        ),
+    }
+}
+
+/// POST /files/accept/:id — accept an incoming transfer.
+async fn file_accept_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut transfers = state.file_transfers.write().await;
+    match transfers.get_mut(&id) {
+        Some(t) if t.status == x0x::files::TransferStatus::Pending => {
+            t.status = x0x::files::TransferStatus::InProgress;
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+        Some(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "transfer is not pending"})),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "transfer not found"})),
+        ),
+    }
+}
+
+/// POST /files/reject/:id — reject an incoming transfer.
+async fn file_reject_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let reason = body
+        .as_ref()
+        .and_then(|b| b.get("reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("rejected by user")
+        .to_string();
+
+    let mut transfers = state.file_transfers.write().await;
+    match transfers.get_mut(&id) {
+        Some(t) if t.status == x0x::files::TransferStatus::Pending => {
+            t.status = x0x::files::TransferStatus::Rejected;
+            t.error = Some(reason);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+        Some(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "transfer is not pending"})),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "transfer not found"})),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
