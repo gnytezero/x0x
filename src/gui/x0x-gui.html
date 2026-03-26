@@ -536,6 +536,12 @@ function navigateDm(agentId){navigate('dm',{dmTarget:agentId})}
 
 // Utility
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+// JS-string escaper for use inside onclick='...' inline handlers.
+// Escapes quotes, backslashes, and control chars so the value is safe inside a JS string literal.
+function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\x3c').replace(/>/g,'\\x3e')}
+// Unicode-safe base64 encode/decode for KvStore values (wiki, web, etc.)
+function u8encode(s){return btoa(unescape(encodeURIComponent(s)))}
+function u8decode(s){return decodeURIComponent(escape(atob(s)))}
 function short(s,n){return s?(s.substring(0,n||10)+'…'):'—'}
 function copyId(el){navigator.clipboard.writeText(el.textContent.replace('agent:','').replace('…','')).then(()=>toast('Copied to clipboard','info'))}
 function copyText(text){navigator.clipboard.writeText(text).then(()=>toast('Copied','info'))}
@@ -626,9 +632,9 @@ async function createChannel(spaceId){
   // Read existing channels, add new one
   const existing=await api('/stores/'+storeId+'/channels_index');
   let channels=[];
-  if(existing&&existing.value){try{channels=JSON.parse(atob(existing.value))}catch(e){}}
+  if(existing&&existing.value){try{channels=JSON.parse(u8decode(existing.value))}catch(e){}}
   channels.push(channel);
-  await api('/stores/'+storeId+'/channels_index',{method:'PUT',body:JSON.stringify({value:btoa(JSON.stringify(channels)),content_type:'application/json'})});
+  await api('/stores/'+storeId+'/channels_index',{method:'PUT',body:JSON.stringify({value:u8encode(JSON.stringify(channels)),content_type:'application/json'})});
   channelCache[spaceId]=channels;
   document.querySelector('.modal-overlay').remove();
   toast('Channel #'+name+' created','success');
@@ -640,7 +646,7 @@ async function loadSpaceChannels(spaceId){
   const r=await api('/stores/'+storeId+'/channels_index');
   if(r&&r.value){
     try{
-      const channels=JSON.parse(atob(r.value));
+      const channels=JSON.parse(u8decode(r.value));
       channelCache[spaceId]=channels;
       return channels;
     }catch(e){}
@@ -706,7 +712,7 @@ function renderSidebar(){
       channels.forEach(ch=>{
         const chActive=sapp==='chat'&&curChan===ch.name;
         const unread=LS.get('unread_ch_'+g.group_id+'_'+ch.name,0);
-        sh+='<div class="channel-item'+(chActive?' active':'')+'" onclick="navigateChannel(\''+g.group_id+'\',\''+esc(ch.name)+'\')">';
+        sh+='<div class="channel-item'+(chActive?' active':'')+'" onclick="navigateChannel(\''+escJs(g.group_id)+'\',\''+escJs(ch.name)+'\')">';
         sh+='<span class="hash">#</span><span>'+esc(ch.name)+'</span>';
         if(unread>0)sh+='<span class="unread">'+unread+'</span>';
         sh+='</div>';
@@ -988,6 +994,14 @@ function addChatMsg(chatKey,msg){
   if(S.get('view')==='space'&&S.get('spaceApp')==='chat'&&chatKey===currentKey){
     const msgs=document.getElementById('chat-msgs');
     if(msgs){appendChatMsg(msgs,msg,sid);msgs.scrollTop=msgs.scrollHeight}
+  } else if(!msg.own){
+    // Increment unread count for channels/spaces not currently viewed
+    const parts=chatKey.split('_');
+    if(parts.length>=2){
+      const unreadKey='unread_ch_'+chatKey;
+      LS.set(unreadKey,(LS.get(unreadKey,0))+1);
+      renderSidebar();
+    }
   }
 }
 
@@ -1029,10 +1043,10 @@ function appendChatMsg(container,m,spaceId){
     ${!m.own&&trust?'<span class="trust trust-'+trust.toLowerCase()+'" style="font-size:8px;padding:0 4px">'+trust+'</span>':''}
     <span>${fmtTime(m.timestamp)}</span>
     ${isBroadcast?'<span style="font-size:10px;color:var(--tx3);margin-left:4px">replied in thread</span>':''}
-    ${!isBroadcast&&msgId&&spaceId?'<button class="ghost" style="font-size:10px;padding:2px 6px;margin-left:auto" onclick="openThreadById(\''+esc(spaceId)+'\',\''+esc(msgId)+'\')">Reply</button>':''}
+    ${!isBroadcast&&msgId&&spaceId?'<button class="ghost" style="font-size:10px;padding:2px 6px;margin-left:auto" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">Reply</button>':''}
   </div>
   <div class="body">${esc(m.text||'')}</div>
-  ${tc&&tc.reply_count>0?'<div class="thread-indicator" id="thread-ind-'+esc(msgId)+'" onclick="openThreadById(\''+esc(spaceId)+'\',\''+esc(msgId)+'\')"><span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).map(esc).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span></div>':''}`;
+  ${tc&&tc.reply_count>0?'<div class="thread-indicator" id="thread-ind-'+esc(msgId)+'" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')"><span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).map(esc).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span></div>':''}`;
   container.appendChild(d);
 }
 
@@ -1069,7 +1083,7 @@ async function pollBoard(){
   const todo=r.tasks.filter(t=>t.state==='Empty'||t.state==='empty');
   const wip=r.tasks.filter(t=>t.state&&(t.state.startsWith('Claimed')||t.state.startsWith('claimed')));
   const done=r.tasks.filter(t=>t.state&&(t.state.startsWith('Done')||t.state.startsWith('done')));
-  const render=(arr,canAct,action)=>arr.map(t=>`<div class="kanban-card" ${canAct?'onclick="boardAction(\''+t.id+'\',\''+action+'\')"':''}>
+  const render=(arr,canAct,action)=>arr.map(t=>`<div class="kanban-card" ${canAct?'onclick="boardAction(\''+escJs(t.id)+'\',\''+escJs(action)+'\')"':''}>
     <div class="title">${esc(t.title)}</div>
     <div class="meta">${canAct?'click to '+action:''} ${t.claimed_by?trustHtml(getContactTrust(t.claimed_by)):''}</div>
   </div>`).join('')||'<div style="color:var(--tx3);font-size:11px;padding:8px">Empty</div>';
@@ -1248,7 +1262,7 @@ async function saveWikiPage(sid){
   if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
     await api('/stores',{method:'POST',body:JSON.stringify({name:'Wiki',topic:storeId})});
   }
-  await api('/stores/'+storeId+'/'+currentWikiSlug,{method:'PUT',body:JSON.stringify({value:btoa(content),content_type:'text/markdown'})});
+  await api('/stores/'+storeId+'/'+currentWikiSlug,{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/markdown'})});
   document.getElementById('wiki-editor').style.display='none';
   toast('Page saved','success');
   loadWikiPages(sid);
@@ -1275,7 +1289,7 @@ async function editWikiPage(sid,slug){
   if(r&&r.value){
     currentWikiSlug=slug;
     document.getElementById('wiki-title').textContent=slug;
-    try{document.getElementById('wiki-content').value=atob(r.value)}catch(e){document.getElementById('wiki-content').value=r.value}
+    try{document.getElementById('wiki-content').value=u8decode(r.value)}catch(e){document.getElementById('wiki-content').value=r.value}
     document.getElementById('wiki-editor').style.display='block';
   }
 }
@@ -1311,7 +1325,7 @@ async function saveWebPage(sid){
   if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
     await api('/stores',{method:'POST',body:JSON.stringify({name:'Web',topic:storeId})});
   }
-  await api('/stores/'+storeId+'/'+currentWebPath,{method:'PUT',body:JSON.stringify({value:btoa(content),content_type:'text/html'})});
+  await api('/stores/'+storeId+'/'+currentWebPath,{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/html'})});
   document.getElementById('web-editor').style.display='none';
   toast('Published','success');
   loadWebPages(sid);
@@ -1339,7 +1353,7 @@ async function previewWebPage(sid,path){
   if(r&&r.value&&preview){
     // Render in a sandboxed iframe to prevent XSS from stored HTML
     let content='';
-    try{content=atob(r.value)}catch(e){content=esc(r.value)}
+    try{content=u8decode(r.value)}catch(e){content=esc(r.value)}
     const iframe=document.createElement('iframe');
     iframe.sandbox='allow-same-origin'; // no allow-scripts
     iframe.style.cssText='width:100%;min-height:200px;border:none;background:var(--bg)';
@@ -1390,7 +1404,7 @@ async function sendDm(){
   const inp=document.getElementById('dm-in');
   const t=inp.value.trim();if(!t||!target)return;
   const name=LS.get('display_name','')||short(S.get('agentId'));
-  const payload=btoa(JSON.stringify({text:t,sender_name:name,ts:Date.now()}));
+  const payload=u8encode(JSON.stringify({text:t,sender_name:name,ts:Date.now()}));
   await api('/direct/send',{method:'POST',body:JSON.stringify({agent_id:target,payload})});
   const msg={text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),own:true};
   addDmMsg(target,msg);
