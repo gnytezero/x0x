@@ -784,7 +784,8 @@ function renderView(){
    JS SECTION 6: HOME VIEW
    ═══════════════════════════════════════════════════════════════════ */
 function renderHome(){
-  return `<h2>Dashboard</h2>
+  return `<div id="h-upgrade-banner" style="display:none" class="mb2"></div>
+<h2>Dashboard</h2>
 <div class="grid g4 mb2" id="home-stats">
   <div class="card stat-card"><div class="label">Status</div><div class="val" id="h-status">—</div></div>
   <div class="card stat-card"><div class="label">Version</div><div class="val" id="h-version">—</div></div>
@@ -830,6 +831,17 @@ async function pollDash(){
     S.set('userId',a.user_id||'');
     renderIdentityChain();
   }
+  // Check for updates
+  const upg=await api('/upgrade');
+  const banner=document.getElementById('h-upgrade-banner');
+  if(banner&&upg&&upg.update_available){
+    banner.style.display='block';
+    banner.innerHTML=`<div class="card" style="border-color:var(--gn);background:var(--gn-dim);display:flex;align-items:center;justify-content:space-between">
+      <div><strong style="color:var(--gn)">Update available:</strong> v${esc(upg.latest_version||'?')} (you have v${esc(upg.current_version||'?')})</div>
+      <div style="font-size:12px;color:var(--tx2)">Run: <code style="color:var(--cy)">curl -sfL https://x0x.md | sh</code></div>
+    </div>`;
+  }else if(banner){banner.style.display='none'}
+
   const d=await api('/agents/discovered');
   if(d&&d.agents){
     S.set('discovered',d.agents);
@@ -1454,10 +1466,13 @@ function renderPeopleList(){
   const contacts=S.get('contacts')||[];
   const el=document.getElementById('people-list');if(!el)return;
 
-  // Group by user_id if available
+  // Split into active and blocked
+  const active=contacts.filter(c=>c.trust_level!=='Blocked');
+  const blocked=contacts.filter(c=>c.trust_level==='Blocked');
+
+  // Group active contacts by user_id if available
   const byUser={};const ungrouped=[];
-  contacts.forEach(c=>{
-    // We'll attempt to get user info from discovered agents
+  active.forEach(c=>{
     const disc=(S.get('discovered')||[]).find(d=>d.agent_id===c.agent_id);
     const uid=disc&&disc.user_id;
     if(uid){
@@ -1490,9 +1505,24 @@ function renderPeopleList(){
     ungrouped.forEach(c=>{h+=renderAgentRow(c)});
   }
 
-  if(!contacts.length){
+  if(!active.length&&!blocked.length){
     h='<div class="card" style="text-align:center;padding:40px;color:var(--tx3)"><p>No contacts yet.</p><p style="margin-top:8px">Import an agent card or discover agents on the network.</p></div>';
   }
+
+  // Blocked contacts in a collapsible section
+  if(blocked.length){
+    h+=`<div style="margin-top:20px">
+      <div class="sb-section-title" style="cursor:pointer" onclick="const s=document.getElementById('blocked-list');s.style.display=s.style.display==='none'?'block':'none'">
+        <span>Blocked (${blocked.length})</span>
+      </div>
+      <div id="blocked-list" style="display:none">`;
+    blocked.forEach(c=>{
+      const disc=(S.get('discovered')||[]).find(d=>d.agent_id===c.agent_id);
+      h+=renderAgentRow({...c,discovered:disc});
+    });
+    h+='</div></div>';
+  }
+
   el.innerHTML=h;
 }
 
@@ -1571,7 +1601,7 @@ async function pollNetworkView(){
    JS SECTION 11: SETTINGS VIEW
    ═══════════════════════════════════════════════════════════════════ */
 function renderSettings(){
-  const curTheme=LS.get('theme','system');
+  const curTheme=LS.get('theme','light');
   return `<h2>Settings</h2>
   <div class="card mb2">
     <h3 style="margin-top:0">Theme</h3>
@@ -1617,15 +1647,16 @@ function setTheme(theme){
 
 function applyTheme(theme){
   if(theme==='system'){
-    const prefersDark=window.matchMedia('(prefers-color-scheme: dark)').matches;
-    document.documentElement.setAttribute('data-theme',prefersDark?'dark':'light');
+    // Check OS preference; default to light if no preference set
+    const mq=window.matchMedia('(prefers-color-scheme: dark)');
+    document.documentElement.setAttribute('data-theme',mq.matches?'dark':'light');
   }else{
     document.documentElement.setAttribute('data-theme',theme);
   }
 }
 // Listen for OS theme changes when in system mode
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{
-  if(LS.get('theme','system')==='system')applyTheme('system');
+  if(LS.get('theme','light')==='system')applyTheme('system');
 });
 
 function saveName(){
@@ -1899,8 +1930,12 @@ async function togglePin(agentId,machineId,pin){
 }
 
 async function setTrust(agentId,level){
-  await api('/contacts/trust',{method:'POST',body:JSON.stringify({agent_id:agentId,level:level.toLowerCase()})});
-  toast('Trust set to '+level,'success');
+  const r=await api('/contacts/trust',{method:'POST',body:JSON.stringify({agent_id:agentId,level:level.toLowerCase()})});
+  if(r&&r.ok){
+    toast('Trust set to '+level,'success');
+  }else{
+    toast('Failed: '+(r&&r.error||'contact may be revoked'),'error');
+  }
   await pollContacts();
   showAgentDetail(agentId);
 }
@@ -2167,7 +2202,7 @@ async function pollAll(){
 }
 
 // Apply theme on startup
-applyTheme(LS.get('theme','system'));
+applyTheme(LS.get('theme','light'));
 
 // Init
 wsConnect();
