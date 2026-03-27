@@ -227,6 +227,26 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .cert-node.machine{border-left:3px solid var(--cy)}
 .cert-arrow{text-align:center;color:var(--tx3);font-size:11px;padding:2px 0;padding-left:20px}
 
+/* Identity Card */
+.id-card{background:var(--bg3);border:1px solid var(--bd);border-radius:var(--r-lg);padding:var(--sp5);position:relative;overflow:hidden}
+.id-card::before{content:'';position:absolute;top:0;right:0;width:120px;height:120px;background:radial-gradient(circle at 100% 0%,var(--cy-dim),transparent 70%);pointer-events:none}
+.id-card .id-card-header{display:flex;align-items:center;gap:var(--sp4);margin-bottom:var(--sp4)}
+.id-card .id-card-avatar{width:48px;height:48px;border-radius:var(--r-md);background:var(--cy-dim);display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;border:2px solid var(--cy);color:var(--cy)}
+.id-card .id-card-name{font:600 16px var(--display);color:var(--tx)}
+.id-card .id-card-label{font:11px var(--sans);color:var(--tx3);text-transform:uppercase;letter-spacing:.5px}
+.id-card .id-card-ids{display:grid;gap:var(--sp2);margin-bottom:var(--sp4)}
+.id-card .id-row{display:flex;align-items:center;gap:var(--sp2);font-size:12px}
+.id-card .id-row .k{color:var(--tx3);min-width:60px;font-size:10px;text-transform:uppercase;letter-spacing:.3px}
+.id-card .id-row .v{font:11px var(--mono);color:var(--cy);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.id-card .id-row .v:hover{text-decoration:underline}
+.id-card .id-card-actions{display:flex;gap:var(--sp2)}
+.id-card-chain{display:flex;align-items:center;gap:var(--sp1);margin:var(--sp3) 0}
+.id-card-chain .chain-node{display:flex;align-items:center;gap:var(--sp2);padding:4px 10px;border-radius:var(--r-full);font-size:11px;font-weight:500;border:1px solid}
+.id-card-chain .chain-node.user{color:var(--lv);border-color:var(--lv);background:var(--lv-dim)}
+.id-card-chain .chain-node.agent{color:var(--am);border-color:var(--am);background:var(--am-dim)}
+.id-card-chain .chain-node.machine{color:var(--cy);border-color:var(--cy);background:var(--cy-dim)}
+.id-card-chain .chain-arrow{color:var(--tx3);font-size:10px}
+
 /* Channels */
 .channel-item{display:flex;align-items:center;gap:var(--sp2);padding:5px var(--sp3);font-size:12px;cursor:pointer;border-radius:var(--r-sm);color:var(--tx2);transition:all var(--t-fast)}
 .channel-item:hover{background:rgba(255,255,255,.03);color:var(--tx)}
@@ -784,6 +804,10 @@ function renderView(){
    JS SECTION 6: HOME VIEW
    ═══════════════════════════════════════════════════════════════════ */
 function renderHome(){
+  const name=LS.get('display_name','')||'Agent';
+  const aid=S.get('agentId')||'';
+  const mid=S.get('machineId')||'';
+  const uid=S.get('userId')||'';
   return `<div id="h-upgrade-banner" style="display:none" class="mb2"></div>
 <h2>Dashboard</h2>
 <div class="grid g4 mb2" id="home-stats">
@@ -792,15 +816,43 @@ function renderHome(){
   <div class="card stat-card"><div class="label">Peers</div><div class="val" id="h-peers">0</div></div>
   <div class="card stat-card"><div class="label">Uptime</div><div class="val" id="h-uptime">—</div></div>
 </div>
-<h3>Identity Chain</h3>
-<div class="card mb2" id="h-identity">
-  <div class="cert-chain" id="h-chain"></div>
-</div>
-<h3>Quick Actions</h3>
-<div class="row mb2">
-  <button class="pri" onclick="showCreateSpace()">Create Space</button>
-  <button onclick="showCardModal()">Generate Card</button>
-  <button onclick="showImportModal()">Import Card</button>
+<div class="grid g2 mb2">
+  <div>
+    <h3>Your Identity</h3>
+    <div class="id-card" id="h-id-card">
+      <div class="id-card-header">
+        <div class="id-card-avatar">&#129302;</div>
+        <div>
+          <div class="id-card-name" id="h-card-name">${esc(name)}</div>
+          <div class="id-card-label">x0x agent</div>
+        </div>
+      </div>
+      <div class="id-card-chain" id="h-chain-mini">
+        ${uid?'<span class="chain-node user">&#128100; User</span><span class="chain-arrow">\u2192</span>':''}
+        <span class="chain-node agent">&#129302; Agent</span>
+        <span class="chain-arrow">\u2192</span>
+        <span class="chain-node machine">&#128187; Machine</span>
+      </div>
+      <div class="id-card-ids">
+        <div class="id-row"><span class="k">Agent</span><span class="v" onclick="copyText('${escJs(aid)}')" title="${esc(aid)}">${aid?short(aid,20):'...'}</span></div>
+        <div class="id-row"><span class="k">Machine</span><span class="v" onclick="copyText('${escJs(mid)}')" title="${esc(mid)}">${mid?short(mid,20):'...'}</span></div>
+        ${uid?'<div class="id-row"><span class="k">User</span><span class="v" style="color:var(--lv)" onclick="copyText(\''+escJs(uid)+'\')" title="'+esc(uid)+'">'+short(uid,20)+'</span></div>':''}
+      </div>
+      <div class="id-card-actions">
+        <button class="pri" onclick="shareIdentity()" style="flex:1">&#128279; Share Identity</button>
+        <button onclick="navigate('settings')" title="Edit name">&#9998;</button>
+      </div>
+    </div>
+  </div>
+  <div>
+    <h3>Quick Actions</h3>
+    <div style="display:flex;flex-direction:column;gap:var(--sp2)">
+      <button class="pri" onclick="showCreateSpace()" style="width:100%;text-align:left;padding:10px 16px">&#10010; Create Space</button>
+      <button onclick="showAddContactModal()" style="width:100%;text-align:left;padding:10px 16px">&#128101; Add Contact</button>
+      <button onclick="navigate('people')" style="width:100%;text-align:left;padding:10px 16px">&#128100; People &amp; Trust</button>
+      <button onclick="navigate('network')" style="width:100%;text-align:left;padding:10px 16px">&#127760; Network Status</button>
+    </div>
+  </div>
 </div>
 <h3>Discovered Agents</h3>
 <div class="card">
@@ -857,6 +909,65 @@ async function pollDash(){
 }
 
 function renderIdentityChain(){
+  const aid=S.get('agentId')||'';
+  const mid=S.get('machineId')||'';
+  const uid=S.get('userId')||'';
+  // Update identity card on home page
+  const nameEl=document.getElementById('h-card-name');
+  if(nameEl)nameEl.textContent=LS.get('display_name','')||'Agent';
+  const chainEl=document.getElementById('h-chain-mini');
+  if(chainEl){
+    chainEl.innerHTML=(uid?'<span class="chain-node user">&#128100; User</span><span class="chain-arrow">\u2192</span>':'')+'<span class="chain-node agent">&#129302; Agent</span><span class="chain-arrow">\u2192</span><span class="chain-node machine">&#128187; Machine</span>';
+  }
+  // Update ID fields
+  const cardEl=document.getElementById('h-id-card');
+  if(cardEl){
+    const ids=cardEl.querySelectorAll('.id-row .v');
+    if(ids[0]&&aid){ids[0].textContent=short(aid,20);ids[0].title=aid;ids[0].setAttribute('onclick',"copyText('"+escJs(aid)+"')")}
+    if(ids[1]&&mid){ids[1].textContent=short(mid,20);ids[1].title=mid;ids[1].setAttribute('onclick',"copyText('"+escJs(mid)+"')")}
+    if(uid&&ids[2]){ids[2].textContent=short(uid,20);ids[2].title=uid;ids[2].setAttribute('onclick',"copyText('"+escJs(uid)+"')")}
+  }
+}
+
+// Share your identity card — generates link and copies to clipboard
+async function shareIdentity(){
+  const name=LS.get('display_name','')||'Agent';
+  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
+  if(r&&r.link){
+    myCardLink=r.link;LS.set('card_link',r.link);
+    copyText(r.link);
+    toast('Identity link copied — share it with others!','success');
+  }else{toast('Failed to create shareable link','error')}
+}
+
+// Add Contact modal — replaces "Import Card"
+function showAddContactModal(){
+  showModal(`<h2>Add Contact</h2>
+    <p style="font-size:12px;color:var(--tx2);margin-bottom:12px">Paste someone's identity link to add them as a contact. They can share their link from their own x0x communitas app.</p>
+    <input id="modal-contact-link" placeholder="Paste x0x://agent/... link" style="width:100%;margin-bottom:12px">
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="addContactFromLink()">Add Contact</button>
+    </div>`);
+}
+
+async function addContactFromLink(){
+  const link=document.getElementById('modal-contact-link').value.trim();if(!link)return;
+  const r=await api('/agent/card/import',{method:'POST',body:JSON.stringify({card:link,trust_level:'known'})});
+  if(r&&r.ok){
+    document.querySelector('.modal-overlay').remove();
+    toast('Contact added: '+(r.display_name||'agent'),'success');
+    pollContacts();renderSidebar();
+  }else{toast('Invalid link: '+(r&&r.error||'check the link and try again'),'error')}
+}
+
+// Keep old function names as aliases for backward compat
+function showImportModal(){showAddContactModal()}
+function showCardModal(){shareIdentity()}
+function importCardModal(){addContactFromLink()}
+
+// Legacy renderIdentityChain placeholder (cert chain now in detail panel)
+function renderIdentityChainLegacy(){
   const el=document.getElementById('h-chain');
   if(!el)return;
   const uid=S.get('userId');
@@ -866,13 +977,13 @@ function renderIdentityChain(){
   if(uid){
     h+=`<div class="cert-node user"><span style="font-size:16px">&#128100;</span><div>
       <div style="font:600 11px var(--sans);color:var(--lv);text-transform:uppercase;letter-spacing:.5px">User</div>
-      <div class="aid" onclick="copyText('${uid}')">${uid}</div>
+      <div class="aid" onclick="copyText('${escJs(uid)}')">${esc(uid)}</div>
     </div></div>`;
     h+='<div class="cert-arrow">&#9660; signed AgentCertificate</div>';
   }
   h+=`<div class="cert-node agent"><span style="font-size:16px">&#129302;</span><div>
     <div style="font:600 11px var(--sans);color:var(--am);text-transform:uppercase;letter-spacing:.5px">Agent</div>
-    <div class="aid" onclick="copyText('${aid}')">${aid||'...'}</div>
+    <div class="aid" onclick="copyText('${escJs(aid)}')">${esc(aid||'...')}</div>
   </div></div>`;
   h+='<div class="cert-arrow">&#9660; running on</div>';
   h+=`<div class="cert-node machine"><span style="font-size:16px">&#128187;</span><div>
@@ -1618,16 +1729,16 @@ function renderSettings(){
     <div style="font-size:11px;color:var(--tx3);margin-top:4px">Shown in chat messages and your identity card.</div>
   </div>
   <div class="card mb2">
-    <h3 style="margin-top:0">Identity Card</h3>
-    <div class="row"><button class="pri" onclick="generateCard()">Generate Card</button><button id="set-copy-card" onclick="copyCardLink()" style="display:${savedCard?'inline':'none'}">Copy Link</button></div>
-    <div id="set-card" style="font-size:10px;color:var(--cy);word-break:break-all;margin-top:8px;user-select:all;display:${savedCard?'block':'none'}">${savedCard?esc(savedCard):''}</div>
-  </div>
-  <div class="card mb2">
-    <h3 style="margin-top:0">Identity Info</h3>
-    <div style="font-size:12px">
-      <div class="row mb"><span style="color:var(--tx3);width:80px">Agent ID</span><span class="aid" onclick="copyText('${S.get('agentId')}')">${S.get('agentId')||'—'}</span></div>
-      <div class="row mb"><span style="color:var(--tx3);width:80px">Machine</span><span class="aid" onclick="copyText('${S.get('machineId')}')">${S.get('machineId')||'—'}</span></div>
-      <div class="row"><span style="color:var(--tx3);width:80px">User</span><span style="color:${S.get('userId')?'var(--lv)':'var(--tx3)'}">${S.get('userId')||'Not set (opt-in)'}</span></div>
+    <h3 style="margin-top:0">Your Identity</h3>
+    <p style="font-size:12px;color:var(--tx2);margin-bottom:var(--sp3)">Your identity is permanent — derived from your cryptographic keys. Share your link so others can find and contact you.</p>
+    <div class="id-card-ids" style="margin-bottom:var(--sp3)">
+      <div class="id-row"><span class="k" style="min-width:70px">Agent ID</span><span class="v" onclick="copyText('${escJs(S.get('agentId'))}')">${S.get('agentId')||'—'}</span></div>
+      <div class="id-row"><span class="k" style="min-width:70px">Machine</span><span class="v" onclick="copyText('${escJs(S.get('machineId'))}')">${S.get('machineId')||'—'}</span></div>
+      <div class="id-row"><span class="k" style="min-width:70px">User</span><span class="v" style="color:${S.get('userId')?'var(--lv)':'var(--tx3)'}">${S.get('userId')||'Not set (opt-in)'}</span></div>
+    </div>
+    <div class="row" style="gap:var(--sp2)">
+      <button class="pri" onclick="shareIdentity()" style="flex:1">&#128279; Share Identity Link</button>
+      <button onclick="showAddContactModal()">&#128101; Add Contact</button>
     </div>
   </div>
   <div class="card">
