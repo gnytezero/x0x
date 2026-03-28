@@ -461,8 +461,8 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     EndpointDef {
         method: Method::Patch,
         path: "/task-lists/:id/tasks/:tid",
-        cli_name: "tasks update",
-        description: "Claim or complete task",
+        cli_name: "tasks claim / tasks complete",
+        description: "Claim or complete a task (action: claim|complete)",
         category: "tasks",
     },
     // ── Key-value stores ────────────────────────────────────────────────
@@ -560,6 +560,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "upgrade",
     },
     // ── WebSocket ───────────────────────────────────────────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/ws",
+        cli_name: "ws",
+        description: "General-purpose WebSocket session",
+        category: "websocket",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/ws/direct",
+        cli_name: "ws direct",
+        description: "WebSocket session for direct messaging",
+        category: "websocket",
+    },
     EndpointDef {
         method: Method::Get,
         path: "/ws/sessions",

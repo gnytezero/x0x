@@ -26,11 +26,13 @@ pub async fn send_file(client: &DaemonClient, agent_id: &str, path: &Path) -> Re
     let hash = sha2::Digest::finalize(sha2::Sha256::new_with_prefix(&contents));
     let sha256 = hex::encode(hash);
 
+    let canonical = path.canonicalize()?;
     let body = serde_json::json!({
         "agent_id": agent_id,
         "filename": filename,
         "size": size,
         "sha256": sha256,
+        "path": canonical.to_string_lossy(),
     });
 
     let resp = client.post("/files/send", &body).await?;

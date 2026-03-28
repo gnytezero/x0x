@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Default chunk size: 64 KB.
 pub const DEFAULT_CHUNK_SIZE: usize = 65536;
 
+/// Maximum file transfer size: 1 GB.
+pub const MAX_TRANSFER_SIZE: u64 = 1_073_741_824;
+
 /// A file transfer offer sent to initiate transfer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileOffer {
@@ -93,6 +96,23 @@ pub struct TransferState {
     pub error: Option<String>,
     /// Timestamp when transfer started (unix seconds).
     pub started_at: u64,
+    /// Local file path (sender side only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Output path for received file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+    /// Chunk size used for this transfer.
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: usize,
+    /// Total number of chunks.
+    #[serde(default)]
+    pub total_chunks: u64,
+}
+
+/// Default chunk size for serde deserialization.
+fn default_chunk_size() -> usize {
+    DEFAULT_CHUNK_SIZE
 }
 
 /// File transfer message types (sent over direct messaging).

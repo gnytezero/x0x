@@ -182,6 +182,8 @@ pub struct Agent {
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
     /// Direct messaging infrastructure for point-to-point communication.
     direct_messaging: std::sync::Arc<direct::DirectMessaging>,
+    /// Ensures direct message listener is spawned once.
+    direct_listener_started: std::sync::atomic::AtomicBool,
 }
 
 /// A message received from the gossip network.
@@ -779,7 +781,19 @@ impl Agent {
             return Ok(connectivity::ConnectOutcome::Unreachable);
         };
 
-        // 2. Try direct connection if likely to succeed
+        // 2. If already connected via gossip, reuse that connection
+        let machine_peer_id = ant_quic::PeerId(agent.machine_id.0);
+        if network.is_connected(&machine_peer_id).await {
+            self.direct_messaging
+                .mark_connected(agent.agent_id, agent.machine_id)
+                .await;
+            // Return the first address as the connected address
+            if let Some(addr) = info.addresses.first() {
+                return Ok(connectivity::ConnectOutcome::Direct(*addr));
+            }
+        }
+
+        // 3. Try direct connection if likely to succeed
         if info.likely_direct() {
             for addr in &info.addresses {
                 match network.connect_addr(*addr).await {
@@ -881,12 +895,22 @@ impl Agent {
             error::NetworkError::NodeCreation("network not initialized".to_string())
         })?;
 
-        // Look up machine_id from discovery cache
-        let machine_id = {
+        // Look up machine_id from discovery cache, falling back to DirectMessaging registry
+        let cached_machine_id = {
             let cache = self.identity_discovery_cache.read().await;
             cache.get(agent_id).map(|d| d.machine_id)
-        }
-        .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+        };
+        let machine_id = match cached_machine_id {
+            Some(id) => id,
+            None => {
+                // Fallback: check DirectMessaging agent→machine registry
+                // (populated when we receive direct messages from this agent)
+                self.direct_messaging
+                    .get_machine_id(agent_id)
+                    .await
+                    .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?
+            }
+        };
 
         // Check if connected
         let ant_peer_id = ant_quic::PeerId(machine_id.0);
@@ -985,30 +1009,13 @@ impl Agent {
     }
 
     /// Internal helper for receiving direct messages.
+    ///
+    /// Reads from the `DirectMessaging` internal channel, which is fed by
+    /// the background `start_direct_listener` task. This ensures there is
+    /// only ONE consumer of `network.recv_direct()` (the listener), avoiding
+    /// message-stealing races.
     async fn recv_direct_inner(&self) -> Option<direct::DirectMessage> {
-        let network = self.network.as_ref()?;
-
-        // Get the raw message from network layer
-        let (ant_peer_id, payload) = network.recv_direct().await?;
-
-        // Parse sender agent_id from payload (first 32 bytes after stream type)
-        if payload.len() < 32 {
-            tracing::warn!("Direct message too short to contain sender agent_id");
-            return None;
-        }
-
-        let mut sender_bytes = [0u8; 32];
-        sender_bytes.copy_from_slice(&payload[..32]);
-        let sender = identity::AgentId(sender_bytes);
-        let machine_id = identity::MachineId(ant_peer_id.0);
-        let data = payload[32..].to_vec();
-
-        // Register the mapping for future lookups
-        self.direct_messaging
-            .register_agent(sender, machine_id)
-            .await;
-
-        Some(direct::DirectMessage::new(sender, machine_id, data))
+        self.direct_messaging.recv().await
     }
 
     /// Subscribe to direct messages.
@@ -1595,6 +1602,7 @@ impl Agent {
             tracing::info!("Gossip runtime started");
         }
         self.start_identity_listener().await?;
+        self.start_direct_listener();
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
         if bootstrap_nodes.is_empty() {
@@ -2024,6 +2032,55 @@ impl Agent {
     /// Idempotent — if the heartbeat is already running, returns `Ok(())` immediately.
     /// The heartbeat re-announces this agent's identity at `heartbeat_interval_secs`
     /// intervals so that late-joining peers can discover it without waiting for a
+    /// Start the direct message listener background task.
+    ///
+    /// This task reads raw direct messages from the network layer and
+    /// dispatches them to `DirectMessaging::handle_incoming()`, which
+    /// broadcasts to all `subscribe_direct()` receivers.
+    ///
+    /// Called automatically by [`Agent::join_network`].
+    fn start_direct_listener(&self) {
+        if self
+            .direct_listener_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let Some(network) = self.network.as_ref().map(std::sync::Arc::clone) else {
+            return;
+        };
+        let dm = std::sync::Arc::clone(&self.direct_messaging);
+
+        tokio::spawn(async move {
+            tracing::info!("Direct message listener started");
+            loop {
+                let Some((ant_peer_id, payload)) = network.recv_direct().await else {
+                    tracing::debug!("Direct message channel closed");
+                    break;
+                };
+
+                // Parse: first 32 bytes = sender AgentId, rest = payload
+                if payload.len() < 32 {
+                    tracing::warn!("Direct message too short ({} bytes)", payload.len());
+                    continue;
+                }
+
+                let mut sender_bytes = [0u8; 32];
+                sender_bytes.copy_from_slice(&payload[..32]);
+                let sender = identity::AgentId(sender_bytes);
+                let machine_id = identity::MachineId(ant_peer_id.0);
+                let data = payload[32..].to_vec();
+
+                // Register the agent→machine mapping for future lookups
+                dm.register_agent(sender, machine_id).await;
+
+                // Broadcast to all subscribe_direct() receivers
+                dm.handle_incoming(machine_id, sender, data).await;
+            }
+        });
+    }
+
     /// new announcement.
     ///
     /// Called automatically by [`Agent::join_network`].
@@ -2786,6 +2843,7 @@ impl AgentBuilder {
             rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
             contact_store,
             direct_messaging,
+            direct_listener_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
