@@ -26,12 +26,12 @@ use x0x::cli::{DaemonClient, OutputFormat};
 #[derive(Parser)]
 #[command(name = "x0x", version = x0x::VERSION, about = "x0x agent network — control a running x0xd daemon")]
 struct Cli {
-    /// Named instance to target (reads port from data dir).
-    #[arg(long, global = true)]
+    /// Named instance to target (reads port from data dir). [dev]
+    #[arg(long, global = true, hide = true)]
     name: Option<String>,
 
-    /// Daemon API address override (default: auto-detect).
-    #[arg(long, global = true)]
+    /// Daemon API address override (default: auto-detect). [dev]
+    #[arg(long, global = true, hide = true)]
     api: Option<String>,
 
     /// Output as JSON.
@@ -55,9 +55,11 @@ enum Commands {
     },
     /// Stop a running daemon.
     Stop,
-    /// List running daemon instances.
+    /// List running daemon instances. [dev]
+    #[command(hide = true)]
     Instances,
-    /// Pre-flight diagnostics.
+    /// Pre-flight diagnostics. [dev]
+    #[command(hide = true)]
     Doctor,
     /// Configure daemon to start on boot (systemd/launchd).
     Autostart {
@@ -159,15 +161,23 @@ enum Commands {
     /// Check for upgrades.
     /// Check for updates and upgrade.
     Upgrade,
-    /// WebSocket session info.
+    /// WebSocket session info. [dev]
+    #[command(hide = true)]
     Ws {
         #[command(subcommand)]
         sub: WsSub,
     },
     /// Open the x0x GUI in your browser.
     Gui,
-    /// Print all API routes.
+    /// Print all API routes. [dev]
+    #[command(hide = true)]
     Routes,
+    /// Show all commands in a tree view.
+    Tree,
+    /// Uninstall x0x binaries (keeps your data and keys).
+    Uninstall,
+    /// Remove ALL x0x data, keys, and configuration. DESTRUCTIVE.
+    Purge,
     /// Send a file to an agent.
     SendFile {
         /// Target agent ID (hex).
@@ -636,6 +646,9 @@ async fn run(
     // Commands that don't need a running daemon.
     match &command {
         Commands::Routes => return commands::routes(),
+        Commands::Tree => return print_command_tree(),
+        Commands::Uninstall => return uninstall().await,
+        Commands::Purge => return purge().await,
         Commands::Instances => return commands::daemon::instances().await,
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
@@ -930,8 +943,348 @@ async fn run(
             reason,
         } => commands::files::reject_file(&client, &transfer_id, reason.as_deref()).await,
         Commands::Routes
+        | Commands::Tree
+        | Commands::Uninstall
+        | Commands::Purge
         | Commands::Start { .. }
         | Commands::Instances
         | Commands::Autostart { .. } => unreachable!(),
     }
+}
+
+// ── Tree view ──────────────────────────────────────────────────────────────
+
+fn print_command_tree() -> anyhow::Result<()> {
+    let tree = "\
+x0x (v{VERSION})
+|
++-- Daemon
+|   +-- start              Start the x0xd daemon
+|   +-- stop               Stop a running daemon
+|   +-- instances          List running daemon instances
+|   +-- doctor             Pre-flight diagnostics
+|   +-- autostart          Configure daemon to start on boot
+|
++-- Identity
+|   +-- agent              Show agent identity
+|   |   +-- user-id        Show user ID
+|   |   +-- card           Generate shareable identity card
+|   |   +-- import         Import an agent card to contacts
+|   +-- announce           Announce identity to network
+|
++-- Network
+|   +-- health             Health check
+|   +-- status             Runtime status (uptime, peers, addresses)
+|   +-- peers              Connected gossip peers
+|   +-- presence           Online agents
+|   +-- network status     NAT type, connectivity diagnostics
+|   +-- network cache      Bootstrap peer cache stats
+|
++-- Discovery
+|   +-- agents list        List discovered agents
+|   +-- agents get         Get agent details
+|   +-- agents find        Find an agent (3-stage: cache/shard/rendezvous)
+|   +-- agents reachability  Check if agent is directly reachable
+|   +-- agents by-user     Find agents by user ID
+|
++-- Contacts & Trust
+|   +-- contacts list      List contacts
+|   +-- contacts add       Add a contact with trust level
+|   +-- contacts update    Update trust or identity type
+|   +-- contacts remove    Remove a contact
+|   +-- contacts revoke    Revoke a contact (with reason)
+|   +-- contacts revocations  List revocations
+|   +-- trust set          Quick-set trust level
+|   +-- trust evaluate     Evaluate agent+machine trust
+|   +-- machines list      List machine records for contact
+|   +-- machines add       Add machine record
+|   +-- machines remove    Remove machine record
+|   +-- machines pin       Pin machine for identity verification
+|   +-- machines unpin     Unpin machine
+|
++-- Messaging
+|   +-- publish            Publish message to gossip topic
+|   +-- subscribe          Subscribe and stream topic messages
+|   +-- unsubscribe        Unsubscribe from topic
+|   +-- events             Stream all gossip events
+|   +-- direct connect     Establish QUIC connection to agent
+|   +-- direct send        Send direct (point-to-point) message
+|   +-- direct connections List direct connections
+|   +-- direct events      Stream incoming direct messages
+|
++-- MLS Encryption (saorsa-mls PQC)
+|   +-- groups list        List encrypted MLS groups
+|   +-- groups create      Create a new encrypted group
+|   +-- groups get         Get group details and members
+|   +-- groups add-member  Add member (ML-KEM-768 key exchange)
+|   +-- groups remove-member  Remove member
+|   +-- groups encrypt     Encrypt payload with group key
+|   +-- groups decrypt     Decrypt ciphertext
+|   +-- groups welcome     Generate welcome message for new member
+|
++-- Named Groups
+|   +-- group list         List named groups
+|   +-- group create       Create a named group
+|   +-- group info         Get group info
+|   +-- group invite       Generate invite link
+|   +-- group join         Join via invite link
+|   +-- group set-name     Set display name in group
+|   +-- group leave        Leave or delete group
+|
++-- Data
+|   +-- store list         List key-value stores
+|   +-- store create       Create a KV store
+|   +-- store join         Join existing store by topic
+|   +-- store keys         List keys
+|   +-- store put          Write a value
+|   +-- store get          Read a value
+|   +-- store rm           Delete a key
+|   +-- tasks list         List CRDT task lists
+|   +-- tasks create       Create a task list
+|   +-- tasks show         Show tasks in a list
+|   +-- tasks add          Add a task
+|   +-- tasks claim        Claim a task
+|   +-- tasks complete     Mark task as done
+|
++-- Files
+|   +-- send-file          Send file to an agent
+|   +-- receive-file       Watch for incoming transfers
+|   +-- transfers          List active/recent transfers
+|   +-- transfer-status    Check transfer progress
+|   +-- accept-file        Accept incoming transfer
+|   +-- reject-file        Reject incoming transfer
+|
++-- System
+    +-- upgrade            Check for updates
+    +-- gui                Open embedded web GUI
+    +-- routes             Print all 70 REST API routes
+    +-- tree               This command tree
+    +-- ws sessions        List WebSocket sessions
+    +-- uninstall          Remove x0x binaries (keeps data)
+    +-- purge              Remove ALL data and keys (destructive)
+";
+    print!("{}", tree.replace("{VERSION}", x0x::VERSION));
+    Ok(())
+}
+
+// ── Uninstall ──────────────────────────────────────────────────────────────
+
+async fn uninstall() -> anyhow::Result<()> {
+    eprintln!("x0x uninstall");
+    eprintln!("=============");
+    eprintln!();
+    eprintln!("This will remove x0x binaries but keep your data and keys.");
+    eprintln!();
+
+    // Find binaries
+    let x0x_path = std::env::current_exe()?;
+    let x0xd_path = x0x_path.parent().map(|p| p.join("x0xd"));
+
+    eprintln!("Binaries to remove:");
+    eprintln!("  {}", x0x_path.display());
+    if let Some(ref d) = x0xd_path {
+        if d.exists() {
+            eprintln!("  {}", d.display());
+        }
+    }
+
+    // Data dirs preserved
+    if let Some(data_dir) = dirs::data_dir().map(|d| d.join("x0x")) {
+        eprintln!();
+        eprintln!("Data preserved at: {}", data_dir.display());
+    }
+    if let Some(home) = dirs::home_dir().map(|h| h.join(".x0x")) {
+        if home.exists() {
+            eprintln!("Keys preserved at: {}", home.display());
+        }
+    }
+
+    eprintln!();
+    eprint!("Proceed? [y/N] ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase() != "y" {
+        eprintln!("Cancelled.");
+        return Ok(());
+    }
+
+    // Stop daemon if running
+    eprintln!("Stopping daemon...");
+    let _ = tokio::process::Command::new(&x0x_path)
+        .arg("stop")
+        .output()
+        .await;
+
+    // Remove launchd/systemd autostart
+    eprintln!("Removing autostart...");
+    let _ = tokio::process::Command::new(&x0x_path)
+        .args(["autostart", "--remove"])
+        .output()
+        .await;
+
+    // Remove binaries
+    if let Some(ref d) = x0xd_path {
+        if d.exists() {
+            std::fs::remove_file(d).ok();
+            eprintln!("Removed {}", d.display());
+        }
+    }
+    // Remove self last
+    std::fs::remove_file(&x0x_path).ok();
+    eprintln!("Removed {}", x0x_path.display());
+
+    eprintln!();
+    eprintln!("x0x uninstalled. Your data and keys are preserved.");
+    eprintln!("To reinstall: curl -sfL https://x0x.md | sh");
+    Ok(())
+}
+
+// ── Purge ──────────────────────────────────────────────────────────────────
+
+async fn purge() -> anyhow::Result<()> {
+    eprintln!("\x1b[31;1m");
+    eprintln!("  WARNING: DESTRUCTIVE OPERATION");
+    eprintln!("  ==============================");
+    eprintln!("\x1b[0m");
+    eprintln!("This will permanently delete:");
+    eprintln!();
+
+    let mut paths_to_remove: Vec<std::path::PathBuf> = Vec::new();
+
+    // Data directory
+    if let Some(data_dir) = dirs::data_dir().map(|d| d.join("x0x")) {
+        if data_dir.exists() {
+            eprintln!(
+                "  Data:    {} (contacts, groups, stores, transfers)",
+                data_dir.display()
+            );
+            paths_to_remove.push(data_dir);
+        }
+    }
+    // Keys directory
+    if let Some(home) = dirs::home_dir().map(|h| h.join(".x0x")) {
+        if home.exists() {
+            eprintln!(
+                "  Keys:    {} (machine.key, agent.key, agent.cert)",
+                home.display()
+            );
+            paths_to_remove.push(home);
+        }
+    }
+    // Named instances
+    if let Some(home) = dirs::home_dir() {
+        for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".x0x-") && entry.path().is_dir() {
+                eprintln!("  Instance: {}", entry.path().display());
+                paths_to_remove.push(entry.path());
+            }
+        }
+    }
+    // Binaries
+    let x0x_path = std::env::current_exe()?;
+    let x0xd_path = x0x_path.parent().map(|p| p.join("x0xd"));
+    eprintln!("  Binary:  {}", x0x_path.display());
+    if let Some(ref d) = x0xd_path {
+        if d.exists() {
+            eprintln!("  Binary:  {}", d.display());
+        }
+    }
+
+    if paths_to_remove.is_empty() {
+        eprintln!();
+        eprintln!("No data directories found. Nothing to purge.");
+        return Ok(());
+    }
+
+    // ── Confirmation 1: Acknowledge understanding ──
+    eprintln!();
+    eprintln!("\x1b[33mStep 1/3: This will destroy your agent identity and all data.\x1b[0m");
+    eprintln!("Your agent ID and keys cannot be recovered after deletion.");
+    eprint!("Type 'I understand' to continue: ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() != "I understand" {
+        eprintln!("Cancelled.");
+        return Ok(());
+    }
+
+    // ── Confirmation 2: Type PURGE ──
+    input.clear();
+    eprintln!();
+    eprintln!("\x1b[33mStep 2/3: Final safety check.\x1b[0m");
+    eprint!("Type 'PURGE' in capitals to confirm: ");
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() != "PURGE" {
+        eprintln!("Cancelled.");
+        return Ok(());
+    }
+
+    // ── Confirmation 3: Agent ID verification ──
+    input.clear();
+    eprintln!();
+    eprintln!("\x1b[33mStep 3/3: Verify your agent ID.\x1b[0m");
+    // Try to read agent ID from key file
+    let agent_id_hint = if let Some(home) = dirs::home_dir() {
+        let key_path = home.join(".x0x/agent.key");
+        if key_path.exists() {
+            // Just show first 8 chars as hint
+            let data = std::fs::read(&key_path).unwrap_or_default();
+            if data.len() >= 4 {
+                hex::encode(&data[..4])
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        }
+    } else {
+        "unknown".to_string()
+    };
+    eprintln!("Your agent ID starts with: {agent_id_hint}...");
+    eprint!("Type the first 8 characters of your agent ID to confirm: ");
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() != agent_id_hint {
+        eprintln!("Agent ID mismatch. Cancelled.");
+        return Ok(());
+    }
+
+    // ── Execute purge ──
+    eprintln!();
+    eprintln!("Stopping daemon...");
+    let _ = tokio::process::Command::new(&x0x_path)
+        .arg("stop")
+        .output()
+        .await;
+
+    eprintln!("Removing autostart...");
+    let _ = tokio::process::Command::new(&x0x_path)
+        .args(["autostart", "--remove"])
+        .output()
+        .await;
+
+    for path in &paths_to_remove {
+        if path.is_dir() {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => eprintln!("  Removed {}", path.display()),
+                Err(e) => eprintln!("  Failed to remove {}: {}", path.display(), e),
+            }
+        }
+    }
+
+    // Remove binaries
+    if let Some(ref d) = x0xd_path {
+        if d.exists() {
+            std::fs::remove_file(d).ok();
+            eprintln!("  Removed {}", d.display());
+        }
+    }
+    std::fs::remove_file(&x0x_path).ok();
+    eprintln!("  Removed {}", x0x_path.display());
+
+    eprintln!();
+    eprintln!("x0x has been completely removed.");
+    eprintln!("To reinstall: curl -sfL https://x0x.md | sh");
+    Ok(())
 }
