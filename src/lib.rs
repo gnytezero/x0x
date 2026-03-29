@@ -732,9 +732,7 @@ impl Agent {
     ///
     /// Returns `None` if this agent was built without a network config.
     /// The adapter wraps the same `Arc<BootstrapCache>` as the network node.
-    pub fn gossip_cache_adapter(
-        &self,
-    ) -> Option<&saorsa_gossip_coordinator::GossipCacheAdapter> {
+    pub fn gossip_cache_adapter(&self) -> Option<&saorsa_gossip_coordinator::GossipCacheAdapter> {
         self.gossip_cache_adapter.as_ref()
     }
 
@@ -1660,40 +1658,59 @@ impl Agent {
         self.start_direct_listener();
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
-        if bootstrap_nodes.is_empty() {
-            tracing::debug!("No bootstrap peers configured");
-            if let Err(e) = self.announce_identity(false, false).await {
-                tracing::warn!("Initial identity announcement failed: {}", e);
-            }
-            if let Err(e) = self.start_identity_heartbeat().await {
-                tracing::warn!("Failed to start identity heartbeat: {e}");
-            }
-            return Ok(());
-        }
 
         let min_connected = 3;
         let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
 
-        // Phase 1: Try cached peers first using the real ant-quic peer IDs.
-        if let Some(ref cache) = self.bootstrap_cache {
-            const PHASE1_PEER_CANDIDATES: usize = 12;
-            let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
-            if !cached_peers.is_empty() {
-                tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
+        // Phase 0: Try coordinator cache (seedless bootstrap via gossip-discovered coordinators).
+        if let Some(ref adapter) = self.gossip_cache_adapter {
+            let coordinator_addrs: Vec<std::net::SocketAddr> = adapter
+                .get_all_adverts()
+                .into_iter()
+                .flat_map(|advert| advert.addr_hints.into_iter().map(|h| h.addr))
+                .collect();
+
+            if !coordinator_addrs.is_empty() {
+                tracing::info!(
+                    "Phase 0: Trying {} addresses from {} cached coordinator adverts",
+                    coordinator_addrs.len(),
+                    adapter.advert_count()
+                );
                 let (succeeded, _failed) = self
-                    .connect_cached_peers_parallel_tracked(network, &cached_peers)
+                    .connect_peers_parallel_tracked(network, &coordinator_addrs)
                     .await;
                 all_connected.extend(&succeeded);
                 tracing::info!(
-                    "Phase 1: {}/{} cached peers connected",
+                    "Phase 0: {}/{} coordinator addresses connected",
                     succeeded.len(),
-                    cached_peers.len()
+                    coordinator_addrs.len()
                 );
             }
         }
 
-        // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
+        // Phase 1: Try cached peers first using the real ant-quic peer IDs.
         if all_connected.len() < min_connected {
+            if let Some(ref cache) = self.bootstrap_cache {
+                const PHASE1_PEER_CANDIDATES: usize = 12;
+                let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+                if !cached_peers.is_empty() {
+                    tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
+                    let (succeeded, _failed) = self
+                        .connect_cached_peers_parallel_tracked(network, &cached_peers)
+                        .await;
+                    all_connected.extend(&succeeded);
+                    tracing::info!(
+                        "Phase 1: {}/{} cached peers connected",
+                        succeeded.len(),
+                        cached_peers.len()
+                    );
+                }
+            }
+        } // end Phase 1 min_connected check
+
+        // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
+        // This is the fallback for when coordinator cache and cached peers aren't enough.
+        if all_connected.len() < min_connected && !bootstrap_nodes.is_empty() {
             let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
                 .iter()
                 .filter(|addr| !all_connected.contains(addr))
@@ -2900,9 +2917,9 @@ impl AgentBuilder {
         ));
 
         // Wrap bootstrap cache with gossip coordinator adapter (zero duplication).
-        let gossip_cache_adapter = bootstrap_cache
-            .as_ref()
-            .map(|cache| saorsa_gossip_coordinator::GossipCacheAdapter::new(std::sync::Arc::clone(cache)));
+        let gossip_cache_adapter = bootstrap_cache.as_ref().map(|cache| {
+            saorsa_gossip_coordinator::GossipCacheAdapter::new(std::sync::Arc::clone(cache))
+        });
 
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
