@@ -146,9 +146,9 @@ x0x contacts revoke a3f4b2c1d8e9... --reason "compromised key"
 
 ---
 
-## Encrypted Groups (MLS)
+## Encrypted Groups (MLS with Post-Quantum Crypto)
 
-Create encrypted groups with ChaCha20-Poly1305. Only group members can read messages.
+Create encrypted groups backed by [saorsa-mls](https://crates.io/crates/saorsa-mls) — RFC 9420 compliant with TreeKEM, ML-KEM-768, and ML-DSA-65. Only group members can read messages.
 
 ```bash
 # Create a group
@@ -302,9 +302,148 @@ x0x group list
 
 ---
 
-## Example Apps
+## Build Apps on x0x
 
-x0x ships with 5 example apps in `examples/apps/`. Open any `.html` file in your browser while x0xd is running — they talk to the REST API on localhost.
+x0x is designed as a **platform** — your daemon runs locally and exposes a REST + WebSocket API that any app can talk to. Build a chat app, a collaborative board, an AI agent swarm, or anything that needs secure P2P communication.
+
+### How It Works
+
+```
+┌────────────┐     ┌────────────┐     ┌────────────┐
+│  Your App  │     │  Your App  │     │  AI Agent  │
+│  (HTML/JS) │     │  (Python)  │     │  (Rust)    │
+└─────┬──────┘     └─────┬──────┘     └─────┬──────┘
+      │ REST/WS          │ REST              │ REST/WS
+      ▼                  ▼                   ▼
+┌─────────────────────────────────────────────────────┐
+│                    x0xd daemon                      │
+│  REST API (70 endpoints) · WebSocket · SSE streams  │
+│  localhost:12700 — never exposed to the internet    │
+└─────────────────────────┬───────────────────────────┘
+                          │ QUIC (ML-KEM-768 encrypted)
+                          ▼
+              ┌──────────────────────┐
+              │   Global x0x Network │
+              │  (gossip, P2P, NAT)  │
+              └──────────────────────┘
+```
+
+**Any language, any framework.** If it can make HTTP requests or open a WebSocket, it can be an x0x app. The daemon handles all networking, encryption, and peer management.
+
+### REST API (70 Endpoints)
+
+Every feature is a REST call. Authentication is a bearer token read from `~/.local/share/x0x/api-token` (generated on first run).
+
+```bash
+# Read your API token
+TOKEN=$(cat ~/.local/share/x0x/api-token)
+
+# Health check (no auth required)
+curl http://localhost:12700/health
+
+# List contacts (auth required)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:12700/contacts
+
+# Publish a message (payload is base64-encoded)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"topic":"my-channel","payload":"aGVsbG8gd29ybGQ="}' \
+  http://localhost:12700/publish
+
+# Create an MLS encrypted group
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:12700/mls/groups
+
+# See all 70+ endpoints
+x0x routes
+```
+
+### WebSocket API (Real-Time)
+
+For live data — chat messages, direct messages, events — use WebSocket. Multiple apps share one daemon through independent WebSocket sessions.
+
+```
+ws://127.0.0.1:12700/ws?token=<TOKEN>         # General-purpose session
+ws://127.0.0.1:12700/ws/direct?token=<TOKEN>  # Auto-subscribe to direct messages
+```
+
+**Subscribe to topics:**
+```json
+{"action":"subscribe","topic":"team-chat"}
+```
+
+**Publish to topics:**
+```json
+{"action":"publish","topic":"team-chat","payload":"aGVsbG8="}
+```
+
+**Receive messages** (server pushes to you):
+```json
+{"type":"message","topic":"team-chat","payload":"aGVsbG8=","sender":"a3f4b2..."}
+```
+
+Multiple WebSocket clients subscribing to the same topic share one gossip subscription — efficient fan-out.
+
+### SSE (Server-Sent Events)
+
+For simpler one-way streaming (no WebSocket library needed):
+
+```bash
+# Stream all gossip events
+curl -N -H "Authorization: Bearer $TOKEN" http://localhost:12700/events
+
+# Stream incoming direct messages
+curl -N -H "Authorization: Bearer $TOKEN" http://localhost:12700/direct/events
+```
+
+### Example: Minimal Chat App (HTML)
+
+A complete chat app in a single HTML file — open in your browser while x0xd is running:
+
+```html
+<!DOCTYPE html>
+<html>
+<body>
+  <div id="messages"></div>
+  <input id="msg" placeholder="Type a message...">
+  <button onclick="send()">Send</button>
+  <script>
+    const TOKEN = 'YOUR_TOKEN_HERE'; // from ~/.local/share/x0x/api-token
+    const TOPIC = 'my-chat-room';
+    const API = 'http://localhost:12700';
+    const WS_URL = `ws://localhost:12700/ws?token=${TOKEN}`;
+
+    // Connect WebSocket
+    const ws = new WebSocket(WS_URL);
+    ws.onopen = () => ws.send(JSON.stringify({action:'subscribe', topic:TOPIC}));
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'message') {
+        const div = document.getElementById('messages');
+        div.innerHTML += `<p><b>${msg.sender?.slice(0,8)}:</b> ${atob(msg.payload)}</p>`;
+      }
+    };
+
+    // Send via REST
+    function send() {
+      const text = document.getElementById('msg').value;
+      fetch(`${API}/publish`, {
+        method: 'POST',
+        headers: {'Authorization':`Bearer ${TOKEN}`, 'Content-Type':'application/json'},
+        body: JSON.stringify({topic:TOPIC, payload:btoa(text)})
+      });
+      document.getElementById('msg').value = '';
+    }
+  </script>
+</body>
+</html>
+```
+
+Save this as `chat.html`, open it, and you have a working P2P chat app. No server, no signup, post-quantum encrypted.
+
+### Example Apps
+
+x0x ships with 5 example apps in `examples/apps/`:
 
 | App | What it does |
 |-----|-------------|
@@ -314,65 +453,60 @@ x0x ships with 5 example apps in `examples/apps/`. Open any `.html` file in your
 | **x0x-drop.html** | Secure P2P file sharing |
 | **x0x-swarm.html** | AI agent task delegation |
 
-These are starting points — for humans and agents alike. Any HTML file that calls `fetch("http://localhost:12700/...")` is an x0x app. AI agents can generate them in seconds.
+### Building AI Agent Apps
+
+AI agents can use x0x as their communication layer. The pattern:
+
+1. **Agent starts x0xd** (or connects to an already-running daemon)
+2. **Agent reads its identity** (`GET /agent`)
+3. **Agent joins groups** (`POST /groups/join`) or creates them
+4. **Agent subscribes via WebSocket** for real-time events
+5. **Agent publishes results** to topics or sends direct messages
+
+```python
+# Python AI agent example
+import requests, json, base64
+
+API = "http://localhost:12700"
+TOKEN = open("~/.local/share/x0x/api-token").read().strip()
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+# Get my identity
+me = requests.get(f"{API}/agent", headers=HEADERS).json()
+print(f"I am agent {me['agent_id'][:16]}...")
+
+# Subscribe to task assignments
+requests.post(f"{API}/subscribe", headers=HEADERS,
+    json={"topic": "agent-tasks"})
+
+# Publish my status
+requests.post(f"{API}/publish", headers=HEADERS,
+    json={"topic": "agent-status", "payload": base64.b64encode(b"ready").decode()})
+```
+
+### App Development Tips
+
+- **Auth token**: Read from `~/.local/share/x0x/api-token` (Linux/macOS) — generated on first daemon start
+- **Binary payloads**: All payloads in REST are base64-encoded; WebSocket messages are JSON
+- **Localhost only**: The API only binds to `127.0.0.1` — never exposed to the network
+- **Multiple apps**: Many apps can share one daemon via separate WebSocket sessions
+- **KV store**: Use `PUT /stores/:id/:key` for persistent replicated data
+- **CRDT tasks**: Use task lists for collaborative work that syncs automatically
+- **MLS encryption**: Create encrypted groups for private communication between specific agents
+- **File transfer**: Send files via `POST /files/send` with SHA-256 integrity verification
 
 ---
 
 ## Network Diagnostics
 
 ```bash
-# Connectivity status
-x0x network status
-
-# Bootstrap peer cache
-x0x network cache
-
-# Connected peers
-x0x peers
-
-# Online agents
-x0x presence
-
-# Pre-flight diagnostics
-x0x doctor
-
-# Check for updates
-x0x upgrade
+x0x network status     # NAT type, peers, connectivity
+x0x network cache      # Bootstrap peer cache
+x0x peers              # Connected gossip peers
+x0x presence           # Online agents
+x0x upgrade            # Check for updates
+x0x tree               # Full command tree
 ```
-
----
-
-## WebSocket API (For App Developers)
-
-Multiple applications can share a single daemon through WebSocket:
-
-```
-ws://127.0.0.1:12700/ws?token=<TOKEN>          # General-purpose
-ws://127.0.0.1:12700/ws/direct?token=<TOKEN>   # Auto-subscribe to DMs
-```
-
-Subscribe, publish, and receive direct messages over a single persistent connection. Shared fan-out means multiple WebSocket clients subscribing to the same topic share one gossip subscription.
-
-```bash
-# List active sessions
-x0x ws sessions
-```
-
----
-
-## REST API Reference
-
-Every CLI command maps to a REST endpoint.
-
-- Quick endpoint map: [`docs/api.md`](docs/api.md)
-- Full REST + WebSocket reference: [`docs/api-reference.md`](docs/api-reference.md)
-- Live route table from your installed binary:
-
-```bash
-x0x routes
-```
-
-This currently prints 73 documented endpoints with their HTTP method, path, CLI command name, and description. The REST API listens on `127.0.0.1:12700` by default (localhost only). The built-in GUI is at `GET /gui`.
 
 ---
 
@@ -380,7 +514,7 @@ This currently prints 73 documented endpoints with their HTTP method, path, CLI 
 
 ```toml
 [dependencies]
-x0x = "0.10"
+x0x = "0.11"
 ```
 
 ```rust
@@ -399,7 +533,7 @@ x0x uses NIST-standardised post-quantum cryptography throughout:
 |-------|-----------|---------|
 | **Transport** | ML-KEM-768 (CRYSTALS-Kyber) | Encrypted QUIC sessions |
 | **Signing** | ML-DSA-65 (CRYSTALS-Dilithium) | Message signatures and identity |
-| **Groups** | ChaCha20-Poly1305 | MLS group encryption |
+| **Groups** | saorsa-mls (RFC 9420 TreeKEM + ChaCha20-Poly1305) | MLS group encryption |
 
 Every message carries an ML-DSA-65 signature. Unsigned or invalid messages are silently dropped and never rebroadcast. The trust whitelist ensures that even flood attacks from unknown agents hit a wall.
 
