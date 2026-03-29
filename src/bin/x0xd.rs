@@ -2226,11 +2226,49 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusDa
         }
     };
 
-    // Get external addresses from ant-quic's NodeStatus (what peers see us as).
+    // Get external addresses: ant-quic observed + local IPv4/IPv6 discovery.
     let mut external_addrs = Vec::new();
     if let Some(network) = state.agent.network() {
         if let Some(ns) = network.node_status().await {
             external_addrs = ns.external_addrs.iter().map(|a| a.to_string()).collect();
+
+            let port = ns.local_addr.port();
+
+            // Discover global IPv4 via UDP socket trick (no data sent).
+            if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if sock.connect("8.8.8.8:80").is_ok() {
+                    if let Ok(local) = sock.local_addr() {
+                        if let std::net::IpAddr::V4(v4) = local.ip() {
+                            if !v4.is_loopback() && !v4.is_unspecified() {
+                                let addr_str = format!("{v4}:{port}");
+                                if !external_addrs.contains(&addr_str) {
+                                    external_addrs.push(addr_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Discover global IPv6 via UDP socket trick.
+            if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
+                if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
+                    if let Ok(local) = sock.local_addr() {
+                        if let std::net::IpAddr::V6(v6) = local.ip() {
+                            let segs = v6.segments();
+                            let is_global = (segs[0] & 0xffc0) != 0xfe80
+                                && (segs[0] & 0xff00) != 0xfd00
+                                && !v6.is_loopback();
+                            if is_global {
+                                let addr_str = format!("[{v6}]:{port}");
+                                if !external_addrs.contains(&addr_str) {
+                                    external_addrs.push(addr_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
