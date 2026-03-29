@@ -87,3 +87,32 @@ async fn adapter_clone_shares_state() {
     adapter.insert_advert(advert).await;
     assert_eq!(adapter2.advert_count(), 1);
 }
+
+#[test]
+fn advert_cbor_round_trip() {
+    let peer_id = PeerId::new([7u8; 32]);
+    let advert = CoordinatorAdvert::new(
+        peer_id,
+        CoordinatorRoles::default(),
+        vec![AddrHint::new("10.0.0.1:5483".parse().unwrap())],
+        NatClass::Eim,
+        60_000,
+    );
+
+    let bytes = advert.to_bytes().unwrap();
+    let decoded = CoordinatorAdvert::from_bytes(&bytes).unwrap();
+
+    assert_eq!(decoded.peer, peer_id);
+    assert!(decoded.is_valid());
+    assert_eq!(decoded.addr_hints.len(), 1);
+}
+
+#[test]
+fn coordinator_topic_is_deterministic() {
+    let hash1 = blake3::hash(b"saorsa-coordinator-topic");
+    let hash2 = blake3::hash(b"saorsa-coordinator-topic");
+    assert_eq!(hash1, hash2);
+    // The hex-encoded topic string used by x0xd
+    let topic = hex::encode(hash1.as_bytes());
+    assert_eq!(topic.len(), 64); // 32 bytes = 64 hex chars
+}

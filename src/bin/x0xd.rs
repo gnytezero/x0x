@@ -952,6 +952,15 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Coordinator advert publisher — advertises this node as a coordinator
+    // if ant-quic reports is_coordinating == true.
+    {
+        let coord_agent = Arc::clone(&state.agent);
+        tokio::spawn(async move {
+            run_coordinator_publisher(coord_agent).await;
+        });
+    }
+
     // Gossip-based release subscription (primary update mechanism)
     if config.update.enabled && config.update.gossip_updates {
         let update_config = config.update.clone();
@@ -6092,4 +6101,96 @@ async fn handle_file_complete(
         complete.transfer_id,
         final_path.display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator advert publisher
+// ---------------------------------------------------------------------------
+
+/// Well-known gossip topic for coordinator adverts.
+/// Hex-encoded BLAKE3("saorsa-coordinator-topic") — matches saorsa_gossip_coordinator::coordinator_topic().
+fn coordinator_topic_string() -> String {
+    let hash = blake3::hash(b"saorsa-coordinator-topic");
+    hex::encode(hash.as_bytes())
+}
+
+/// Periodically publishes coordinator adverts if this node is acting as a coordinator.
+async fn run_coordinator_publisher(agent: std::sync::Arc<x0x::Agent>) {
+    // Wait for network to stabilize before checking coordinator status
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+    let topic = coordinator_topic_string();
+    let interval = std::time::Duration::from_secs(300); // 5 minutes
+
+    loop {
+        if let Err(e) = publish_coordinator_advert_if_eligible(&agent, &topic).await {
+            tracing::debug!("Coordinator advert publish skipped: {e}");
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Publish a coordinator advert if this node is coordinating.
+async fn publish_coordinator_advert_if_eligible(
+    agent: &x0x::Agent,
+    topic: &str,
+) -> Result<(), String> {
+    let network = agent.network().ok_or("no network")?;
+    let status = network.node_status().await.ok_or("no node status")?;
+
+    // Only publish if we're coordinating or have a public IP (VPS nodes)
+    if !status.is_coordinating && !status.has_public_ip {
+        return Err("not a coordinator and no public IP".into());
+    }
+
+    let machine_id = agent.machine_id();
+    let peer_id = saorsa_gossip_types::PeerId::new(machine_id.0);
+
+    let roles = saorsa_gossip_coordinator::CoordinatorRoles {
+        coordinator: status.is_coordinating || status.has_public_ip,
+        reflector: status.can_receive_direct,
+        rendezvous: status.can_receive_direct,
+        relay: status.is_relaying,
+    };
+
+    let addr_hints: Vec<saorsa_gossip_coordinator::AddrHint> = status
+        .external_addrs
+        .iter()
+        .map(|a| saorsa_gossip_coordinator::AddrHint::new(*a))
+        .collect();
+
+    if addr_hints.is_empty() {
+        return Err("no external addresses discovered yet".into());
+    }
+
+    let nat_class = match status.nat_type {
+        ant_quic::NatType::None | ant_quic::NatType::FullCone => {
+            saorsa_gossip_coordinator::NatClass::Eim
+        }
+        ant_quic::NatType::Symmetric => saorsa_gossip_coordinator::NatClass::Symmetric,
+        _ => saorsa_gossip_coordinator::NatClass::Unknown,
+    };
+
+    let advert = saorsa_gossip_coordinator::CoordinatorAdvert::new(
+        peer_id, roles, addr_hints, nat_class, 600_000, // 10 minute validity
+    );
+
+    // Serialize to CBOR for gossip transport
+    let payload = advert
+        .to_bytes()
+        .map_err(|e| format!("serialize failed: {e}"))?;
+
+    // Publish to gossip network
+    agent
+        .publish(topic, payload.to_vec())
+        .await
+        .map_err(|e| format!("publish failed: {e}"))?;
+
+    // Also insert into local cache
+    if let Some(adapter) = agent.gossip_cache_adapter() {
+        adapter.insert_advert(advert).await;
+    }
+
+    tracing::info!("Published coordinator advert to gossip");
+    Ok(())
 }
