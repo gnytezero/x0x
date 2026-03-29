@@ -74,6 +74,12 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     // Check if x0xd exists in the same directory
     let has_x0xd = x0xd_path.exists();
 
+    // Stop the daemon if it's running (can't replace binary while it's in use)
+    let daemon_was_running = stop_daemon_if_running().await;
+    if daemon_was_running {
+        eprintln!("Stopped running daemon.");
+    }
+
     if has_x0xd {
         eprintln!("Upgrading x0xd...");
         upgrade_binary("x0xd", &verified.manifest, force).await?;
@@ -98,9 +104,15 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     eprintln!();
     eprintln!("Upgrade complete: v{new_version}");
 
-    // If x0xd was running, tell the user to restart it
-    if has_x0xd {
-        eprintln!("Restart the daemon: x0x stop && x0x start");
+    // Restart the daemon if it was running before
+    if daemon_was_running {
+        eprintln!("Restarting daemon...");
+        if let Err(e) = restart_daemon().await {
+            eprintln!("  Failed to restart daemon: {e}");
+            eprintln!("  Start manually: x0x start");
+        } else {
+            eprintln!("  Daemon restarted.");
+        }
     }
 
     Ok(())
@@ -231,6 +243,121 @@ async fn upgrade_binary_manual(
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     Ok(())
+}
+
+/// Discover the daemon API address from the port file, if running.
+fn discover_daemon_api() -> Option<String> {
+    let data_dir = dirs::data_dir()?;
+    let port_file = data_dir.join("x0x").join("api.port");
+    std::fs::read_to_string(port_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Stop the daemon if it's running. Returns true if it was running.
+async fn stop_daemon_if_running() -> bool {
+    let addr = match discover_daemon_api() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Check if daemon is actually responding
+    let health_url = format!("http://{addr}/health");
+    if client.get(&health_url).send().await.is_err() {
+        return false;
+    }
+
+    // Read the API token for authenticated shutdown
+    let token = read_api_token();
+
+    // Send shutdown
+    let shutdown_url = format!("http://{addr}/shutdown");
+    let mut req = client.post(&shutdown_url);
+    if let Some(ref t) = token {
+        req = req.bearer_auth(t);
+    }
+    let _ = req.send().await;
+
+    // Wait for daemon to actually stop (up to 5 seconds)
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if client.get(&health_url).send().await.is_err() {
+            return true;
+        }
+    }
+
+    true
+}
+
+/// Read the API token from the daemon's token file.
+fn read_api_token() -> Option<String> {
+    let data_dir = dirs::data_dir()?;
+    let token_file = data_dir.join("x0x").join("api.token");
+    std::fs::read_to_string(token_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Restart the daemon after upgrade.
+async fn restart_daemon() -> Result<()> {
+    let x0x_path = current_binary_path().context("cannot resolve x0x binary path")?;
+    let bin_dir = x0x_path
+        .parent()
+        .context("x0x binary has no parent directory")?;
+
+    let x0xd_name = if cfg!(windows) { "x0xd.exe" } else { "x0xd" };
+    let x0xd_path = bin_dir.join(x0xd_name);
+
+    if !x0xd_path.exists() {
+        anyhow::bail!("x0xd not found at {}", x0xd_path.display());
+    }
+
+    // Start x0xd as a background process (same as `x0x start`)
+    let data_dir = dirs::data_dir().context("cannot determine data directory")?;
+    let log_dir = data_dir.join("x0x");
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_file = log_dir.join("x0xd.log");
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .context("failed to open log file")?;
+
+    std::process::Command::new(&x0xd_path)
+        .arg("--skip-update-check")
+        .stdout(log.try_clone().context("failed to clone log handle")?)
+        .stderr(log)
+        .spawn()
+        .context("failed to spawn x0xd")?;
+
+    // Wait for it to become healthy (up to 15 seconds)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    for _ in 0..15 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Some(addr) = discover_daemon_api() {
+            let url = format!("http://{addr}/health");
+            if client.get(&url).send().await.is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    anyhow::bail!("daemon started but did not become healthy within 15 seconds")
 }
 
 /// Download a URL to a local file (reuses the same logic as apply.rs).
