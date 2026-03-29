@@ -1,21 +1,21 @@
 {
   "version": 1,
-  "project": "x0x-identity-trust-nat",
-  "active": false,
+  "project": "seedless-bootstrap",
+  "active": true,
   "milestone": {
-    "number": 3,
-    "name": "Documentation & Release"
+    "number": 1,
+    "name": "Wire Coordinator Into x0x"
   },
   "phase": {
-    "number": "3.2",
-    "name": "Release & Deploy",
-    "plan": "PLAN-phase-3.2.md"
+    "number": "1.1",
+    "name": "GossipCacheAdapter Integration",
+    "plan": "PLAN-phase-1.1.md"
   },
   "progress": {
-    "total_tasks": 2,
-    "completed_tasks": 2,
-    "current_task": 2
+    "total_tasks": 4,
+    "completed_tasks": 4,
+    "current_task": null
   },
-  "status": "milestone_complete",
-  "last_updated": "2026-03-24T00:05:00Z"
+  "status": "phase_complete",
+  "last_updated": "2026-03-29T16:00:00Z"
 }

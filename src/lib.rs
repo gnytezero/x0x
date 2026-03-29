@@ -157,7 +157,6 @@ use saorsa_gossip_membership::Membership as _;
 ///
 /// println!("Agent ID: {}", agent.agent_id());
 /// ```
-#[derive(Debug)]
 pub struct Agent {
     identity: std::sync::Arc<identity::Identity>,
     /// The network node for P2P communication.
@@ -167,6 +166,8 @@ pub struct Agent {
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
     /// Bootstrap peer cache for quality-based peer selection across restarts.
     bootstrap_cache: Option<std::sync::Arc<ant_quic::BootstrapCache>>,
+    /// Gossip cache adapter wrapping bootstrap_cache with coordinator advert storage.
+    gossip_cache_adapter: Option<saorsa_gossip_coordinator::GossipCacheAdapter>,
     /// Cache of discovered agents from identity announcements.
     identity_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -187,6 +188,18 @@ pub struct Agent {
     direct_messaging: std::sync::Arc<direct::DirectMessaging>,
     /// Ensures direct message listener is spawned once.
     direct_listener_started: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("identity", &self.identity)
+            .field("network", &self.network.is_some())
+            .field("gossip_runtime", &self.gossip_runtime.is_some())
+            .field("bootstrap_cache", &self.bootstrap_cache.is_some())
+            .field("gossip_cache_adapter", &self.gossip_cache_adapter.is_some())
+            .finish()
+    }
 }
 
 /// A message received from the gossip network.
@@ -713,6 +726,16 @@ impl Agent {
     #[must_use]
     pub fn network(&self) -> Option<&std::sync::Arc<network::NetworkNode>> {
         self.network.as_ref()
+    }
+
+    /// Get the gossip cache adapter for coordinator discovery.
+    ///
+    /// Returns `None` if this agent was built without a network config.
+    /// The adapter wraps the same `Arc<BootstrapCache>` as the network node.
+    pub fn gossip_cache_adapter(
+        &self,
+    ) -> Option<&saorsa_gossip_coordinator::GossipCacheAdapter> {
+        self.gossip_cache_adapter.as_ref()
     }
 
     /// Get a reference to the contact store.
@@ -2876,6 +2899,11 @@ impl AgentBuilder {
             contacts::ContactStore::new(contacts_path),
         ));
 
+        // Wrap bootstrap cache with gossip coordinator adapter (zero duplication).
+        let gossip_cache_adapter = bootstrap_cache
+            .as_ref()
+            .map(|cache| saorsa_gossip_coordinator::GossipCacheAdapter::new(std::sync::Arc::clone(cache)));
+
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
 
@@ -2884,6 +2912,7 @@ impl AgentBuilder {
             network,
             gossip_runtime,
             bootstrap_cache,
+            gossip_cache_adapter,
             identity_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
