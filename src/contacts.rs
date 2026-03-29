@@ -243,6 +243,13 @@ impl ContactStore {
         if self.revoked_keys.contains(&contact.agent_id.0) {
             contact.trust_level = TrustLevel::Blocked;
         }
+        // Auto-upgrade identity_type from Anonymous when trust is elevated,
+        // so the UI doesn't show a contradictory "Anonymous + Trusted" state.
+        if matches!(contact.trust_level, TrustLevel::Known | TrustLevel::Trusted)
+            && contact.identity_type == IdentityType::Anonymous
+        {
+            contact.identity_type = IdentityType::Known;
+        }
         self.contacts.insert(contact.agent_id.0, contact);
         let _ = self.save();
     }
@@ -279,6 +286,13 @@ impl ContactStore {
             machines: Vec::new(),
         });
         entry.trust_level = effective_trust;
+        // When elevating trust to Known or Trusted, auto-upgrade identity_type
+        // from the default Anonymous so the UI doesn't show a contradictory state.
+        if matches!(effective_trust, TrustLevel::Known | TrustLevel::Trusted)
+            && entry.identity_type == IdentityType::Anonymous
+        {
+            entry.identity_type = IdentityType::Known;
+        }
         let _ = self.save();
     }
 

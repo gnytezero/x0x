@@ -2772,8 +2772,9 @@ function renderAgentDetail(el,data){
     <div class="card mb" id="detail-chain"></div>
     <h3>Machines</h3>
     <div id="detail-machines"><div style="color:var(--tx3);font-size:12px">Loading...</div></div>
-    <div class="mt2">
-      <button class="danger" onclick="if(confirm('Revoke this contact? This is permanent.'))revokeContact('${aid}')">Revoke Contact</button>
+    <div class="mt2" style="display:flex;gap:8px">
+      <button onclick="if(confirm('Remove this contact?'))removeContact('${aid}')">Remove Contact</button>
+      <button class="danger" onclick="if(confirm('Revoke this contact? This permanently blocks their key.'))revokeContact('${aid}')">Revoke & Block</button>
     </div>
   </div>`;
 
@@ -2840,9 +2841,17 @@ async function setIdentityType(agentId,type){
   await pollContacts();
 }
 
+async function removeContact(agentId){
+  await api('/contacts/'+agentId,{method:'DELETE'});
+  toast('Contact removed');
+  hideDetail();
+  await pollContacts();
+  if(S.get('view')==='people')renderPeopleList();
+}
+
 async function revokeContact(agentId){
   await api('/contacts/'+agentId+'/revoke',{method:'POST',body:JSON.stringify({reason:'user_action'})});
-  toast('Contact revoked','warning');
+  toast('Contact revoked & blocked','warning');
   hideDetail();
   await pollContacts();
   if(S.get('view')==='people')renderPeopleList();
