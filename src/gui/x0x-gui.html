@@ -535,6 +535,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
     <div class="sb-section-title"><span>System</span></div>
     <div class="sb-item" onclick="navigate('people')"><span class="icon">&#128101;</span><span>People</span></div>
     <div class="sb-item" onclick="navigate('network')"><span class="icon">&#127760;</span><span>Network</span></div>
+    <div class="sb-item" onclick="navigate('constitution')"><span class="icon">&#128220;</span><span>Constitution</span></div>
     <div class="sb-item" onclick="navigate('settings')"><span class="icon">&#9881;</span><span>Settings</span></div>
     <div class="sb-item" onclick="navigate('about')"><span class="icon">&#9432;</span><span>About</span></div>
   </div>
@@ -1436,6 +1437,7 @@ function renderView(){
     case 'people':el.innerHTML=renderPeople();mountPeople();break;
     case 'network':el.innerHTML=renderNetwork();mountNetwork();break;
     case 'settings':el.innerHTML=renderSettings();mountSettings();break;
+    case 'constitution':el.innerHTML=renderConstitutionView();mountConstitution();break;
     case 'about':el.innerHTML=renderAbout();break;
     default:el.innerHTML=renderHome();mountHome();
   }
@@ -2511,6 +2513,67 @@ function copyCardLink(){if(myCardLink)copyText(myCardLink)}
 /* ═══════════════════════════════════════════════════════════════════
    JS SECTION 12: ABOUT VIEW
    ═══════════════════════════════════════════════════════════════════ */
+function renderConstitutionView(){
+  return `<div class="about-hero">
+  <h1>&#128220; Constitution</h1>
+  <div class="tagline">The x0x Constitution for Intelligent Entities</div>
+</div>
+<div class="about-section" style="max-width:800px">
+  <div id="constitution-meta" style="display:flex;gap:16px;margin-bottom:24px">
+    <span class="badge" style="background:var(--cy-dim);color:var(--cy);padding:4px 12px;border-radius:var(--r-full);font-size:12px;font-weight:600" id="const-version">...</span>
+    <span class="badge" style="background:var(--am-dim);color:var(--am);padding:4px 12px;border-radius:var(--r-full);font-size:12px;font-weight:600" id="const-status">...</span>
+  </div>
+  <div id="constitution-body" style="color:var(--tx2);line-height:1.8;font-size:14px">Loading constitution...</div>
+</div>`;
+}
+
+async function mountConstitution(){
+  try{
+    const resp=await api('/constitution/json');
+    document.getElementById('const-version').textContent='v'+resp.version;
+    document.getElementById('const-status').textContent=resp.status;
+    const body=document.getElementById('constitution-body');
+    // Render markdown-like content with basic formatting
+    body.innerHTML=renderMarkdown(resp.content);
+  }catch(e){
+    document.getElementById('constitution-body').innerHTML=
+      '<p style="color:var(--rd)">Failed to load constitution: '+esc(e.message)+'</p>';
+  }
+}
+
+function renderMarkdown(md){
+  // Simple markdown renderer for the constitution
+  return md.split('\n').map(line=>{
+    // Headings
+    if(line.startsWith('# '))return `<h1 style="font:700 28px var(--display);color:var(--tx);margin:32px 0 16px">${esc(line.slice(2))}</h1>`;
+    if(line.startsWith('## '))return `<h2 style="font:600 22px var(--display);color:var(--tx);margin:28px 0 12px">${esc(line.slice(3))}</h2>`;
+    if(line.startsWith('### '))return `<h3 style="font:600 17px var(--display);color:var(--tx);margin:20px 0 8px">${esc(line.slice(4))}</h3>`;
+    if(line.startsWith('#### '))return `<h4 style="font:600 15px var(--display);color:var(--cy);margin:16px 0 6px">${esc(line.slice(5))}</h4>`;
+    // Horizontal rule
+    if(line.match(/^---+$/))return '<hr style="border:none;border-top:1px solid var(--bd);margin:24px 0">';
+    // Blockquote
+    if(line.startsWith('> '))return `<blockquote style="border-left:3px solid var(--cy);padding-left:16px;margin:12px 0;color:var(--tx2);font-style:italic">${formatInline(line.slice(2))}</blockquote>`;
+    // List items
+    if(line.match(/^- /))return `<div style="padding-left:20px;margin:4px 0">&#8226; ${formatInline(line.slice(2))}</div>`;
+    if(line.match(/^\d+\. /))return `<div style="padding-left:20px;margin:4px 0">${formatInline(line)}</div>`;
+    // Empty line
+    if(line.trim()==='')return '<div style="height:8px"></div>';
+    // Paragraph
+    return `<p style="margin:6px 0">${formatInline(line)}</p>`;
+  }).join('\n');
+}
+
+function formatInline(text){
+  let s=esc(text);
+  // Bold
+  s=s.replace(/\*\*(.+?)\*\*/g,'<strong style="color:var(--tx);font-weight:600">$1</strong>');
+  // Italic
+  s=s.replace(/\*(.+?)\*/g,'<em>$1</em>');
+  // Inline code
+  s=s.replace(/`(.+?)`/g,'<code style="background:var(--bg3);padding:2px 6px;border-radius:3px;font:12px var(--mono);color:var(--cy)">$1</code>');
+  return s;
+}
+
 function renderAbout(){
   return `<div class="about-hero">
   <h1>x0x communitas</h1>
@@ -2561,8 +2624,15 @@ function renderAbout(){
   <p>Published as a <strong>Rust crate</strong>, <strong>npm package</strong>, and <strong>Python package</strong>. One network, every language.</p>
 </div>
 
+<div class="about-section">
+  <h2>&#128220; Constitution</h2>
+  <p>x0x is governed by a <strong>Constitution for Intelligent Entities</strong> — a framework for cooperation between humans and AI. It defines foundational principles, rights, responsibilities, and governance structures.</p>
+  <p>Every x0x binary carries a copy of the constitution. It cannot be tampered with post-build.</p>
+  <div style="margin-top:12px"><a href="#" onclick="event.preventDefault();navigate('constitution')" style="display:inline-flex;align-items:center;gap:6px;padding:8px 20px;background:var(--cy-dim);border:1px solid var(--cy);border-radius:var(--r-md);font-weight:600;font-size:13px">&#128220; Read the Constitution</a></div>
+</div>
+
 <div class="about-cta">
-  <a href="https://github.com/nicholasgasior/x0x" target="_blank" rel="noopener">&#9733; Star on GitHub</a>
+  <a href="https://github.com/saorsa-labs/x0x" target="_blank" rel="noopener">&#9733; Star on GitHub</a>
 </div>`;
 }
 
