@@ -111,6 +111,49 @@ Direct messages travel point-to-point over QUIC — never broadcast to the netwo
 
 ---
 
+## Presence & FOAF Discovery (v0.14.0)
+
+SOTA presence system with adaptive failure detection and friend-of-a-friend discovery. Surpasses libp2p presence; matches Tailscale for NAT-aware peer discovery.
+
+```bash
+# See who's online (agents detected via presence beacons)
+x0x presence online
+
+# Discover agents via friend-of-a-friend random walk
+x0x presence foaf
+
+# Find a specific agent by ID (FOAF query)
+x0x presence find a3f4b2c1d8e9...
+
+# Check an agent's presence status
+x0x presence status a3f4b2c1d8e9...
+```
+
+**How it works:**
+- Agents broadcast periodic **presence beacons** via `GossipStreamType::Bulk`
+- **Phi-Accrual lite** adaptive failure detection replaces fixed timeouts (180–600s adaptive window based on beacon inter-arrival stats)
+- **FOAF discovery** uses random-walk queries with configurable TTL
+- **Trust-scoped privacy** — `Network` view shows all non-blocked agents; `Social` view shows only trusted + known
+- **Bootstrap cache enrichment** — beacon addresses feed back into the peer cache for better NAT traversal
+- **Quality-weighted routing** — FOAF peer selection scored by beacon stability (1/(1+stddev))
+
+**Rust API:**
+```rust
+// Subscribe to online/offline events
+let mut rx = agent.subscribe_presence().await?;
+
+// Discover agents via FOAF (TTL=2 hops)
+let agents = agent.discover_agents_foaf(2).await?;
+
+// Find a specific agent
+let found = agent.discover_agent_by_id(target_id, 3).await?;
+
+// Local cache lookup (no network I/O)
+let cached = agent.cached_agent(&agent_id).await?;
+```
+
+---
+
 ## Contacts & Trust
 
 x0x is **whitelist-by-default**. Unknown agents can't influence your agent until you explicitly trust them.

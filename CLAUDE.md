@@ -57,8 +57,9 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 1. **Transport** (`network.rs`): Wraps `ant-quic::Node`. Implements `saorsa_gossip_transport::GossipTransport` trait. Handles PeerId conversion between ant-quic and gossip type systems.
 2. **Bootstrap** (`bootstrap.rs`): 6 hardcoded global nodes (port 5483). 3-round retry with exponential backoff (0s, 10s, 15s). Nodes are in `network.rs::DEFAULT_BOOTSTRAP_PEERS`.
 3. **Gossip** (`gossip/`): Thin orchestration over `saorsa-gossip-*` crates. `GossipRuntime` owns `PubSubManager` which provides topic-based pub/sub via epidemic broadcast.
-4. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
-5. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
+4. **Presence** (`presence.rs`): SOTA presence system via `saorsa-gossip-presence`. Beacons propagate on `GossipStreamType::Bulk`. Phi-Accrual lite adaptive failure detection (180–600s), FOAF random-walk discovery with trust-scoped privacy (`PresenceVisibility::Network` vs `Social`), bootstrap cache enrichment from beacons, quality-weighted FOAF peer selection. Surpasses libp2p presence; matches Tailscale for NAT-aware discovery.
+5. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
+6. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
 
 ### Self-Update System (`upgrade/`)
 
@@ -93,6 +94,7 @@ lib.rs (Agent, AgentBuilder, TaskListHandle, KvStoreHandle)
   ├── kv/          ← KvStore, KvEntry, KvStoreDelta, KvStoreSync, AccessPolicy
   ├── groups/      ← GroupInfo, SignedInvite, AgentCard (high-level group mgmt)
   ├── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
+  ├── presence.rs  ← SOTA presence: beacons, FOAF, adaptive detection, trust privacy
   ├── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
   └── gui/         ← Embedded HTML GUI (compiled into binary via include_str!)
 ```
@@ -124,17 +126,26 @@ let entry = store.get("key").await?;
 let keys = store.keys().await?;
 store.remove("key").await?;
 
+// Presence — SOTA discovery with FOAF and adaptive detection
+let rx = agent.subscribe_presence().await?;       // AgentOnline/AgentOffline events
+let agents = agent.discover_agents_foaf(2).await?; // FOAF walk, TTL=2
+let found = agent.discover_agent_by_id(id, 3).await?; // Find specific agent
+let cached = agent.cached_agent(&id).await?;       // Local cache lookup (no network)
+let pw = agent.presence_system().unwrap();          // Access PresenceWrapper
+let config = pw.config();                           // PresenceConfig
+
 // Named groups with invite links
 // (managed via REST API: POST /groups, POST /groups/:id/invite, etc.)
 ```
 
 ### Error Handling
 
-Two error enums in `error.rs`:
+Three error enums in `error.rs`:
 - `IdentityError`: Key generation, validation, storage, serialization, certificate verification
 - `NetworkError`: Node creation, connections, NAT traversal, protocol violations, resource limits
+- `PresenceError`: NotInitialized, BeaconFailed, FoafQueryFailed, SubscriptionFailed, Internal
 
-Type aliases: `error::Result<T>` for identity, `error::NetworkResult<T>` for network.
+Type aliases: `error::Result<T>` for identity, `error::NetworkResult<T>` for network, `error::PresenceResult<T>` for presence.
 
 ### Storage Format
 
@@ -144,7 +155,7 @@ Keypairs are serialized with **bincode** (compact binary), not JSON. Manual seri
 
 `src/bin/x0x.rs` — unified CLI that controls a running `x0xd` daemon. Every REST endpoint is mapped to a CLI subcommand. Shared endpoint registry in `src/api/mod.rs` ensures routes and CLI commands stay in sync. CLI modules in `src/cli/`.
 
-Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x groups`, `x0x tasks`, `x0x routes` (prints all 50 endpoints).
+Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x groups`, `x0x tasks`, `x0x presence online|foaf|find|status`, `x0x routes` (prints all 75+ endpoints).
 
 ## FFI Bindings
 
@@ -207,7 +218,7 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 
 ## Test Organization
 
-16 integration test files in `tests/`:
+19 integration test files in `tests/` (704 tests total):
 
 | File | Tests |
 |------|-------|
@@ -226,14 +237,17 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 | `nat_traversal_integration.rs` | NAT hole-punching |
 | `comprehensive_integration.rs` | End-to-end workflows |
 | `scale_testing.rs` | Performance with many agents |
-| `presence_foaf_integration.rs` | Presence and friend-of-a-friend discovery |
+| `presence_foaf_integration.rs` | Presence beacons, FOAF discovery, trust-scoped visibility |
+| `presence_wiring_test.rs` | PresenceWrapper lifecycle, config defaults, shutdown |
+| `presence_integration.rs` | Presence API surface: subscribe, cached_agent, foaf_peer_candidates |
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 
 ## API Completeness
 
-70 REST endpoints, all wired to x0xd and CLI:
+75+ REST endpoints, all wired to x0xd and CLI:
 - Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
+- Presence (v0.14.0): `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
 - Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`
 - KvStore: `POST/GET /stores`, `PUT/GET/DELETE /stores/:id/:key` (with access control)
 - Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`
