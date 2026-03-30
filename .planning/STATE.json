@@ -7,21 +7,21 @@
     "name": "SOTA Presence Integration"
   },
   "phase": {
-    "number": "1.2",
-    "name": "Public API — FOAF Discovery & Events",
-    "plan": "PLAN-phase-1.2-sota-presence.md"
+    "number": "1.3",
+    "name": "REST/CLI + Trust-Scoped Privacy",
+    "plan": null
   },
   "progress": {
-    "total_tasks": 7,
+    "total_tasks": 0,
     "completed_tasks": 0,
-    "current_task": 1
+    "current_task": null
   },
-  "status": "executing",
+  "status": "continuation_spawned",
   "review": {
     "status": "pending",
     "iteration": 0,
     "last_verdict": null
   },
-  "last_action": "plan_created",
-  "last_updated": "2026-03-30T13:05:00Z"
+  "last_action": "continuation_spawned",
+  "last_updated": "2026-03-30T13:30:00Z"
 }

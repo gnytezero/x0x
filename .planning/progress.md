@@ -514,3 +514,14 @@ Phase 2.3 completed with comprehensive CI/CD pipeline implementation. Initial re
 - Phase 2.4 (GPG-Signed SKILL.md): ✅
 
 Phase 1.1: Identity Unification - COMPLETE (commit bca5b8b)
+
+### Phase 1.2 Complete - 2026-03-30
+- All 7 tasks completed as a single focused implementation pass
+- `subscribe_presence()`, `discover_agents_foaf()`, `discover_agent_by_id()` APIs added to Agent
+- `global_presence_topic()`, `peer_to_agent_id()`, `presence_record_to_discovered_agent()` helpers in presence.rs
+- `PresenceWrapper::start_event_loop()` diff-based online/offline event emission
+- `join_network()` auto-starts event loop
+- 660/660 tests passing, zero warnings, zero doc warnings
+- Commit: afb96ea
+
+### Phase 1.3 Starting...
