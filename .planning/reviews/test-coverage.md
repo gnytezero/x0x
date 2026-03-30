@@ -1,54 +1,27 @@
 # Test Coverage Review
-**Date**: Mon 30 Mar 2026 10:40:22 BST
+**Date**: 2026-03-30
+**Mode**: gsd-task (Phase 1.4)
 
-## Test files
-announcement_test.rs
-bootstrap_cache_integration.rs
-comprehensive_integration.rs
-connectivity_test.rs
-constitution_integration.rs
-crdt_convergence_concurrent.rs
-crdt_integration.rs
-crdt_partition_tolerance.rs
-daemon_api_integration.rs
-direct_messaging_integration.rs
-file_transfer_integration.rs
-gossip_cache_adapter_integration.rs
-identity_announcement_integration.rs
-identity_integration.rs
-identity_unification_test.rs
-mls_integration.rs
-nat_traversal_integration.rs
-network_integration.rs
-network_timeout.rs
-presence_foaf_integration.rs
-presence_wiring_test.rs
-rendezvous_integration.rs
-scale_testing.rs
-trust_evaluation_test.rs
-upgrade_integration.rs
-vps_e2e_integration.rs
+## Statistics
+- New tests in src/presence.rs: 19 total
+- Phase 1.4 new tests: 11 (test_peer_beacon_stats_*, test_foaf_peer_score_*, test_presence_config_*)
+- All 679 tests pass (confirmed by build run)
 
-## New code test coverage
-New APIs added in Phase 1.2:
-  - Agent::subscribe_presence()  — no dedicated test
-  - Agent::discover_agents_foaf() — no dedicated test
-  - Agent::discover_agent_by_id() — no dedicated test
-  - presence::peer_to_agent_id() — no dedicated test
-  - presence::presence_record_to_discovered_agent() — no dedicated test
-  - PresenceWrapper::start_event_loop() — no dedicated test
+## Test Scenarios Covered
+- [OK] PeerBeaconStats single sample → fallback
+- [OK] PeerBeaconStats two samples → computes stats, floor clamp
+- [OK] PeerBeaconStats high jitter → ceiling clamp (600s)
+- [OK] PeerBeaconStats steady beacons → floor clamp (180s)
+- [OK] PeerBeaconStats window cap at 10
+- [OK] foaf_peer_score no stats → 0.5
+- [OK] foaf_peer_score stable peer → close to 1.0
+- [OK] foaf_peer_score jittery vs stable comparison
+- [OK] foaf_peer_score always in [0,1] range
+- [OK] PresenceConfig adaptive fallback default = 300
+- [OK] PresenceConfig legacy_coexistence_mode default = true
 
-  Note: tests/presence_foaf_integration.rs has 8 tests but ALL are #[ignore]
-  (awaiting VPS testnet — by design per CLAUDE.md)
+## Gaps
+- [MINOR] No async test for start_event_loop bootstrap_cache integration (requires mock)
+- [MINOR] foaf_peer_candidates() not directly tested (depends on async runtime)
 
-## Existing test counts
-Unit tests in src/: 365
-Integration test files: 26
-
-## Findings
-- [IMPORTANT] No unit tests for peer_to_agent_id(), presence_record_to_discovered_agent() helper functions
-- [IMPORTANT] No unit test for start_event_loop() idempotency (double-call should be no-op)
-- [MINOR] discover_agents_foaf() and discover_agent_by_id() untested without network
-- [OK] Integration tests in presence_foaf_integration.rs exist but are correctly ignored (VPS dependency)
-
-## Grade: B
+## Grade: A

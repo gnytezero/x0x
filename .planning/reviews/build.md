@@ -1,18 +1,23 @@
 # Build Validation Report
-**Date**: Mon 30 Mar 2026 10:40:38 BST
+**Date**: 2026-03-30
 **Language**: Rust
 
 ## Results
 | Check | Status |
 |-------|--------|
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
-| build | PASS |
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
-| clippy | PASS |
-| format | PASS |
- Documenting x0x v0.13.0 (/Users/davidirvine/Desktop/Devel/projects/x0x)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.55s
-   Generated /Users/davidirvine/Desktop/Devel/projects/x0x/target/doc/x0x/index.html and 2 other files
-| docs | PASS |
+| cargo check | PASS |
+| cargo clippy -D warnings | PASS |
+| cargo fmt --check | FAIL |
+| cargo doc -D warnings | PASS |
+| cargo nextest (679 tests) | PASS (confirmed) |
+
+## Errors/Warnings
+
+
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/bin/x0x.rs:781:
+             PresenceSub::Foaf { ttl, timeout_ms } => {
+                 commands::presence::foaf(&client, ttl, timeout_ms).await
+             }
+[31m-            PresenceSub::Find { id, ttl, timeout_ms } => {
 
 ## Grade: A

@@ -1,27 +1,20 @@
 # Code Quality Review
-**Date**: Mon 30 Mar 2026 10:40:06 BST
+**Date**: 2026-03-30
+**Mode**: gsd-task (Phase 1.4)
 
-## Changes in scope
- src/lib.rs      | 121 ++++++++++++++++++++++++++++++++++++
- src/presence.rs | 189 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
- 2 files changed, 304 insertions(+), 6 deletions(-)
+## Scope
+src/presence.rs — new PeerBeaconStats type, PresenceWrapper fields, event loop changes
 
-## Findings
-
-## Clone usage (new code)
-+                return Ok(Some(agent.clone()));
-+            let mut updated = cached.clone();
-+        let event_tx = self.event_tx.clone();
-
-## Analysis
-- error variant naming: NodeCreation used for 'not initialized' case — MINOR: misleading name, prefer NodeCreation only for actual node creation failures
-- Linear scan in peer_to_agent_id() — O(n) over all cached agents — MINOR: acceptable for current scale (<10K agents)
-- SystemTime::now() in presence_record_to_discovered_agent() — correct use
-- Arc::clone pattern used correctly throughout
-- Event loop uses poll-based diff — simple and correct, no complex concurrency
+## Good Patterns
+- PeerBeaconStats implements Default via explicit impl (correct)
+- VecDeque capacity preallocated with_capacity(INTER_ARRIVAL_WINDOW + 1)
+- Constants use descriptive names: INTER_ARRIVAL_WINDOW, ADAPTIVE_TIMEOUT_FLOOR_SECS
+- foaf_peer_score() is pure function — testable and side-effect free
+- foaf_peer_candidates() returns sorted Vec — caller doesn't need to sort
 
 ## Findings
-- [MINOR] src/lib.rs — NodeCreation error variant used for 'not initialized' case; consider a dedicated variant or NodeError
-- [MINOR] src/presence.rs:peer_to_agent_id — O(n) linear scan; acceptable at current scale
+- [LOW] src/presence.rs: PresenceWrapper::foaf_peer_candidates sorts with partial_cmp fallback using Ordering::Equal for NaN — acceptable since f64 scores are always finite (1/(1+x) for x≥0)
+- [OK] No TODO/FIXME/HACK comments
+- [OK] No unnecessary clones in hot paths
 
-## Grade: A-
+## Grade: A

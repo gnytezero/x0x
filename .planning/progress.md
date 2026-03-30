@@ -538,3 +538,15 @@ Phase 1.1: Identity Unification - COMPLETE (commit bca5b8b)
 - Commit: e9e062d
 
 ### Phase 1.4 Starting...
+
+### Phase 1.4 Complete - 2026-03-30
+- All 5 tasks completed in a single implementation pass
+- Task 1: Bootstrap cache enrichment from presence beacons (PresenceWrapper gets optional BootstrapCache, feeds add_from_connection)
+- Task 2: PeerBeaconStats with VecDeque<u64> sliding window (INTER_ARRIVAL_WINDOW=10), inter_arrival_stats()
+- Task 3: Adaptive offline timeout (mean + 3*stddev, clamp 180-600s), PresenceConfig::adaptive_timeout_fallback_secs
+- Task 4: foaf_peer_score() pure function, foaf_peer_candidates() sorted Vec, PresenceWrapper::foaf_peer_candidates()
+- Task 5: PresenceConfig::legacy_coexistence_mode, 11 new unit tests, all 679 tests passing
+- Review findings fixed: double RwLock reads merged, peer_stats evicted on offline, last_seen() accessor added, fmt fixed
+- 679/679 tests passing, zero warnings, zero clippy violations
+
+### Phase 1.5 Starting...

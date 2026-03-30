@@ -1,17 +1,17 @@
 # Type Safety Review
-**Date**: Mon 30 Mar 2026 10:40:28 BST
+**Date**: 2026-03-30
+**Mode**: gsd-task (Phase 1.4)
 
-## Type cast analysis in new code
-
-## Type conversion analysis
-- PeerId→MachineId: MachineId(*peer_id.as_bytes()) — correct, same underlying [u8;32]
-- PeerId→AgentId fallback: AgentId(*peer_id.as_bytes()) — correctly noted as temporary
-- SystemTime→u64: uses duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) — safe
-- PresenceRecord.expires: u64 unix secs, compared correctly with now_secs
+## Scope
+src/presence.rs Phase 1.4 changes
 
 ## Findings
-- [OK] All type conversions are explicit and correct
-- [MINOR] AgentId fallback (AgentId(peer.0)) for unknown peers could cause confusion
-  if cached by callers — caller-visible behavior is documented
+- [OK] ant_quic::PeerId(*peer.as_bytes()) — correct tuple struct construction, byte array preserved
+- [OK] as u64 cast from f64 in adaptive_timeout_secs: safe because clamp(180.0, 600.0) guarantees value fits in u64
+- [OK] saturating_sub on u64 timestamps prevents underflow
+- [OK] VecDeque<u64> — unix timestamps never overflow u64 in realistic usage
+- [OK] Arc<RwLock<HashMap<PeerId, PeerBeaconStats>>> — proper interior mutability for shared state
+- [OK] No transmute, no Any, no unchecked numeric casts
+- [INFO] f64 arithmetic: variance.sqrt() on non-negative variance (sum of squares) is always ≥ 0 — no NaN risk
 
 ## Grade: A

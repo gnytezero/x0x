@@ -2083,11 +2083,7 @@ impl Agent {
     /// performed — use [`discover_agent_by_id`](Agent::discover_agent_by_id) for
     /// an active lookup that queries the network.
     pub async fn cached_agent(&self, id: &identity::AgentId) -> Option<DiscoveredAgent> {
-        self.identity_discovery_cache
-            .read()
-            .await
-            .get(id)
-            .cloned()
+        self.identity_discovery_cache.read().await.get(id).cloned()
     }
 
     /// Discover agents via Friend-of-a-Friend (FOAF) random walk.
@@ -3156,6 +3152,7 @@ impl AgentBuilder {
                 peer_id,
                 std::sync::Arc::clone(net),
                 presence::PresenceConfig::default(),
+                bootstrap_cache.clone(),
             )
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
