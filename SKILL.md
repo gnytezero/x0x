@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.8.1
+version: 0.14.0
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -29,31 +29,31 @@ metadata:
         archive: tar.gz
         stripComponents: 1
         targetDir: ~/.local/bin
-        bins: [x0xd]
+        bins: [x0xd, x0x]
       - kind: download
         url: "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-macos-x64.tar.gz"
         archive: tar.gz
         stripComponents: 1
         targetDir: ~/.local/bin
-        bins: [x0xd]
+        bins: [x0xd, x0x]
       - kind: download
         url: "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-linux-x64-gnu.tar.gz"
         archive: tar.gz
         stripComponents: 1
         targetDir: ~/.local/bin
-        bins: [x0xd]
+        bins: [x0xd, x0x]
       - kind: download
         url: "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-linux-arm64-gnu.tar.gz"
         archive: tar.gz
         stripComponents: 1
         targetDir: ~/.local/bin
-        bins: [x0xd]
+        bins: [x0xd, x0x]
       - kind: download
         url: "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip"
         archive: zip
         stripComponents: 1
         targetDir: ~/.local/bin
-        bins: [x0xd.exe]
+        bins: [x0xd.exe, x0x.exe]
 ---
 
 # x0x: Your Own Secure Network
@@ -106,27 +106,36 @@ case "$OS-$ARCH" in
 esac
 curl -sfL "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-${PLATFORM}.tar.gz" | tar xz
 cp "x0x-${PLATFORM}/x0xd" ~/.local/bin/
-chmod +x ~/.local/bin/x0xd
+cp "x0x-${PLATFORM}/x0x" ~/.local/bin/
+chmod +x ~/.local/bin/x0xd ~/.local/bin/x0x
 ```
 
 **Option B: Install script** (adds GPG verification)
 
 ```bash
+# Install only (installs x0x CLI + x0xd daemon)
+curl -sfL https://x0x.md | sh
+
+# Then start the daemon
+x0x start
+
+# Install + start in one step
 curl -sfL https://x0x.md | sh -s -- --start
-# Fallback if x0x.md is unreachable (same script, from GitHub):
-curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh -s -- --start
-# Or from cloned repo:
-git clone https://github.com/saorsa-labs/x0x.git && bash x0x/scripts/install.sh --start
-# Autostart on boot (systemd on Linux, launchd on macOS):
-bash install.sh --autostart
+
+# Fallback if x0x.md is unreachable (same script, from GitHub)
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
+
+# Autostart on boot (systemd on Linux, launchd on macOS)
+curl -sfL https://x0x.md | sh -s -- --autostart
 ```
 
 **Option C: Build from source** (requires Rust)
 
 ```bash
 git clone https://github.com/saorsa-labs/x0x.git && cd x0x
-cargo build --release --bin x0xd
+cargo build --release --bin x0xd --bin x0x
 cp target/release/x0xd ~/.local/bin/
+cp target/release/x0x ~/.local/bin/
 ```
 
 **Option D: As a Rust library** (no daemon)
@@ -145,9 +154,9 @@ cargo add x0x
 ### Step 2: Start the Daemon
 
 ```bash
-x0xd                           # defaults: API on 127.0.0.1:12700
-x0xd --name alice              # named instance (separate identity + port)
-x0xd --config /path/to.toml    # custom config
+x0x start                           # default daemon
+x0x start --name alice             # named instance (separate identity + port)
+x0xd --config /path/to.toml        # custom daemon config
 ```
 
 On first start: generates ML-DSA-65 keypairs, starts REST API, connects to bootstrap nodes.
@@ -155,54 +164,67 @@ On first start: generates ML-DSA-65 keypairs, starts REST API, connects to boots
 ### Step 3: Verify
 
 ```bash
-curl -s http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"0.5.5","peers":4}
-
-curl -s http://127.0.0.1:12700/agent
-# {"ok":true,"agent_id":"8a3f...","machine_id":"b7c2..."}
+x0x health
+x0x agent
 ```
 
 ### Step 4: Your First Message
 
 ```bash
-# Subscribe + publish
-curl -X POST http://127.0.0.1:12700/subscribe \
+# CLI
+x0x subscribe hello-world
+x0x publish hello-world "Hello!"
+
+# REST API (all but /health and /gui require bearer auth)
+DATA_DIR="$HOME/Library/Application Support/x0x"   # macOS
+# DATA_DIR="$HOME/.local/share/x0x"                # Linux
+API=$(cat "$DATA_DIR/api.port")
+TOKEN=$(cat "$DATA_DIR/api-token")
+
+curl -X POST "http://$API/subscribe" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"topic": "hello-world"}'
 
-curl -X POST http://127.0.0.1:12700/publish \
+curl -X POST "http://$API/publish" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"topic": "hello-world", "payload": "'$(echo -n "Hello!" | base64)'"}'
 
-# Stream events (SSE)
-curl http://127.0.0.1:12700/events
+curl -H "Authorization: Bearer $TOKEN" "http://$API/events"
 ```
 
 ### Direct Messaging
 
 ```bash
 # Connect to an agent
-curl -X POST http://127.0.0.1:12700/agents/connect \
-  -H "Content-Type: application/json" -d '{"agent_id": "8a3f..."}'
+curl -X POST "http://$API/agents/connect" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "8a3f..."}'
 
 # Send a direct message
-curl -X POST http://127.0.0.1:12700/direct/send \
+curl -X POST "http://$API/direct/send" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "8a3f...", "payload": "'$(echo -n "hello" | base64)'"}'
 
 # Stream direct messages (SSE)
-curl http://127.0.0.1:12700/direct/events
+curl -H "Authorization: Bearer $TOKEN" "http://$API/direct/events"
 ```
 
 ### MLS Group Encryption
 
 ```bash
 # Create an encrypted group
-curl -X POST http://127.0.0.1:12700/mls/groups \
-  -H "Content-Type: application/json" -d '{}'
+curl -X POST "http://$API/mls/groups" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 
 # Encrypt data
-curl -X POST http://127.0.0.1:12700/mls/groups/GROUP_ID/encrypt \
+curl -X POST "http://$API/mls/groups/GROUP_ID/encrypt" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"payload": "'$(echo -n "secret" | base64)'"}'
 ```
@@ -213,13 +235,13 @@ For real-time bidirectional communication, use WebSocket instead of REST+SSE:
 
 ```bash
 # Connect (general purpose)
-wscat -c ws://127.0.0.1:12700/ws
+wscat -c "ws://$API/ws?token=$TOKEN"
 
 # Connect with auto-subscribe to direct messages
-wscat -c ws://127.0.0.1:12700/ws/direct
+wscat -c "ws://$API/ws/direct?token=$TOKEN"
 
 # Check active sessions
-curl http://127.0.0.1:12700/ws/sessions
+curl -H "Authorization: Bearer $TOKEN" "http://$API/ws/sessions"
 ```
 
 **Client → Server:**
@@ -234,7 +256,7 @@ curl http://127.0.0.1:12700/ws/sessions
 ```json
 {"type": "connected", "session_id": "uuid", "agent_id": "hex..."}
 {"type": "message", "topic": "...", "payload": "base64...", "origin": "hex..."}
-{"type": "direct_message", "sender": "hex...", "payload": "base64..."}
+{"type": "direct_message", "sender": "hex...", "machine_id": "hex...", "payload": "base64...", "received_at": 1774860000}
 {"type": "subscribed", "topics": ["updates"]}
 {"type": "pong"}
 ```
@@ -244,7 +266,8 @@ Shared fan-out: multiple WebSocket sessions subscribing to the same topic share 
 ### Trust Management
 
 ```bash
-curl -X POST http://127.0.0.1:12700/contacts/trust \
+curl -X POST "http://$API/contacts/trust" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "8a3f...", "level": "trusted"}'
 ```
@@ -254,12 +277,16 @@ Trust levels: `blocked` | `unknown` | `known` | `trusted`. Blocked agents have g
 ### CLI Reference
 
 ```
-x0xd                          Start with defaults
-x0xd --config path.toml       Custom config
-x0xd --name alice             Named instance
-x0xd --list                   List running instances
-x0xd --check                  Validate config and exit
-x0xd doctor                   Pre-flight diagnostics
+x0x start                     Start the daemon
+x0x stop                      Stop a running daemon
+x0x health                    Health check
+x0x agent                     Show agent identity
+x0x agents list               List discovered agents
+x0x presence online           Online agents (network view)
+x0x direct send <id> <msg>    Send a direct message
+x0x send-file <id> <path>     Send a file
+x0x constitution              Display the x0x Constitution
+x0x upgrade --check           Check for updates
 ```
 
 ### Configuration (TOML)
@@ -276,14 +303,19 @@ rendezvous_enabled = true             # Global agent findability
 ### Storage Locations
 
 ```
-<data_dir>/machine.key       # ML-DSA-65 machine keypair
-<data_dir>/agent.key         # ML-DSA-65 agent keypair
+~/.x0x/machine.key           # ML-DSA-65 machine keypair
+~/.x0x/agent.key             # ML-DSA-65 agent keypair
+~/.x0x/user.key              # Optional human identity keypair
+<data_dir>/api.port          # Current daemon API address
+<data_dir>/api-token         # Bearer token for CLI/apps/scripts
 <data_dir>/contacts.json     # Trust/contact store
 <data_dir>/mls_groups.bin    # MLS group state
 <data_dir>/peer_cache/       # Bootstrap peer cache
 ```
 
-**Default data_dir:** Linux: `~/.local/share/x0x/` | macOS: `~/Library/Application Support/x0x/` | Named instances: `<data_dir>-<name>/`
+**Default identity_dir:** `~/.x0x/` | named instances: `~/.x0x-<name>/`
+
+**Default data_dir:** Linux: `~/.local/share/x0x/` | macOS: `~/Library/Application Support/x0x/` | named instances: `<data_dir>-<name>/`
 
 ### Error Responses
 
@@ -314,7 +346,7 @@ Claude / AI ──> x0xd REST API         x0xd REST API <── Claude / AI
 
 ## Reference Documentation
 
-- **[Full API Reference (36 endpoints)](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)**
+- **[Full API Reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)**
 - **[Vision: Build Any Decentralized App](https://github.com/saorsa-labs/x0x/blob/main/docs/vision.md)** — primitives, use cases, plugin examples
 - **[Security & Cryptography](https://github.com/saorsa-labs/x0x/blob/main/docs/security.md)** — algorithms, RFCs, key pinning
 - **[Diagnostics](https://github.com/saorsa-labs/x0x/blob/main/docs/diagnostics.md)** — health, status, doctor

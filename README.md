@@ -51,7 +51,7 @@ x0x agent
 
 ```bash
 # Generate your identity card
-x0x agent card --name "Alice"
+x0x agent card "Alice"
 # Output: x0x://agent/eyJkaXNwbGF5X25hbWUiOi...
 
 # Someone else imports it
@@ -317,7 +317,7 @@ x0x is designed as a **platform** — your daemon runs locally and exposes a RES
       ▼                  ▼                   ▼
 ┌─────────────────────────────────────────────────────┐
 │                    x0xd daemon                      │
-│  REST API (70 endpoints) · WebSocket · SSE streams  │
+│  REST API · WebSocket · SSE streams                 │
 │  localhost:12700 — never exposed to the internet    │
 └─────────────────────────┬───────────────────────────┘
                           │ QUIC (ML-KEM-768 encrypted)
@@ -330,31 +330,39 @@ x0x is designed as a **platform** — your daemon runs locally and exposes a RES
 
 **Any language, any framework.** If it can make HTTP requests or open a WebSocket, it can be an x0x app. The daemon handles all networking, encryption, and peer management.
 
-### REST API (70 Endpoints)
+### REST API
 
-Every feature is a REST call. Authentication is a bearer token read from `~/.local/share/x0x/api-token` (generated on first run).
+Every feature is a REST call. Authentication is a bearer token read from the daemon's `api-token` file.
 
 ```bash
-# Read your API token
-TOKEN=$(cat ~/.local/share/x0x/api-token)
+# Discover the daemon (macOS)
+DATA_DIR="$HOME/Library/Application Support/x0x"
+
+# Linux:
+# DATA_DIR="$HOME/.local/share/x0x"
+
+API=$(cat "$DATA_DIR/api.port")
+TOKEN=$(cat "$DATA_DIR/api-token")
 
 # Health check (no auth required)
-curl http://localhost:12700/health
+curl "http://$API/health"
 
 # List contacts (auth required)
-curl -H "Authorization: Bearer $TOKEN" http://localhost:12700/contacts
+curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 
 # Publish a message (payload is base64-encoded)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"topic":"my-channel","payload":"aGVsbG8gd29ybGQ="}' \
-  http://localhost:12700/publish
+  "http://$API/publish"
 
 # Create an MLS encrypted group
 curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://localhost:12700/mls/groups
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  "http://$API/mls/groups"
 
-# See all 70+ endpoints
+# See all current endpoints
 x0x routes
 ```
 
@@ -369,17 +377,17 @@ ws://127.0.0.1:12700/ws/direct?token=<TOKEN>  # Auto-subscribe to direct message
 
 **Subscribe to topics:**
 ```json
-{"action":"subscribe","topic":"team-chat"}
+{"type":"subscribe","topics":["team-chat"]}
 ```
 
 **Publish to topics:**
 ```json
-{"action":"publish","topic":"team-chat","payload":"aGVsbG8="}
+{"type":"publish","topic":"team-chat","payload":"aGVsbG8="}
 ```
 
 **Receive messages** (server pushes to you):
 ```json
-{"type":"message","topic":"team-chat","payload":"aGVsbG8=","sender":"a3f4b2..."}
+{"type":"message","topic":"team-chat","payload":"aGVsbG8=","origin":"a3f4b2..."}
 ```
 
 Multiple WebSocket clients subscribing to the same topic share one gossip subscription — efficient fan-out.
@@ -398,7 +406,7 @@ curl -N -H "Authorization: Bearer $TOKEN" http://localhost:12700/direct/events
 
 ### Example: Minimal Chat App (HTML)
 
-A complete chat app in a single HTML file — open in your browser while x0xd is running:
+A complete chat app in a single HTML file — serve it from `http://127.0.0.1` or `http://localhost` while `x0xd` is running:
 
 ```html
 <!DOCTYPE html>
@@ -408,19 +416,19 @@ A complete chat app in a single HTML file — open in your browser while x0xd is
   <input id="msg" placeholder="Type a message...">
   <button onclick="send()">Send</button>
   <script>
-    const TOKEN = 'YOUR_TOKEN_HERE'; // from ~/.local/share/x0x/api-token
+    const TOKEN = 'YOUR_TOKEN_HERE'; // inject from <data_dir>/api-token
     const TOPIC = 'my-chat-room';
-    const API = 'http://localhost:12700';
-    const WS_URL = `ws://localhost:12700/ws?token=${TOKEN}`;
+    const API = 'http://127.0.0.1:12700';
+    const WS_URL = `ws://127.0.0.1:12700/ws?token=${TOKEN}`;
 
     // Connect WebSocket
     const ws = new WebSocket(WS_URL);
-    ws.onopen = () => ws.send(JSON.stringify({action:'subscribe', topic:TOPIC}));
+    ws.onopen = () => ws.send(JSON.stringify({type:'subscribe', topics:[TOPIC]}));
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       if (msg.type === 'message') {
         const div = document.getElementById('messages');
-        div.innerHTML += `<p><b>${msg.sender?.slice(0,8)}:</b> ${atob(msg.payload)}</p>`;
+        div.innerHTML += `<p><b>${msg.origin?.slice(0,8)}:</b> ${atob(msg.payload)}</p>`;
       }
     };
 
@@ -439,7 +447,7 @@ A complete chat app in a single HTML file — open in your browser while x0xd is
 </html>
 ```
 
-Save this as `chat.html`, open it, and you have a working P2P chat app. No server, no signup, post-quantum encrypted.
+Serve this from localhost and you have a working P2P chat app. No server, no signup, post-quantum encrypted.
 
 ### Example Apps
 
@@ -466,9 +474,13 @@ AI agents can use x0x as their communication layer. The pattern:
 ```python
 # Python AI agent example
 import requests, json, base64
+from pathlib import Path
 
-API = "http://localhost:12700"
-TOKEN = open("~/.local/share/x0x/api-token").read().strip()
+data_dir = Path.home() / "Library/Application Support/x0x"  # macOS
+# data_dir = Path.home() / ".local/share/x0x"                # Linux
+
+API = f"http://{(data_dir / 'api.port').read_text().strip()}"
+TOKEN = (data_dir / "api-token").read_text().strip()
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
 # Get my identity
@@ -486,7 +498,7 @@ requests.post(f"{API}/publish", headers=HEADERS,
 
 ### App Development Tips
 
-- **Auth token**: Read from `~/.local/share/x0x/api-token` (Linux/macOS) — generated on first daemon start
+- **Auth token**: Read `api.port` and `api-token` from the daemon data directory rather than hardcoding paths or ports
 - **Binary payloads**: All payloads in REST are base64-encoded; WebSocket messages are JSON
 - **Localhost only**: The API only binds to `127.0.0.1` — never exposed to the network
 - **Multiple apps**: Many apps can share one daemon via separate WebSocket sessions
@@ -503,7 +515,7 @@ requests.post(f"{API}/publish", headers=HEADERS,
 x0x network status     # NAT type, peers, connectivity
 x0x network cache      # Bootstrap peer cache
 x0x peers              # Connected gossip peers
-x0x presence           # Online agents
+x0x presence online    # Online agents
 x0x upgrade            # Check for updates
 x0x tree               # Full command tree
 ```
@@ -514,7 +526,7 @@ x0x tree               # Full command tree
 
 ```toml
 [dependencies]
-x0x = "0.11"
+x0x = "0.14"
 ```
 
 ```rust

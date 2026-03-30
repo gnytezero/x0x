@@ -1,6 +1,6 @@
 **Give an agent a persistent identity that survives restarts.**
 
-> Status: current upstream `x0x v0.11.0` uses a three-layer identity model: machine identity, agent identity, and optional user identity.
+> Status: current upstream `x0x v0.14.0` uses a three-layer identity model: machine identity, agent identity, and optional user identity.
 
 The most important day-to-day identifier is the `agent_id`. If the agent key persists, the `agent_id` persists.
 
@@ -55,7 +55,7 @@ CLI:
 
 ```bash
 # Generate a shareable card link
-x0x agent card --name "MyAgent"
+x0x agent card "MyAgent"
 
 # Import someone else's card
 x0x agent import '<x0x://agent/...>' --trust known
