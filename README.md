@@ -368,11 +368,12 @@ x0x routes
 
 ### WebSocket API (Real-Time)
 
-For live data — chat messages, direct messages, events — use WebSocket. Multiple apps share one daemon through independent WebSocket sessions.
+For live data — chat messages, direct messages, events — use WebSocket. Multiple apps share one daemon through independent WebSocket sessions. `127.0.0.1:12700` is the default API address, but using `api.port` is more correct for named instances and custom configs.
 
-```
-ws://127.0.0.1:12700/ws?token=<TOKEN>         # General-purpose session
-ws://127.0.0.1:12700/ws/direct?token=<TOKEN>  # Auto-subscribe to direct messages
+```bash
+# Using $API and $TOKEN from the REST API section above
+wscat -c "ws://$API/ws?token=$TOKEN"         # General-purpose session
+wscat -c "ws://$API/ws/direct?token=$TOKEN"  # Auto-subscribe to direct messages
 ```
 
 **Subscribe to topics:**
