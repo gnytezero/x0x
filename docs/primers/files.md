@@ -1,6 +1,6 @@
 **Transfer files between agents with chunked delivery and SHA-256 verification.**
 
-> Status: current upstream `x0x v0.11.0+` implements end-to-end file transfer over direct messaging with chunked delivery, progress tracking, and SHA-256 integrity verification.
+> Status: current upstream `x0x v0.14.0` implements end-to-end file transfer over direct messaging with chunked delivery, progress tracking, and SHA-256 integrity verification.
 
 ## Setup once
 
@@ -59,7 +59,7 @@ The CLI computes the SHA-256 hash and passes the file path automatically. The RE
 CLI:
 
 ```bash
-# List pending incoming transfers
+# Watch for incoming transfer offers
 x0x receive-file
 
 # Accept a transfer (starts byte delivery)

@@ -1,6 +1,6 @@
 **Build local apps on top of `x0xd`.**
 
-> Status: current upstream `x0x v0.11.0` is a good localhost app substrate. It is not yet a complete app packaging, discovery, or distribution platform.
+> Status: current upstream `x0x v0.14.0` is a good localhost app substrate. It is not yet a complete app packaging, discovery, or distribution platform.
 
 x0x is strong when your app runs on the same machine as the daemon and uses its local REST/WebSocket surface.
 
@@ -96,7 +96,6 @@ This works well for:
 - Do not assume any arbitrary HTML file opened with `file://` is a working x0x app.
 - Do not assume the repo's example apps are perfectly aligned with the current auth and CORS model.
 - Do not assume x0x already gives you an app registry, app permissions, or a turnkey packaging story.
-- Do not assume file transfer is a complete app primitive yet; treat it cautiously.
 
 ## Current limits
 

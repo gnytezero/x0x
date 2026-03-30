@@ -1,6 +1,6 @@
 **Coordinate shared state across agents with task lists and stores.**
 
-> Status: current upstream `x0x v0.11.0` provides collaborative task lists (CRDT-based) and replicated key-value stores with automatic cross-node synchronization via gossip.
+> Status: current upstream `x0x v0.14.0` provides collaborative task lists (CRDT-based) and replicated key-value stores with automatic cross-node synchronization via gossip.
 
 ## Setup once
 
@@ -76,10 +76,10 @@ curl -X PATCH "http://$API/task-lists/tasks.release.v1/tasks/<task_id>" \
   -d '{"action":"claim"}'
 ```
 
-Two agents coordinate by binding to the same topic. Agent A creates the list; Agent B joins with:
+Two agents coordinate by binding local task-list handles to the same topic. Agent A creates the list, and Agent B creates its own local handle using the same shared topic:
 
 ```bash
-x0x tasks join "tasks.release.v1"
+x0x tasks create "Release checklist" "tasks.release.v1"
 ```
 
 After the initial ~15s route establishment, mutations from either side propagate automatically.
