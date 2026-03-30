@@ -525,3 +525,16 @@ Phase 1.1: Identity Unification - COMPLETE (commit bca5b8b)
 - Commit: afb96ea
 
 ### Phase 1.3 Starting...
+
+### Phase 1.3 Complete - 2026-03-30
+- All 6 tasks completed in a single implementation pass
+- Task 1: 5 presence endpoints registered in api/mod.rs + "presence" category
+- Task 2: PresenceVisibility enum + filter_by_trust() in presence.rs (TrustEvaluator reuse)
+- Task 3: 5 x0xd handlers (presence_online, foaf, find, status, events SSE)
+- Task 4: cli/commands/presence.rs (NEW) - DaemonClient wrappers for all endpoints
+- Task 5: PresenceSub enum + dispatch in x0x.rs CLI binary
+- Task 6: cached_agent() accessor on Agent for no-I/O local cache lookup
+- 668/668 tests passing, zero warnings, zero clippy violations
+- Commit: e9e062d
+
+### Phase 1.4 Starting...
