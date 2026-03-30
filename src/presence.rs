@@ -1158,7 +1158,10 @@ mod tests {
             );
         }
         // Most-stable should score highest
-        assert!(s_vs >= s_c, "Very stable ({s_vs}) must beat chaotic ({s_c})");
+        assert!(
+            s_vs >= s_c,
+            "Very stable ({s_vs}) must beat chaotic ({s_c})"
+        );
     }
 
     // ── Phase 1.5: proptest property tests ────────────────────────────────────

@@ -120,12 +120,9 @@ async fn test_presence_beacon_expiration() {
 async fn test_foaf_ttl_1_immediate_neighbors() {
     let (agent, _tmp) = build_local_agent().await;
 
-    let result = timeout(
-        Duration::from_secs(3),
-        agent.discover_agents_foaf(1, 200),
-    )
-    .await
-    .expect("FOAF query must complete within 3 seconds");
+    let result = timeout(Duration::from_secs(3), agent.discover_agents_foaf(1, 200))
+        .await
+        .expect("FOAF query must complete within 3 seconds");
 
     let agents = result.expect("discover_agents_foaf should not error with network config");
     assert!(
@@ -145,12 +142,9 @@ async fn test_foaf_ttl_1_immediate_neighbors() {
 async fn test_foaf_ttl_3_multi_hop() {
     let (agent, _tmp) = build_local_agent().await;
 
-    let result = timeout(
-        Duration::from_secs(3),
-        agent.discover_agents_foaf(3, 200),
-    )
-    .await
-    .expect("FOAF query must complete within 3 seconds");
+    let result = timeout(Duration::from_secs(3), agent.discover_agents_foaf(3, 200))
+        .await
+        .expect("FOAF query must complete within 3 seconds");
 
     let agents = result.expect("discover_agents_foaf should not error");
     assert!(
@@ -176,7 +170,10 @@ async fn test_foaf_find_specific_agent() {
     let id_a = agent_a.agent_id();
     let id_b = agent_b.agent_id();
 
-    assert_ne!(id_a, id_b, "Independently built agents must have different AgentIds");
+    assert_ne!(
+        id_a, id_b,
+        "Independently built agents must have different AgentIds"
+    );
 
     // Agent A cannot find Agent B (they are not connected).
     let found = timeout(
@@ -187,7 +184,10 @@ async fn test_foaf_find_specific_agent() {
     .expect("discover_agent_by_id must complete within 3 seconds")
     .expect("discover_agent_by_id should not error");
 
-    assert!(found.is_none(), "Unconnected agent must not be discoverable");
+    assert!(
+        found.is_none(),
+        "Unconnected agent must not be discoverable"
+    );
 }
 
 // ---------------------------------------------------------------------------
