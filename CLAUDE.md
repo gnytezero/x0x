@@ -243,6 +243,57 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 
+## E2E Test Scripts
+
+Four bash test scripts in `tests/` for end-to-end validation:
+
+| Script | Scope | Assertions | What it tests |
+|--------|-------|-----------|---------------|
+| `e2e_comprehensive.sh` | Local (alice+bob+charlie) | ~143 | ALL 75+ endpoints, 18 categories: contacts lifecycle, machine pinning, trust eval (5 paths), MLS full lifecycle (add/remove/re-add), named groups (invite validation, leave/rejoin), KV stores (multi-key, update), presence (all 6 endpoints), seedless bootstrap |
+| `e2e_live_network.sh` | Local → live VPS mesh | ~66 | Local node joins real bootstrap network, bidirectional: direct messaging, pub/sub, MLS groups with VPS members, named group invites across network, presence discovery |
+| `e2e_vps.sh` | 6 VPS bootstrap nodes | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Tokyo), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes |
+| `e2e_deploy.sh` | Build + deploy to VPS | ~24 | Cross-compile, upload to 6 nodes, verify health/version/mesh, collect API tokens |
+
+### Running E2E Tests
+
+```bash
+# 1. Build release binary
+cargo build --release
+
+# 2. Local comprehensive test (no VPS needed, ~2 min)
+bash tests/e2e_comprehensive.sh
+
+# 3. Live network test (local node joins real bootstrap, ~3 min)
+#    Requires: VPS nodes running, SSH access
+bash tests/e2e_live_network.sh
+
+# 4. Deploy to VPS (cross-compile + upload, ~5 min)
+#    Requires: cargo-zigbuild, SSH access to 6 VPS nodes
+bash tests/e2e_deploy.sh
+
+# 5. VPS-only test (test across 6 bootstrap nodes, ~4 min)
+#    Requires: tokens in tests/.vps-tokens.env (written by e2e_deploy.sh)
+bash tests/e2e_vps.sh
+
+# 6. Health check (quick VPS status)
+bash .deployment/health-check.sh              # basic
+bash .deployment/health-check.sh --extended   # with peer counts
+```
+
+### VPS Port Configuration
+
+| Port | Protocol | Purpose | Binding |
+|------|----------|---------|---------|
+| **5483** | UDP/QUIC | Transport (gossip network) | `[::]:5483` or `0.0.0.0:5483` |
+| **12600** | TCP/HTTP | REST API on VPS nodes | `127.0.0.1:12600` (configured in `/etc/x0x/config.toml`) |
+| **12700** | TCP/HTTP | REST API default (local dev) | `127.0.0.1:12700` (default when no config) |
+
+VPS API tokens are at `/root/.local/share/x0x/api-token` on Linux nodes.
+
+### SSH Notes for macOS
+
+When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlMaster=no -o ControlPath=none -o BatchMode=yes` to avoid SSH multiplexing hangs. The health check and VPS test scripts already include these flags.
+
 ## API Completeness
 
 75+ REST endpoints, all wired to x0xd and CLI:

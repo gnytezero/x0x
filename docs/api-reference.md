@@ -383,4 +383,4 @@ x0x ws sessions
 x0x gui
 ```
 
-See also: [api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)
+See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)
