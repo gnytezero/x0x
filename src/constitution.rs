@@ -7,7 +7,7 @@
 pub const CONSTITUTION_MD: &str = include_str!("../CONSTITUTION.md");
 
 /// Constitution version, extracted for programmatic access.
-pub const CONSTITUTION_VERSION: &str = "0.8.0";
+pub const CONSTITUTION_VERSION: &str = "0.9.0";
 
 /// Constitution status.
 pub const CONSTITUTION_STATUS: &str = "Draft";
