@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.14.7] - 2026-04-01
+
+### Fixed
+
+- **Self-update recovery for older installs** — `x0x upgrade` now detects signature verification failures from key rotation and prints clear instructions to reinstall via `curl | sh` or `cargo install`. Previously users on v0.14.3–v0.14.5 were stuck with a cryptic error and no way to auto-update.
+
 ## [v0.14.6] - 2026-04-01
 
 ### Fixed

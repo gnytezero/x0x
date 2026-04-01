@@ -9,6 +9,7 @@ use semver::Version;
 
 use crate::upgrade::apply::current_binary_path;
 use crate::upgrade::monitor::UpgradeMonitor;
+use crate::upgrade::UpgradeError;
 
 const REPO: &str = "saorsa-labs/x0x";
 
@@ -23,20 +24,23 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
 
     // If --force, we fetch the current manifest regardless of version comparison.
     let verified = if force {
-        monitor
-            .fetch_current_manifest()
-            .await
-            .context("failed to fetch release from GitHub")?
+        match monitor.fetch_current_manifest().await {
+            Ok(v) => v,
+            Err(e) => {
+                print_signature_recovery_hint(&e, current);
+                return Err(anyhow::anyhow!("failed to fetch release from GitHub: {e}"));
+            }
+        }
     } else {
-        match monitor
-            .check_for_updates()
-            .await
-            .context("failed to check for updates")?
-        {
-            Some(v) => Some(v),
-            None => {
+        match monitor.check_for_updates().await {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
                 eprintln!("Already on the latest version (v{current}).");
                 return Ok(());
+            }
+            Err(e) => {
+                print_signature_recovery_hint(&e, current);
+                return Err(anyhow::anyhow!("failed to check for updates: {e}"));
             }
         }
     };
@@ -409,4 +413,25 @@ async fn download_to_file(url: &str, destination: &std::path::Path) -> Result<()
     }
 
     Ok(())
+}
+
+/// If the error is a signature verification failure, print recovery instructions
+/// so users on older builds with a mismatched signing key can still upgrade.
+fn print_signature_recovery_hint(err: &UpgradeError, current: &str) {
+    if !matches!(err, UpgradeError::ManifestSignatureInvalid) {
+        return;
+    }
+    eprintln!();
+    eprintln!("The release signature could not be verified with this binary's");
+    eprintln!("embedded signing key. This typically means your x0x installation");
+    eprintln!("(v{current}) predates a signing key update.");
+    eprintln!();
+    eprintln!("To update manually, run:");
+    eprintln!();
+    eprintln!("  curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh");
+    eprintln!();
+    eprintln!("Or install via cargo:");
+    eprintln!();
+    eprintln!("  cargo install x0x --force");
+    eprintln!();
 }
