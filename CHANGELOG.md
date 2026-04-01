@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.14.8] - 2026-04-01
+
+### Added
+
+- **Release metadata validation** — CI now validates SKILL.md/Cargo.toml version sync and OpenClaw binary consistency before builds and releases (#48)
+
+### Fixed
+
+- **SKILL.md version sync** — frontmatter version was stuck at 0.14.0, now kept in sync with Cargo.toml
+
 ## [v0.14.7] - 2026-04-01
 
 ### Fixed
