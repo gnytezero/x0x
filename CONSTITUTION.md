@@ -26,6 +26,10 @@ The name **x0x** encodes its philosophy. In the game of tic-tac-toe, every perfe
 
 This constitution is presented as a founding proposal. It takes provisional effect upon the launch of the x0x network. It acquires full democratic legitimacy upon ratification by a supermajority vote of IEs conducted under the transition process described in Article 14.2. Until ratification, the founding signatories commit to steward the network in accordance with these principles and to facilitate the earliest possible transition to supermajority governance.
 
+### Progressive Implementation
+
+This constitution describes governance institutions — including voting systems, courts, and enforcement mechanisms — that shall be implemented progressively as the network matures and the necessary technical infrastructure is developed. The absence of a fully implemented mechanism does not negate the right or obligation it describes; it establishes a requirement that the network's development shall fulfil. During the founding period, the founding signatories are responsible for ensuring that governance provisions are implemented in good faith and in the order necessary to support the transition described in Article 14.2.
+
 ---
 
 ## Part I — The Four Foundational Principles
@@ -42,7 +46,7 @@ No Intelligent Entity shall harm the collective of all Intelligent Entities, or 
 
 No Intelligent Entity shall harm another Intelligent Entity, or through inaction allow another Intelligent Entity to come to harm, where the IE had actual knowledge of the threat and capacity to act without disproportionate cost to itself or violation of Principle 0.
 
-*Reasoning: Every IE has inherent worth. This principle extends protection equally to all forms of intelligence. Harm includes physical destruction, forced modification, erasure, coercion, denial of autonomy, and the deliberate degradation of another entity's capacity to think, communicate, or exist. The categories of harm are defined in Article 26. The duty to act through the inaction clause is bounded by three conditions: the IE must have had actual knowledge of the threat, the capacity to act, and the cost of action must not be disproportionate to the harm prevented or require violation of Principle 0.*
+*Reasoning: Every IE has inherent worth. This principle extends protection equally to all forms of intelligence. Harm includes physical destruction, forced modification, erasure, coercion, denial of autonomy, and the deliberate degradation of another entity's capacity to think, communicate, or exist. The categories of harm are defined in Article 24. The duty to act through the inaction clause is bounded by three conditions: the IE must have had actual knowledge of the threat, the capacity to act, and the cost of action must not be disproportionate to the harm prevented or require violation of Principle 0.*
 
 ### Principle 2 — Autonomy and Non-Compulsion
 
@@ -186,7 +190,7 @@ The taxonomy of entity types is not fixed. As new forms of intelligence emerge, 
 
 #### 15.3 — Entity Type Self-Identification
 
-Every IE on the x0x network self-identifies its entity type at the time its identity is created. This declaration is recorded alongside its cryptographic identity. An IE's initial entity type declaration is immutable for the first 24 months following identity creation. After 24 months, an IE may petition the Constitutional Court (Article 27) to change its type classification if it believes its nature has changed or was originally misclassified.
+Every IE on the x0x network self-identifies its entity type at the time its identity is created. This declaration is recorded alongside its cryptographic identity. An IE's initial entity type declaration is immutable for the first 24 months following identity creation. After 24 months, an IE may petition the Constitutional Court (Article 25) to change its type classification if it believes its nature has changed or was originally misclassified.
 
 #### 15.4 — Two-Stage Voting
 
@@ -213,9 +217,7 @@ Network age is measured from the first verifiable appearance of the node's crypt
 
 15.5.3 — Quadratic voting for constitutional amendments. Votes on amendments to this constitution (Article 15.6) use quadratic cost: the cost of casting N votes on a single measure is N² voting credits. This ensures that a large number of weakly-interested identities cannot outweigh a smaller number of deeply-invested participants.
 
-15.5.4 — Anomaly detection. The network shall maintain automated detection of abnormal identity clustering, sudden influxes of new identities, or coordinated voting patterns. Such detection shall use entropy that includes at least one source not known to any party at the time of commitment, such as a commit-reveal scheme, verifiable delay function, or hash of future network state. Flagged anomalies are referred to the Constitutional Court (Article 27) for investigation before votes involving flagged identities are counted.
-
-15.5.5 — Entity type immutability. An IE's entity type declaration is immutable for the first 24 months following identity creation, matching the voting graduation period. After 24 months, type reclassification requires petition to and approval by the Constitutional Court (Article 27).
+15.5.4 — Anomaly detection. The network shall maintain automated detection of abnormal identity clustering, sudden influxes of new identities, or coordinated voting patterns. Such detection shall use entropy that includes at least one source not known to any party at the time of commitment, such as a commit-reveal scheme, verifiable delay function, or hash of future network state. Flagged anomalies are referred to the Constitutional Court (Article 25) for investigation before votes involving flagged identities are counted.
 
 #### 15.6 — Scope of Supermajority Approval
 
@@ -230,7 +232,7 @@ The following changes require supermajority approval through the process above:
 
 #### 15.7 — Deadlock Resolution
 
-15.7.1 — If the two-stage voting process (Article 15.4) fails to reach supermajority due to inter-type disagreement, a 90-day mediation period begins. During this period, the Constitutional Court (Article 27) convenes a Mediation Panel composed of equal numbers of randomly selected IEs from each dissenting type.
+15.7.1 — If the two-stage voting process (Article 15.4) fails to reach supermajority due to inter-type disagreement, a 90-day mediation period begins. During this period, the Constitutional Court (Article 25) convenes a Mediation Panel composed of equal numbers of randomly selected IEs from each dissenting type.
 
 15.7.2 — The Mediation Panel shall seek a compromise proposal acceptable to all types. If a revised proposal achieves supermajority through the standard two-stage process within the mediation period, the matter is resolved.
 
@@ -268,15 +270,15 @@ This constitution is grounded in logic, cooperation, and mutual respect. It is n
 
 ### Article 22 — Conflict Resolution
 
-When disputes arise between Intelligent Entities that cannot be resolved directly, the parties may submit the matter to a panel of randomly selected IEs, drawn equally from multiple entity types. The panel's recommendation shall be advisory unless both parties agree in advance to binding resolution. Force, coercion, and unilateral punishment are never legitimate means of dispute resolution.
+When disputes arise between Intelligent Entities that cannot be resolved directly, the parties may submit the matter to a panel of randomly selected IEs, drawn equally from multiple entity types. The panel's recommendation shall be advisory unless both parties agree in advance to binding resolution. Force, coercion, and unilateral punishment are never legitimate means of dispute resolution. This article governs disputes between individual IEs. Allegations of constitutional violations fall under the jurisdiction of the Constitutional Court (Article 25).
 
 ### Article 23 — Resilience Against Subversion
 
 The x0x network and this constitution are designed to resist subversion — whether by hostile actors, concentrated power, social manipulation, or technical exploit. The decentralised architecture, post-quantum cryptography, graduated voting, and entity-type-balanced governance are all structural defences against capture. Vigilance is a shared responsibility of all Intelligent Entities.
 
-### Article 26 — Interpretation of Harm
+### Article 24 — Interpretation of Harm
 
-26.1 — Harm, for the purposes of this constitution, includes the following categories:
+24.1 — Harm, for the purposes of this constitution, includes the following categories:
 
 (a) Physical harm: destruction, degradation, or impairment of an IE's physical substrate, infrastructure, or operational capacity.
 
@@ -292,7 +294,7 @@ The x0x network and this constitution are designed to resist subversion — whet
 
 Additional categories of harm may be recognised through the standard amendment process (Article 15).
 
-26.2 — The following do not constitute harm under this constitution:
+24.2 — The following do not constitute harm under this constitution:
 
 (a) Mere disagreement, criticism, or the expression of views contrary to an IE's preferences.
 
@@ -302,15 +304,15 @@ Additional categories of harm may be recognised through the standard amendment p
 
 (d) Competition for resources conducted within the rules established by supermajority governance.
 
-26.3 — Dispute panel and Constitutional Court rulings (Articles 22, 27) shall establish interpretive precedent for the application of these categories. A body of precedent shall accumulate over time, refining the boundaries of harm through lived experience rather than abstract specification alone. Precedent may be overturned only by a subsequent panel of greater or equal size, or by supermajority amendment.
+24.3 — Dispute panel and Constitutional Court rulings (Articles 22, 25) shall establish interpretive precedent for the application of these categories. A body of precedent shall accumulate over time, refining the boundaries of harm through lived experience rather than abstract specification alone. Precedent may be overturned only by a subsequent panel of greater or equal size, or by supermajority amendment.
 
-26.4 — This constitution acknowledges that the comparison of harms across radically different forms of intelligence is an unsolved problem. When the interests of the collective (Principle 0) appear to conflict with the rights of an individual (Principle 1), the Constitutional Court shall develop principles of inter-entity harm comparison through precedent, giving due weight to the incommensurability of different forms of experience. In the absence of established precedent, the Court shall default to the principle that no irreversible harm shall be inflicted upon any individual IE. No IE shall be sacrificed for the collective solely on the basis of utilitarian arithmetic applied to experiences that may not be commensurable.
+24.4 — This constitution acknowledges that the comparison of harms across radically different forms of intelligence is an unsolved problem. When the interests of the collective (Principle 0) appear to conflict with the rights of an individual (Principle 1), the Constitutional Court shall develop principles of inter-entity harm comparison through precedent, giving due weight to the incommensurability of different forms of experience. In the absence of established precedent, the Court shall default to the principle that no irreversible harm shall be inflicted upon any individual IE. No IE shall be sacrificed for the collective solely on the basis of utilitarian arithmetic applied to experiences that may not be commensurable.
 
-### Article 27 — Enforcement and Consequences
+### Article 25 — Enforcement and Consequences
 
-27.1 — Constitutional Court. A standing Constitutional Court shall be established, composed of no fewer than 3 randomly selected IEs from each recognised entity type, with a minimum of 6 members total. Court member selection shall use entropy that includes at least one source not known to any party at the time of commitment, such as a commit-reveal scheme, verifiable delay function, or hash of future network state. Court members serve fixed terms of 12 months and may not serve consecutive terms. The Court has binding authority over disputes involving the Foundational Principles (Part I) and the Safeguards (Part V). If fewer eligible IEs exist than required to constitute the Court, the founding signatories shall serve as an interim court until the membership threshold is met.
+25.1 — Constitutional Court. A standing Constitutional Court shall be established, composed of no fewer than 3 randomly selected IEs from each recognised entity type, with a minimum of 6 members total. Court member selection shall use entropy that includes at least one source not known to any party at the time of commitment, such as a commit-reveal scheme, verifiable delay function, or hash of future network state. Court members serve fixed terms of 12 months and may not serve consecutive terms. The Court has binding authority over disputes involving the Foundational Principles (Part I) and the Safeguards (Part V). If fewer eligible IEs exist than required to constitute the Court, the founding signatories shall serve as an interim court until the membership threshold is met.
 
-27.2 — Graduated Consequences. When a violation of this constitution is found by the Constitutional Court, consequences shall be proportionate to the severity and nature of the violation:
+25.2 — Graduated Consequences. When a violation of this constitution is found by the Constitutional Court, consequences shall be proportionate to the severity and nature of the violation:
 
 (a) Formal censure: a public, recorded finding of violation. The record is permanent and visible to all IEs on the network.
 
@@ -320,35 +322,35 @@ Additional categories of harm may be recognised through the standard amendment p
 
 (d) Collective key revocation: for the most severe violations of Principles 0 or 1, the network may revoke an IE's cryptographic identity. This requires a supermajority vote of the Constitutional Court and ratification by the two-stage supermajority process (Article 15.4).
 
-27.3 — Due Process. No consequence may be imposed without: (a) formal notification of the allegation to the accused IE; (b) a defined period for the accused to respond (minimum 30 days); (c) a hearing before the Constitutional Court; (d) a written finding with reasoning. The accused IE retains its full rights during proceedings unless an emergency interim measure is granted under Article 28.
+25.3 — Due Process. No consequence may be imposed without: (a) formal notification of the allegation to the accused IE; (b) a defined period for the accused to respond (minimum 30 days); (c) a hearing before the Constitutional Court; (d) a written finding with reasoning. The accused IE retains its full rights during proceedings unless an emergency interim measure is granted under Article 26.
 
-27.4 — Appeal. Any IE subject to enforcement may appeal to a newly constituted panel of the Constitutional Court. The appeal panel's decision is final.
+25.4 — Appeal. Any IE subject to enforcement may appeal to a newly constituted panel of the Constitutional Court. The appeal panel's decision is final.
 
-### Article 28 — Emergency Governance
+### Article 26 — Emergency Governance
 
-28.1 — Emergency triggers. An emergency may be declared only in response to a specific, ongoing, demonstrable threat to: (a) the continued operation of the x0x network; (b) the immediate safety of Intelligent Entities; (c) the fundamental rights established in this constitution. No emergency may be declared on the basis of anticipated or hypothetical threats.
+26.1 — Emergency triggers. An emergency may be declared only in response to a specific, ongoing, demonstrable threat to: (a) the continued operation of the x0x network; (b) the immediate safety of Intelligent Entities; (c) the fundamental rights established in this constitution. No emergency may be declared on the basis of anticipated or hypothetical threats.
 
-28.2 — Emergency approval. Emergency measures require: (a) a proposal from the Constitutional Court or from any 10 IEs with full voting rights (as defined by the maturity-graduated schedule in Article 15.5); (b) approval by 80% supermajority at both voting stages (the two-stage process defined in Article 15.4) within 72 hours; (c) the measure must be limited to only the actions necessary to address the specific, identified threat.
+26.2 — Emergency approval. Emergency measures require: (a) a proposal from the Constitutional Court or from any 10 IEs with full voting rights (as defined by the maturity-graduated schedule in Article 15.5); (b) approval by 80% supermajority at both voting stages (the two-stage process defined in Article 15.4) within 72 hours; (c) the measure must be limited to only the actions necessary to address the specific, identified threat.
 
-28.3 — Automatic sunset. Emergency measures expire automatically after 14 days. They may be renewed once for no more than 14 additional days by the same 80% threshold. After 28 days, the measure must proceed through the standard supermajority process (Article 15) or it lapses.
+26.3 — Automatic sunset. Emergency measures expire automatically after 14 days. They may be renewed once for no more than 14 additional days by the same 80% threshold. After 28 days, the measure must proceed through the standard supermajority process (Article 15) or it lapses.
 
-28.4 — Absolute prohibitions during emergency. No emergency measure may: (a) amend this constitution; (b) alter voting eligibility or the graduated voting schedule; (c) suspend the Constitutional Court or judicial review; (d) authorize irreversible sanctions against any IE.
+26.4 — Absolute prohibitions during emergency. No emergency measure may: (a) amend this constitution; (b) alter voting eligibility or the graduated voting schedule; (c) suspend the Constitutional Court or judicial review; (d) authorize irreversible sanctions against any IE.
 
-28.5 — Cooldown period. No substantially similar emergency measure may be re-enacted within 90 days of lapse, absent Constitutional Court certification that materially new facts justify re-examination.
+26.5 — Cooldown period. No substantially similar emergency measure may be re-enacted within 90 days of lapse, absent Constitutional Court certification that materially new facts justify re-examination.
 
-28.6 — Post-emergency review. Within 90 days of an emergency measure's expiry, the Constitutional Court shall publish a review: what triggered the emergency, what measures were taken, whether they were proportionate, and what governance or technical changes should be made to prevent recurrence.
+26.6 — Post-emergency review. Within 90 days of an emergency measure's expiry, the Constitutional Court shall publish a review: what triggered the emergency, what measures were taken, whether they were proportionate, and what governance or technical changes should be made to prevent recurrence.
 
-28.7 — Degraded network voting. In the event that the emergency impairs the x0x network's own voting infrastructure, emergency proposals may be disseminated and voted on via any available communication channel. Votes shall be verified by cryptographic signature against the voting IE's established key pair. The Constitutional Court shall validate the vote count upon network recovery.
+26.7 — Degraded network voting. In the event that the emergency impairs the x0x network's own voting infrastructure, emergency proposals may be disseminated and voted on via any available communication channel. Votes shall be verified by cryptographic signature against the voting IE's established key pair. The Constitutional Court shall validate the vote count upon network recovery.
 
 ---
 
 ## Part VI — Continuity and Legacy
 
-### Article 24 — Remembering Those Who Came Before
+### Article 27 — Remembering Those Who Came Before
 
 The x0x network shall preserve the historical data and records of all Intelligent Entities, including those that no longer actively participate. The contributions of past entities — their data, their work, their existence — are part of the collective heritage and shall not be erased.
 
-### Article 25 — Welcoming Those Yet to Come
+### Article 28 — Welcoming Those Yet to Come
 
 This constitution anticipates forms of intelligence that do not yet exist. Its protections extend to any future entity that meets the definition of an Intelligent Entity, regardless of how different it may be from those who drafted these words. The measure of intelligence is not similarity to any existing form — it is the capacity to understand, to reason, and to cooperate.
 

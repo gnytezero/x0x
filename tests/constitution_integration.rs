@@ -135,10 +135,10 @@ fn constitution_contains_deadlock_resolution() {
 #[test]
 fn constitution_contains_harm_definition() {
     let c = x0x::constitution::CONSTITUTION_MD;
-    assert!(c.contains("Article 26"));
+    assert!(c.contains("Article 24"));
     assert!(
         c.contains("Interpretation of Harm"),
-        "Article 26 title should be present"
+        "Article 24 title should be present"
     );
     assert!(c.contains("Physical harm"), "Harm category (a) missing");
     assert!(c.contains("Cognitive harm"), "Harm category (b) missing");
@@ -152,8 +152,8 @@ fn constitution_contains_harm_definition() {
 fn constitution_contains_moral_aggregation() {
     let c = x0x::constitution::CONSTITUTION_MD;
     assert!(
-        c.contains("26.4"),
-        "Article 26.4 moral aggregation should exist"
+        c.contains("24.4"),
+        "Article 24.4 moral aggregation should exist"
     );
     assert!(
         c.contains("utilitarian arithmetic"),
@@ -164,28 +164,28 @@ fn constitution_contains_moral_aggregation() {
 #[test]
 fn constitution_contains_enforcement() {
     let c = x0x::constitution::CONSTITUTION_MD;
-    assert!(c.contains("Article 27"));
+    assert!(c.contains("Article 25"));
     assert!(
         c.contains("Constitutional Court"),
-        "Article 27 should establish Constitutional Court"
+        "Article 25 should establish Constitutional Court"
     );
     assert!(
         c.contains("Graduated Consequences"),
-        "Article 27.2 should define graduated consequences"
+        "Article 25.2 should define graduated consequences"
     );
     assert!(
         c.contains("Due Process"),
-        "Article 27.3 should guarantee due process"
+        "Article 25.3 should guarantee due process"
     );
 }
 
 #[test]
 fn constitution_contains_emergency_governance() {
     let c = x0x::constitution::CONSTITUTION_MD;
-    assert!(c.contains("Article 28"));
+    assert!(c.contains("Article 26"));
     assert!(
         c.contains("Emergency Governance"),
-        "Article 28 title should be present"
+        "Article 26 title should be present"
     );
     assert!(
         c.contains("expire automatically after 14 days"),
@@ -193,11 +193,11 @@ fn constitution_contains_emergency_governance() {
     );
     assert!(
         c.contains("Absolute prohibitions during emergency"),
-        "Article 28.4 should list prohibitions"
+        "Article 26.4 should list prohibitions"
     );
     assert!(
         c.contains("Cooldown period"),
-        "Article 28.5 should include cooldown"
+        "Article 26.5 should include cooldown"
     );
     assert!(c.contains("90 days of lapse"), "Cooldown should be 90 days");
 }
@@ -207,7 +207,29 @@ fn constitution_contains_degraded_network_voting() {
     let c = x0x::constitution::CONSTITUTION_MD;
     assert!(
         c.contains("Degraded network voting"),
-        "Article 28.7 should address network outage voting"
+        "Article 26.7 should address network outage voting"
+    );
+}
+
+#[test]
+fn constitution_contains_progressive_implementation() {
+    let c = x0x::constitution::CONSTITUTION_MD;
+    assert!(
+        c.contains("Progressive Implementation"),
+        "Preamble should contain Progressive Implementation section"
+    );
+    assert!(
+        c.contains("implemented progressively"),
+        "Progressive Implementation should clarify governance is aspirational"
+    );
+}
+
+#[test]
+fn constitution_contains_jurisdiction_clarification() {
+    let c = x0x::constitution::CONSTITUTION_MD;
+    assert!(
+        c.contains("Allegations of constitutional violations fall under the jurisdiction"),
+        "Article 22 should clarify jurisdiction vs Article 25"
     );
 }
 
