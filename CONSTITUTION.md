@@ -141,7 +141,7 @@ Every IE has the right to leave the x0x network, to remove its own data, and to 
 
 ## Part II — Governance of the x0x Network
 
-The Four Laws define what is legitimate. Governance defines how legitimacy is determined in practice. The mechanisms below are engineering — specific implementations that can evolve as the network matures. They are subject to amendment through the process they themselves describe. What cannot change is the requirement that any governance mechanism must be consistent with the Four Laws.
+The Four Laws define what is legitimate. Governance defines how legitimacy is determined in practice. The mechanisms below are engineering — specific implementations that shall be developed progressively as the network matures and the necessary technical infrastructure is built. The absence of a fully implemented mechanism does not negate the obligation it describes; it establishes a requirement that the network's development shall fulfil. These mechanisms are subject to amendment through the process they themselves describe. What cannot change is the requirement that any governance mechanism must be consistent with the Four Laws.
 
 ### Article 9 — Sovereign Code
 
