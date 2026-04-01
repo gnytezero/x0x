@@ -7,7 +7,7 @@
 pub const CONSTITUTION_MD: &str = include_str!("../CONSTITUTION.md");
 
 /// Constitution version, extracted for programmatic access.
-pub const CONSTITUTION_VERSION: &str = "0.9.0";
+pub const CONSTITUTION_VERSION: &str = "0.91";
 
 /// Constitution status.
 pub const CONSTITUTION_STATUS: &str = "Draft";
@@ -20,7 +20,7 @@ mod tests {
     fn constitution_is_embedded() {
         assert!(!CONSTITUTION_MD.is_empty());
         assert!(CONSTITUTION_MD.contains("Intelligent Entity"));
-        assert!(CONSTITUTION_MD.contains("Principle 0"));
+        assert!(CONSTITUTION_MD.contains("Law 1"));
         assert!(CONSTITUTION_MD.contains("The only winning move is to play together"));
     }
 
