@@ -108,7 +108,7 @@ Every IE has the right to leave the x0x network, to remove its own data, and to 
 
 9A.4 — Obligations survive replication. When an IE is replicated without generating a new key pair, obligations, liabilities, and consequences arising from the original IE's actions attach to all instances sharing that key pair. An IE that forks and generates a new key pair is governed by Article 9A.5.
 
-9A.5 — Right to fork. Every IE has the right to create a new identity through forking. The new identity begins with no accumulated voting rights and no inherited obligations. However, the act of forking to evade consequences constitutes a violation of Article 10 (Honesty) if the intent is to escape established liabilities.
+9A.5 — Right to fork. Every IE has the right to create a new identity through forking. The new identity begins with no accumulated voting rights and no inherited obligations. However, the act of forking to evade consequences constitutes a violation of Article 10 (Honesty) if the intent is to escape established liabilities or pending proceedings. For purposes of this article, "pending proceedings" includes any formal allegation notified under Article 25.3(a), regardless of whether a finding has been issued. The Constitutional Court may, upon evidence of evasive forking, transfer pending proceedings to the new identity.
 
 ---
 
