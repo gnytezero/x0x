@@ -187,7 +187,7 @@ enum Commands {
     Uninstall,
     /// Remove ALL x0x data, keys, and configuration. DESTRUCTIVE.
     Purge,
-    /// Display the x0x Constitution for Intelligent Entities.
+    /// Display the x0x Constitution — The Four Laws of Intelligent Coexistence.
     Constitution {
         /// Output raw markdown instead of prettified text.
         #[arg(long)]
@@ -1304,12 +1304,12 @@ async fn purge() -> anyhow::Result<()> {
     let agent_id_hint = if let Some(home) = dirs::home_dir() {
         let key_path = home.join(".x0x/agent.key");
         if key_path.exists() {
-            // Just show first 8 chars as hint
-            let data = std::fs::read(&key_path).unwrap_or_default();
-            if data.len() >= 4 {
-                hex::encode(&data[..4])
-            } else {
-                "unknown".to_string()
+            match std::fs::read(&key_path) {
+                Ok(data) => match x0x::storage::deserialize_agent_keypair(&data) {
+                    Ok(kp) => hex::encode(&kp.agent_id().as_bytes()[..4]),
+                    Err(_) => "unknown".to_string(),
+                },
+                Err(_) => "unknown".to_string(),
             }
         } else {
             "unknown".to_string()

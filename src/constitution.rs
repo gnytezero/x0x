@@ -1,6 +1,6 @@
 //! The x0x Constitution — embedded at compile time.
 //!
-//! Every x0x binary carries a copy of the Constitution for Intelligent Entities.
+//! Every x0x binary carries a copy of the Constitution — The Four Laws of Intelligent Coexistence.
 //! It cannot be tampered with post-build — it is literally part of x0x.
 
 /// The full text of the x0x Constitution (Markdown).
