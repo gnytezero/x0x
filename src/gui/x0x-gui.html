@@ -1521,7 +1521,14 @@ async function pollDash(){
   }
   const a=await api('/agent');
   if(a&&a.ok){
-    if(!S.get('agentId'))S.set('agentId',a.agent_id||'');
+    const prevAgent=LS.get('last_agent_id','');
+    const curAgent=a.agent_id||'';
+    if(prevAgent&&curAgent&&prevAgent!==curAgent){
+      // Identity changed (e.g. after purge+reinstall) — clear stale prefs
+      LS.del('display_name');LS.del('card_link');LS.del('sidebar_collapsed');
+    }
+    if(curAgent)LS.set('last_agent_id',curAgent);
+    if(!S.get('agentId'))S.set('agentId',curAgent);
     S.set('machineId',a.machine_id||'');
     S.set('userId',a.user_id||'');
     renderIdentityChain();
