@@ -111,7 +111,7 @@ Direct messages travel point-to-point over QUIC — never broadcast to the netwo
 
 ---
 
-## Presence & FOAF Discovery (v0.14.0)
+## Presence & FOAF Discovery
 
 SOTA presence system with adaptive failure detection and friend-of-a-friend discovery. Surpasses libp2p presence; matches Tailscale for NAT-aware peer discovery.
 

@@ -150,7 +150,7 @@ saorsa-pqc ◄── saorsa-mls
 | Structure | 11-crate workspace |
 | License | MIT OR Apache-2.0 |
 | Published | 10/11 crates on crates.io |
-| Depends on | saorsa-pqc 0.5, ant-quic 0.25.1 |
+| Depends on | saorsa-pqc 0.5, ant-quic 0.25.2 |
 | Tests | 404 |
 
 **Crates**: types, identity, transport, membership, pubsub, groups, presence, crdt-sync, coordinator, rendezvous, runtime

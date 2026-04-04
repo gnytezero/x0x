@@ -69,7 +69,7 @@ x0x is a bad fit when:
 
 ## Current state
 
-Version **0.10.0**.
+Version **0.15.1**.
 
 Current, working surface area includes:
 

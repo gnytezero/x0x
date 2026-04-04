@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.15.1] - 2026-04-03
+
+### Added
+
+- **mDNS zero-config LAN discovery** — agents on the same network find each other automatically via `_x0x._udp.local.` DNS-SD, no bootstrap needed
+- New integration tests: KV store, named groups, stress tests
+- Phase 19 mDNS testing in comprehensive test prompt
+
+## [v0.15.0] - 2026-04-03
+
+### Added
+
+- **4-word speakable identities** — human-friendly agent addresses via `four-word-networking` (`x0x find ocean-metal-forest-coral`)
+- `x0x find` and `x0x connect` CLI commands for agent discovery by words
+- Trust-gated `/introduction` endpoint with per-trust-level field visibility
+
+## [v0.14.9] - 2026-04-02
+
+### Fixed
+
+- Identity/address/timeout bug fixes
+- SKILL.md version sync
+- Rustdoc warning fixes
+
 ## [v0.14.8] - 2026-04-01
 
 ### Added
