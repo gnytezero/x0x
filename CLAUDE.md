@@ -316,7 +316,7 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 
 75+ REST endpoints, all wired to x0xd and CLI:
 - Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
-- Presence (v0.14.0): `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
+- Presence: `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
 - Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`
 - KvStore: `POST/GET /stores`, `PUT/GET/DELETE /stores/:id/:key` (with access control)
 - Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`
