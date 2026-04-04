@@ -225,7 +225,7 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 
 ## Test Organization
 
-19 integration test files in `tests/` (744 tests total):
+29 integration test files in `tests/` (744 tests total):
 
 | File | Tests |
 |------|-------|
@@ -247,6 +247,17 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 | `presence_foaf_integration.rs` | Presence beacons, FOAF discovery, trust-scoped visibility |
 | `presence_wiring_test.rs` | PresenceWrapper lifecycle, config defaults, shutdown |
 | `presence_integration.rs` | Presence API surface: subscribe, cached_agent, foaf_peer_candidates |
+| `kv_store_integration.rs` | KV store CRUD, access policies, CRDT sync |
+| `named_group_integration.rs` | Named groups, invites, join/leave, display names |
+| `bootstrap_cache_integration.rs` | Bootstrap cache persistence, quality scoring |
+| `constitution_integration.rs` | Constitution embedding and serving |
+| `daemon_api_integration.rs` | Daemon REST API endpoint coverage |
+| `direct_messaging_integration.rs` | Direct send/receive, connection lifecycle |
+| `file_transfer_integration.rs` | File send, accept, reject, progress |
+| `gossip_cache_adapter_integration.rs` | Gossip cache adapter wrapping bootstrap cache |
+| `rendezvous_integration.rs` | Rendezvous shard discovery |
+| `upgrade_integration.rs` | Self-update manifest signing, verification, rollout |
+| `vps_e2e_integration.rs` | VPS bootstrap node end-to-end |
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 
