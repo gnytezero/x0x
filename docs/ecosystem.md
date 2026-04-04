@@ -37,7 +37,7 @@ The ecosystem is a layered stack where each project has a single clear responsib
 │  x0x (v0.15)                                            │
 │  Post-quantum encrypted gossip network for AI agents    │
 │  Rust crate + npm + PyPI + CLI + REST API + GUI         │
-│  33K LoC · 704 tests · 75+ REST endpoints               │
+│  33K LoC · 744 tests · 75+ REST endpoints               │
 │                                                         │
 │  Provides: pub/sub, direct messaging, presence/FOAF,    │
 │  CRDT task lists, MLS groups, file transfer, trust,     │

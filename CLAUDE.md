@@ -225,7 +225,7 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 
 ## Test Organization
 
-19 integration test files in `tests/` (704 tests total):
+19 integration test files in `tests/` (744 tests total):
 
 | File | Tests |
 |------|-------|
