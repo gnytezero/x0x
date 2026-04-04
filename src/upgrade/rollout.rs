@@ -1,3 +1,6 @@
+//! Staged rollout: deterministic delay based on machine ID hash spreads
+//! upgrades across a configurable time window.
+
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};

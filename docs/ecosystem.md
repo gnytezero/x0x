@@ -166,7 +166,7 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.15.1 |
+| Version | 0.15.2 |
 | LoC | ~33,600 |
 | License | MIT OR Apache-2.0 |
 | Published | crates.io, npm, PyPI |

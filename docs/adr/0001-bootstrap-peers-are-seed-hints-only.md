@@ -1,6 +1,6 @@
 # ADR 0001: Bootstrap Peers Are Seed Hints Only
 
-- Status: Accepted (Partial Implementation — Phase 1 in progress, Phases 2–5 future)
+- Status: Accepted (Phase 1 functionally complete — nomenclature rename deferred, Phases 2–5 future)
 - Date: 2026-03-11
 
 ## Context

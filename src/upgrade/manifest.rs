@@ -1,3 +1,8 @@
+//! Release manifest types and wire format.
+//!
+//! `ReleaseManifest` carries version, platform assets, and checksums.
+//! Length-prefixed encoding: `[4-byte BE len][JSON][ML-DSA-65 signature]`.
+
 use serde::{Deserialize, Serialize};
 
 use super::UpgradeError;

@@ -1,3 +1,6 @@
+//! GitHub release monitor: polls for new versions, downloads and verifies
+//! manifests, and returns `VerifiedRelease` with pre-encoded gossip payloads.
+
 use std::time::Duration;
 
 use reqwest::Client;

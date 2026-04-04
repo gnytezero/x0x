@@ -1,3 +1,10 @@
+//! Decentralized self-update system for x0x binaries.
+//!
+//! Manifest-based upgrade flow: GitHub releases are checked for new versions,
+//! verified with ML-DSA-65 signatures, and propagated symmetrically via gossip.
+//! Nodes download, verify, and atomically replace their own binary with rollback
+//! support.
+
 pub mod apply;
 pub mod manifest;
 pub mod monitor;

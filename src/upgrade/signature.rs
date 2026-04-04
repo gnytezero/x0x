@@ -1,3 +1,6 @@
+//! ML-DSA-65 signing and verification for release archives and manifests.
+//! Embeds the release public key for signature verification.
+
 use std::path::Path;
 
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSignature, MlDsaVariant};

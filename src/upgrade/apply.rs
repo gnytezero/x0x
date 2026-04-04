@@ -1,3 +1,6 @@
+//! Binary upgrade application: download, verify SHA-256, extract, and atomically
+//! replace the running binary with rollback on failure.
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 

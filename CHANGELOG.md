@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.15.2] - 2026-04-05
+
+### Added
+
+- **Comprehensive test system** — integration, property-based, fuzz, and soak testing infrastructure
+
+### Fixed
+
+- SKILL.md version synced to 0.15.2
+
 ## [v0.15.1] - 2026-04-03
 
 ### Added

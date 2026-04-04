@@ -2,7 +2,7 @@
 
 ## Status
 
-Superseded by HyParView membership — The connectivity gap this ADR addresses (discovered agents can't exchange pub/sub without a direct QUIC connection) is resolved through HyParView's `membership().join(seeds)` in `join_network()`, which establishes overlay routing between agents sharing bootstrap peers. The specific approach described here (identity-listener-triggered `connect_addr()`) was not implemented; HyParView's active view management handles peer connectivity instead.
+Accepted — The identity listener auto-connects to discovered agents via `connect_addr()` in `start_identity_listener()` (`src/lib.rs`). Guards prevent redundant connections using an `auto_connect_attempted` HashSet. HyParView membership also contributes to overlay routing, but the direct auto-connect mechanism described here is implemented and active.
 
 ## Context
 
