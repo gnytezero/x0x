@@ -89,7 +89,7 @@ fn not_likely_direct_with_can_receive_direct_false() {
 }
 
 #[test]
-fn likely_direct_for_full_cone_nat() {
+fn likely_direct_for_full_cone_nat_is_false_without_peer_verification() {
     let da = fake_discovered(
         3,
         vec!["127.0.0.1:9000".parse().unwrap()],
@@ -99,8 +99,9 @@ fn likely_direct_for_full_cone_nat() {
         None,
     );
     let info = ReachabilityInfo::from_discovered(&da);
-    assert!(info.likely_direct());
-    assert!(!info.needs_coordination());
+    assert!(!info.likely_direct());
+    assert!(info.should_attempt_direct());
+    assert!(info.needs_coordination());
 }
 
 #[test]
@@ -126,7 +127,7 @@ fn not_likely_direct_without_addresses() {
 }
 
 #[test]
-fn likely_direct_optimistic_when_no_nat_info() {
+fn unknown_reachability_still_attempts_direct() {
     let da = fake_discovered(
         6,
         vec!["192.168.1.1:9000".parse().unwrap()],
@@ -136,10 +137,12 @@ fn likely_direct_optimistic_when_no_nat_info() {
         None,
     );
     let info = ReachabilityInfo::from_discovered(&da);
+    assert!(!info.likely_direct());
     assert!(
-        info.likely_direct(),
-        "optimistic: try direct when no NAT info"
+        info.should_attempt_direct(),
+        "unknown peers still get a direct probe"
     );
+    assert!(info.needs_coordination());
 }
 
 #[test]
@@ -303,6 +306,7 @@ async fn reachability_returns_correct_info_from_cache() {
     let info = info.unwrap();
 
     assert!(info.likely_direct());
+    assert!(info.should_attempt_direct());
     assert!(!info.needs_coordination());
     assert!(!info.is_relay());
     assert!(info.is_coordinator());
@@ -314,8 +318,7 @@ async fn reachability_returns_correct_info_from_cache() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn nat_type_none_string_is_likely_direct() {
-    // "None" (no NAT) means fully reachable
+fn nat_type_none_string_is_not_enough_without_peer_verification() {
     let da = fake_discovered(
         20,
         vec!["1.2.3.4:9000".parse().unwrap()],
@@ -325,11 +328,12 @@ fn nat_type_none_string_is_likely_direct() {
         None,
     );
     let info = ReachabilityInfo::from_discovered(&da);
-    assert!(info.likely_direct());
+    assert!(!info.likely_direct());
+    assert!(info.should_attempt_direct());
 }
 
 #[test]
-fn nat_type_address_restricted_optimistic_direct() {
+fn nat_type_address_restricted_still_attempts_direct_but_is_not_verified() {
     let da = fake_discovered(
         21,
         vec!["1.2.3.4:9000".parse().unwrap()],
@@ -339,15 +343,13 @@ fn nat_type_address_restricted_optimistic_direct() {
         None,
     );
     let info = ReachabilityInfo::from_discovered(&da);
-    assert!(
-        info.likely_direct(),
-        "AddressRestricted is optimistically tried"
-    );
-    assert!(!info.needs_coordination());
+    assert!(!info.likely_direct());
+    assert!(info.should_attempt_direct());
+    assert!(info.needs_coordination());
 }
 
 #[test]
-fn nat_type_port_restricted_optimistic_direct() {
+fn nat_type_port_restricted_still_attempts_direct_but_is_not_verified() {
     let da = fake_discovered(
         22,
         vec!["1.2.3.4:9000".parse().unwrap()],
@@ -357,8 +359,7 @@ fn nat_type_port_restricted_optimistic_direct() {
         None,
     );
     let info = ReachabilityInfo::from_discovered(&da);
-    assert!(
-        info.likely_direct(),
-        "PortRestricted is optimistically tried"
-    );
+    assert!(!info.likely_direct());
+    assert!(info.should_attempt_direct());
+    assert!(info.needs_coordination());
 }

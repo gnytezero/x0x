@@ -2483,6 +2483,7 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .iter()
         .map(|a| a.to_string())
         .collect();
+    let mut has_global_address = status.has_global_address;
 
     let port = status.local_addr.port();
 
@@ -2492,8 +2493,10 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
             if let Ok(local) = sock.local_addr() {
                 if let std::net::IpAddr::V4(v4) = local.ip() {
                     if !v4.is_loopback() && !v4.is_unspecified() {
-                        // Use the external IPv4 we saw in ant-quic logs, or local if no NAT
-                        // For now, include our local IPv4 — NAT traversal will handle the rest
+                        if !v4.is_private() && !v4.is_link_local() {
+                            has_global_address = true;
+                        }
+                        // Include our locally inferred IPv4 candidate even when it is LAN-only.
                         let addr_str = format!("{v4}:{port}");
                         if !all_addrs.contains(&addr_str) {
                             all_addrs.push(addr_str);
@@ -2514,6 +2517,7 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
                         && (segs[0] & 0xff00) != 0xfd00           // not ULA
                         && !v6.is_loopback();
                     if is_global {
+                        has_global_address = true;
                         let addr_str = format!("[{v6}]:{port}");
                         if !all_addrs.contains(&addr_str) {
                             all_addrs.push(addr_str);
@@ -2531,7 +2535,7 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "local_addr": status.local_addr.to_string(),
             "external_addrs": all_addrs,
             "nat_type": nat_type_str,
-            "has_public_ip": status.has_public_ip,
+            "has_global_address": has_global_address,
             "can_receive_direct": status.can_receive_direct,
             "connected_peers": status.connected_peers,
             "direct_connections": status.direct_connections,

@@ -4,7 +4,7 @@
 //! reachability of discovered agents and for establishing connections
 //! using the best available strategy:
 //!
-//! 1. **Direct** — the remote agent has a public IP or open NAT.
+//! 1. **Direct** — a peer has verified the agent is directly reachable.
 //! 2. **Coordinated** — hole-punching via a common coordinator node.
 //! 3. **Unreachable** — no viable path found with current information.
 
@@ -20,6 +20,9 @@ pub struct ReachabilityInfo {
     pub addresses: Vec<std::net::SocketAddr>,
     /// NAT type reported by the agent (e.g. "FullCone", "Symmetric").
     /// `None` when the agent has not yet reported NAT information.
+    ///
+    /// This is informational only. Connection strategy should not infer direct
+    /// reachability from NAT type alone.
     pub nat_type: Option<String>,
     /// Whether the agent can receive direct inbound connections.
     /// `None` when not reported.
@@ -45,41 +48,28 @@ impl ReachabilityInfo {
         }
     }
 
-    /// Returns `true` if a direct connection attempt is likely to succeed.
-    ///
-    /// This is the case when:
-    /// - The agent explicitly reports `can_receive_direct: true`, OR
-    /// - The agent has a NAT type that is easy to traverse (Full Cone), OR
-    /// - We have no NAT information but the agent has at least one address.
+    /// Returns `true` if the remote agent has observer-verified direct reachability.
     #[must_use]
     pub fn likely_direct(&self) -> bool {
-        if self.addresses.is_empty() {
-            return false;
-        }
-        match self.can_receive_direct {
-            Some(true) => return true,
-            Some(false) => return false,
-            None => {}
-        }
-        // Fall back to NAT type heuristics
-        match self.nat_type.as_deref() {
-            Some("None") | Some("FullCone") => true,
-            Some("Symmetric") => false,
-            // Unknown, AddressRestricted, PortRestricted: optimistically try direct
-            _ => true,
-        }
+        !self.addresses.is_empty() && self.can_receive_direct == Some(true)
+    }
+
+    /// Returns `true` if it is still worth attempting a direct connection.
+    ///
+    /// Unknown reachability should still get a direct probe, especially for new
+    /// networks where the first nodes have not yet accumulated observations.
+    #[must_use]
+    pub fn should_attempt_direct(&self) -> bool {
+        !self.addresses.is_empty() && self.can_receive_direct != Some(false)
     }
 
     /// Returns `true` if coordinated NAT traversal may be needed to connect.
     ///
-    /// This is the case when the agent reports a symmetric NAT type or
-    /// explicitly says it cannot receive direct connections.
+    /// Any agent that is not positively known to be directly reachable may still
+    /// need coordination after direct attempts are exhausted.
     #[must_use]
     pub fn needs_coordination(&self) -> bool {
-        if let Some(false) = self.can_receive_direct {
-            return true;
-        }
-        matches!(self.nat_type.as_deref(), Some("Symmetric"))
+        !self.addresses.is_empty() && self.can_receive_direct != Some(true)
     }
 
     /// Returns `true` if the agent is acting as a relay node.
@@ -169,10 +159,11 @@ mod tests {
     }
 
     #[test]
-    fn likely_direct_true_for_full_cone_nat() {
+    fn likely_direct_false_when_only_nat_type_is_known() {
         let agent = discovered(vec![addr()], Some("FullCone"), None, None, None);
         let info = ReachabilityInfo::from_discovered(&agent);
-        assert!(info.likely_direct());
+        assert!(!info.likely_direct());
+        assert!(info.should_attempt_direct());
     }
 
     #[test]
@@ -180,6 +171,7 @@ mod tests {
         let agent = discovered(vec![addr()], Some("Symmetric"), None, None, None);
         let info = ReachabilityInfo::from_discovered(&agent);
         assert!(!info.likely_direct());
+        assert!(info.should_attempt_direct());
     }
 
     #[test]
@@ -190,10 +182,11 @@ mod tests {
     }
 
     #[test]
-    fn likely_direct_true_when_no_nat_info_but_has_address() {
+    fn likely_direct_false_when_no_reachability_info_but_has_address() {
         let agent = discovered(vec![addr()], None, None, None, None);
         let info = ReachabilityInfo::from_discovered(&agent);
-        assert!(info.likely_direct());
+        assert!(!info.likely_direct());
+        assert!(info.should_attempt_direct());
     }
 
     #[test]
@@ -211,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_coordination_false_for_full_cone_nat() {
+    fn needs_coordination_false_for_verified_direct_peer() {
         let agent = discovered(vec![addr()], Some("FullCone"), Some(true), None, None);
         let info = ReachabilityInfo::from_discovered(&agent);
         assert!(!info.needs_coordination());

@@ -7,6 +7,7 @@
 set -euo pipefail
 
 X0XD="$(pwd)/target/debug/x0xd"
+VERSION="$(grep '^version = ' Cargo.toml | head -1 | cut -d '"' -f2)"
 PASS=0; FAIL=0; TOTAL=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -34,7 +35,7 @@ cleanup() { echo ""; echo "Cleaning up..."; kill $AP $BP 2>/dev/null||true; wait
 trap cleanup EXIT
 
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}   x0x v0.11.1 Full E2E Test — saorsa-mls PQC Integration${NC}"
+echo -e "${YELLOW}   x0x v${VERSION} Full E2E Test — saorsa-mls PQC Integration${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -82,7 +83,7 @@ BT=$(cat /tmp/x0x-e2e-bob/api-token 2>/dev/null||cat ~/.x0x-e2e-bob/api-token 2>
 # 1. HEALTH & STATUS
 # ═══════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[1/15] Health & Status${NC}"
-R=$(A /health); check_json "alice health" "$R" "ok"; check_contains "version 0.11.1" "$R" "0.11.1"
+R=$(A /health); check_json "alice health" "$R" "ok"; check_contains "version ${VERSION}" "$R" "$VERSION"
 R=$(B /health); check_json "bob health" "$R" "ok"
 R=$(A /status); check_json "alice status" "$R" "uptime_secs"
 

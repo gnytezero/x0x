@@ -942,8 +942,10 @@ impl Agent {
             return Ok(connectivity::ConnectOutcome::Unreachable);
         }
 
-        // 3. Try direct connection if likely to succeed
-        if info.likely_direct() {
+        // 3. Try direct connection whenever the peer is not explicitly known
+        //    to require coordination. Unknown reachability still deserves a
+        //    direct probe, especially for the first nodes in a new network.
+        if info.should_attempt_direct() {
             for addr in &info.addresses {
                 match network.connect_addr(*addr).await {
                     Ok(connected_peer_id) => {
@@ -975,10 +977,10 @@ impl Agent {
             }
         }
 
-        // 3. If direct failed and coordination may help, ensure a coordinator is
+        // 4. If direct failed and coordination may help, ensure a coordinator is
         //    connected first (gives ant-quic a relay path), then retry addresses.
         //    The network layer handles NAT traversal internally via QUIC extension frames.
-        if info.needs_coordination() || !info.likely_direct() {
+        if info.needs_coordination() || !info.should_attempt_direct() {
             // Ensure we're connected to a reachable peer that can act as a
             // coordinator/relay for NAT hole-punching. Any peer with
             // can_receive_direct serves as a potential mutual peer for
