@@ -90,7 +90,9 @@ impl ReachabilityInfo {
 pub enum ConnectOutcome {
     /// Connected directly without NAT traversal assistance.
     Direct(std::net::SocketAddr),
-    /// Connected via coordinated hole-punch or relay.
+    /// Connected via coordinated hole-punch through a relay peer (QUIC extension
+    /// frames, PUNCH_ME_NOW). The relay was a bootstrap node or other reachable peer
+    /// used as the NAT traversal coordinator.
     Coordinated(std::net::SocketAddr),
     /// Already connected via gossip overlay (e.g. LAN peer with no public
     /// address in their announcement).  Direct messaging is available.

@@ -977,58 +977,40 @@ impl Agent {
             }
         }
 
-        // 4. If direct failed and coordination may help, ensure a coordinator is
-        //    connected first (gives ant-quic a relay path), then retry addresses.
-        //    The network layer handles NAT traversal internally via QUIC extension frames.
+        // 4. If direct failed and coordination may help, use peer-ID hole-punching.
+        //    node.connect(peer_id) calls connect_to_peer(peer_id, None) which uses
+        //    the bootstrap nodes (already in known_peers) as implicit coordinators
+        //    for QUIC extension-frame hole-punching (PUNCH_ME_NOW). This is fundamentally
+        //    different from connect_addr which is raw QUIC with no NAT traversal.
         if info.needs_coordination() || !info.should_attempt_direct() {
-            // Ensure we're connected to a reachable peer that can act as a
-            // coordinator/relay for NAT hole-punching. Any peer with
-            // can_receive_direct serves as a potential mutual peer for
-            // ant-quic's PUNCH_ME_NOW coordination.
-            {
-                let cache = self.identity_discovery_cache.read().await;
-                let reachable: Vec<std::net::SocketAddr> = cache
-                    .values()
-                    .filter(|a| a.can_receive_direct == Some(true))
-                    .flat_map(|a| a.addresses.clone())
-                    .take(6)
-                    .collect();
-                drop(cache);
-                for addr in &reachable {
-                    if network.connect_addr(*addr).await.is_ok() {
-                        tracing::debug!(
-                            addr = %addr,
-                            "Connected to reachable peer for NAT coordination"
-                        );
-                        break;
+            let peer_id = ant_quic::PeerId(agent.machine_id.0);
+            match network.connect_peer(peer_id).await {
+                Ok(addr) => {
+                    let real_machine_id = agent.machine_id;
+                    // Enrich bootstrap cache with this successful address
+                    if let Some(ref bc) = self.bootstrap_cache {
+                        bc.add_from_connection(peer_id, vec![addr], None).await;
+                        bc.record_success(&peer_id, 0).await;
                     }
+                    // Update discovery cache (machine_id should already be correct from announcement)
+                    {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = real_machine_id;
+                        }
+                    }
+                    // Register agent mapping for direct messaging
+                    self.direct_messaging
+                        .mark_connected(agent.agent_id, real_machine_id)
+                        .await;
+                    return Ok(connectivity::ConnectOutcome::Coordinated(addr));
                 }
-            }
-
-            for addr in &info.addresses {
-                match network.connect_addr(*addr).await {
-                    Ok(connected_peer_id) => {
-                        let real_machine_id = identity::MachineId(connected_peer_id.0);
-                        if let Some(ref bc) = self.bootstrap_cache {
-                            bc.add_from_connection(connected_peer_id, vec![*addr], None)
-                                .await;
-                        }
-                        // Update discovery cache with real machine_id
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        // Register agent mapping for direct messaging
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
-                            .await;
-                        return Ok(connectivity::ConnectOutcome::Coordinated(*addr));
-                    }
-                    Err(e) => {
-                        tracing::debug!("Coordinated connect to {} failed: {}", addr, e);
-                    }
+                Err(e) => {
+                    tracing::debug!(
+                        "Hole-punch to {:?} failed: {}",
+                        agent.machine_id,
+                        e
+                    );
                 }
             }
         }
