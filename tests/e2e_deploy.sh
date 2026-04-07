@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/target/x86_64-unknown-linux-gnu/release/x0xd"
 TOKEN_FILE="$SCRIPT_DIR/.vps-tokens.env"
-VERSION="0.14.0"
+VERSION="0.15.3"
 SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
