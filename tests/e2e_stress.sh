@@ -98,19 +98,42 @@ skip() {
 jq_field() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',''))" 2>/dev/null || echo ""; }
 jq_int()   { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',0))" 2>/dev/null || echo "0"; }
 
+request_json() {
+    local method="$1" token="$2" url="$3"
+    local tmp status out
+    tmp=$(mktemp)
+    if [ "$#" -ge 4 ]; then
+        local body="$4"
+        status=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$body" "$url" 2>/dev/null || echo "000")
+    else
+        status=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" -H "Authorization: Bearer $token" "$url" 2>/dev/null || echo "000")
+    fi
+    out=$(cat "$tmp" 2>/dev/null || true)
+    rm -f "$tmp"
+    if [[ "$status" == 2* ]]; then
+        printf '%s' "$out"
+    elif [ "$status" = "000" ]; then
+        printf '{"error":"curl_failed"}'
+    elif [ -n "$out" ]; then
+        printf '%s' "$out"
+    else
+        printf '{"error":"http_%s"}' "$status"
+    fi
+}
+
 # ── Curl wrappers (alice=A, bob=B, charlie=C) ─────────────────────────────
-A()   { curl -sf -H "Authorization: Bearer $AT" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-B()   { curl -sf -H "Authorization: Bearer $BT" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-C()   { curl -sf -H "Authorization: Bearer $CT" "$CA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Ap()  { curl -sf -X POST -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d "${2:-{}}" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bp()  { curl -sf -X POST -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d "${2:-{}}" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Cp()  { curl -sf -X POST -H "Authorization: Bearer $CT" -H "Content-Type: application/json" -d "${2:-{}}" "$CA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Apu() { curl -sf -X PUT -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d "$2" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bpu() { curl -sf -X PUT -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d "$2" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Cpu() { curl -sf -X PUT -H "Authorization: Bearer $CT" -H "Content-Type: application/json" -d "$2" "$CA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Ad()  { curl -sf -X DELETE -H "Authorization: Bearer $AT" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bd()  { curl -sf -X DELETE -H "Authorization: Bearer $BT" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Cd()  { curl -sf -X DELETE -H "Authorization: Bearer $CT" "$CA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
+A()   { request_json "GET" "$AT" "$AA$1"; }
+B()   { request_json "GET" "$BT" "$BA$1"; }
+C()   { request_json "GET" "$CT" "$CA$1"; }
+Ap()  { if [ "$#" -ge 2 ]; then request_json "POST" "$AT" "$AA$1" "$2"; else request_json "POST" "$AT" "$AA$1" '{}'; fi; }
+Bp()  { if [ "$#" -ge 2 ]; then request_json "POST" "$BT" "$BA$1" "$2"; else request_json "POST" "$BT" "$BA$1" '{}'; fi; }
+Cp()  { if [ "$#" -ge 2 ]; then request_json "POST" "$CT" "$CA$1" "$2"; else request_json "POST" "$CT" "$CA$1" '{}'; fi; }
+Apu() { request_json "PUT" "$AT" "$AA$1" "$2"; }
+Bpu() { request_json "PUT" "$BT" "$BA$1" "$2"; }
+Cpu() { request_json "PUT" "$CT" "$CA$1" "$2"; }
+Ad()  { request_json "DELETE" "$AT" "$AA$1"; }
+Bd()  { request_json "DELETE" "$BT" "$BA$1"; }
+Cd()  { request_json "DELETE" "$CT" "$CA$1"; }
 
 # ── Cleanup ──────────────────────────────────────────────────────────────
 cleanup() {

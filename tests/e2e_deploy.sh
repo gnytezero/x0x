@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.15.3 Build, Deploy & Verify Bootstrap Nodes
+# x0x Build, Deploy & Verify Bootstrap Nodes
 # Cross-compiles for Linux, deploys to all 6 VPS nodes, verifies health + mesh
 # Writes API tokens to tests/.vps-tokens.env for e2e_vps.sh
 # =============================================================================
@@ -10,8 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/target/x86_64-unknown-linux-gnu/release/x0xd"
 TOKEN_FILE="$SCRIPT_DIR/.vps-tokens.env"
-VERSION="0.15.3"
-SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
+VERSION="$(grep '^version = ' "$PROJECT_DIR/Cargo.toml" | head -1 | cut -d '"' -f2)"
+SSH="ssh -C -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 PASS=0; FAIL=0; TOTAL=0
@@ -72,9 +72,10 @@ for node in "${NODE_NAMES[@]}"; do
         continue
     fi
 
-    # Upload binary
+    # Stream to a temp path and install atomically. These hosts accept SSH
+    # command execution reliably, but SFTP/scp in-place replacement can fail.
     echo -n "    Uploading binary... "
-    if scp -o ConnectTimeout=10 "$BINARY" root@"$ip":/opt/x0x/x0xd 2>/dev/null; then
+    if cat "$BINARY" | $SSH root@"$ip" 'cat > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
         echo -e "${GREEN}done${NC}"
     else
         echo -e "${RED}failed${NC}"
@@ -82,9 +83,9 @@ for node in "${NODE_NAMES[@]}"; do
         continue
     fi
 
-    # Set permissions and restart
+    # Install atomically and restart
     echo -n "    Restarting service... "
-    if $SSH root@"$ip" 'chmod +x /opt/x0x/x0xd && systemctl restart x0xd' 2>/dev/null; then
+    if $SSH root@"$ip" 'install -m 755 /tmp/x0xd.codex /opt/x0x/x0xd && rm -f /tmp/x0xd.codex && systemctl restart x0xd' 2>/dev/null; then
         echo -e "${GREEN}done${NC}"
     else
         echo -e "${RED}failed${NC}"

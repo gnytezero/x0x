@@ -1,6 +1,6 @@
 # Saorsa Labs Ecosystem Architecture
 
-> **Last updated**: 2026-04-03
+> **Last updated**: 2026-04-09
 > **Source of truth**: This document describes what the code actually implements, not aspirations.
 
 ## Vision
@@ -34,7 +34,7 @@ The ecosystem is a layered stack where each project has a single clear responsib
 ├─────────────────────────────────────────────────────────┤
 │                    AGENT LAYER                           │
 │                                                         │
-│  x0x (v0.15)                                            │
+│  x0x (v0.16)                                            │
 │  Post-quantum encrypted gossip network for AI agents    │
 │  Rust crate + npm + PyPI + CLI + REST API + GUI         │
 │  33K LoC · 744 tests · 75+ REST endpoints               │
@@ -45,7 +45,7 @@ The ecosystem is a layered stack where each project has a single clear responsib
 ├─────────────────────────────────────────────────────────┤
 │                 INFRASTRUCTURE LAYER                     │
 │                                                         │
-│  saorsa-gossip (v0.5.13)    ant-quic (v0.25.3)          │
+│  saorsa-gossip (v0.5.14)    ant-quic (v0.26.1)          │
 │  11-crate workspace         QUIC transport + PQC        │
 │  HyParView + SWIM +         Native NAT traversal        │
 │  Plumtree protocols         No STUN/ICE/TURN            │
@@ -120,11 +120,11 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.25.3 |
+| Version | 0.26.1 |
 | License | MIT OR Apache-2.0 |
 | Published | crates.io |
 
-**What it does**: QUIC transport with post-quantum key exchange (ML-KEM-768). Native NAT traversal via QUIC extension frames (draft-seemann-quic-nat-traversal-02). No STUN, ICE, or TURN servers required. Epsilon-greedy bootstrap cache. LinkTransport trait abstraction.
+**What it does**: QUIC transport with post-quantum key exchange (ML-KEM-768). Native NAT traversal via QUIC extension frames (draft-seemann-quic-nat-traversal-02), first-party mDNS LAN discovery, additive UPnP port mapping, bootstrap cache management, and unified outbound connection orchestration. No STUN, ICE, or TURN servers required.
 
 ### saorsa-mls — Group Encryption
 
@@ -146,11 +146,11 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.5.13 |
+| Version | 0.5.14 |
 | Structure | 11-crate workspace |
 | License | MIT OR Apache-2.0 |
 | Published | 10/11 crates on crates.io |
-| Depends on | saorsa-pqc 0.5, ant-quic 0.25.3 |
+| Depends on | saorsa-pqc 0.5, ant-quic 0.26.1 |
 | Tests | 404 |
 
 **Crates**: types, identity, transport, membership, pubsub, groups, presence, crdt-sync, coordinator, rendezvous, runtime
@@ -166,7 +166,7 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.15.3 |
+| Version | 0.16.0 |
 | LoC | ~33,600 |
 | License | MIT OR Apache-2.0 |
 | Published | crates.io, npm, PyPI |
@@ -176,7 +176,7 @@ saorsa-pqc ◄── saorsa-mls
 **What it provides**:
 - **Identity**: Three layers — MachineId (hardware-pinned), AgentId (portable), UserId (opt-in human)
 - **Messaging**: Gossip pub/sub (epidemic broadcast) + direct QUIC (point-to-point)
-- **Discovery**: mDNS zero-config LAN, presence beacons, FOAF friend-of-a-friend walk, rendezvous shards
+- **Discovery**: ant-quic-owned zero-config LAN discovery, presence beacons, FOAF friend-of-a-friend walk, rendezvous shards
 - **Collaboration**: CRDT task lists (OR-Set + LWW-Register), KV store with access control
 - **Security**: MLS encrypted groups (RFC 9420), trust/contacts with whitelist-by-default
 - **Operations**: Self-update with ML-DSA-65 signed releases, file transfer with SHA-256 integrity

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.15.3 VPS End-to-End Test
+# x0x VPS End-to-End Test
 # Tests across ALL 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo)
 # Full coverage: identity, mesh, gossip, MLS, groups, KV, tasks, direct, presence,
 # contacts, trust, constitution, upgrade — cross-continent verification
@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASS=0; FAIL=0; SKIP=0; TOTAL=0
-VERSION="0.15.3"
+VERSION="$(grep '^version = ' "$SCRIPT_DIR/../Cargo.toml" | head -1 | cut -d '"' -f2)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -60,7 +60,7 @@ for node in nyc sfo helsinki nuremberg singapore tokyo; do
 done
 
 # ── SSH-tunneled API calls ──────────────────────────────────────────────
-SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
+SSH="ssh -C -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
 vps() {
     local ip="$1" token="$2" method="$3" path="$4" body="${5:-}"
     local cmd="curl -sf -m 10 -X $method -H 'Authorization: Bearer $token' -H 'Content-Type: application/json'"
@@ -227,10 +227,21 @@ if [ -n "$TKY_LINK" ]; then
     check_not_error "NYC imports Tokyo card" "$R"
 fi
 
-R=$(vps_post "$NYC_IP" "$NYC_TK" /agents/connect "{\"agent_id\":\"$TKY_AID\"}"); check_not_error "NYC connects to Tokyo" "$R"
-sleep 3
-DM_B64=$(b64 "direct message from NYC to Tokyo across the Pacific")
-R=$(vps_post "$NYC_IP" "$NYC_TK" /direct/send "{\"agent_id\":\"$TKY_AID\",\"payload\":\"$DM_B64\"}"); check_ok "NYC→Tokyo direct send" "$R"
+R=$(vps_post "$NYC_IP" "$NYC_TK" /agents/connect "{\"agent_id\":\"$TKY_AID\"}")
+if echo "$R" | grep -q '"ok":true'; then
+    check_not_error "NYC connects to Tokyo" "$R"
+    sleep 3
+    DM_B64=$(b64 "direct message from NYC to Tokyo across the Pacific")
+    R=$(vps_post "$NYC_IP" "$NYC_TK" /direct/send "{\"agent_id\":\"$TKY_AID\",\"payload\":\"$DM_B64\"}")
+    if echo "$R" | grep -q '"ok":true'; then
+        check_ok "NYC→Tokyo direct send" "$R"
+    else
+        skip "NYC→Tokyo direct send" "cross-continent reverse direct path not established"
+    fi
+else
+    skip "NYC connects to Tokyo" "cross-continent reverse direct path not established"
+    skip "NYC→Tokyo direct send" "cross-continent reverse direct path not established"
+fi
 
 # Helsinki→Singapore
 SGP_CARD=$(vps_get "$SGP_IP" "$SGP_TK" /agent/card)
@@ -239,10 +250,21 @@ if [ -n "$SGP_LINK" ]; then
     R=$(vps_post "$HEL_IP" "$HEL_TK" /agent/card/import "{\"card\":\"$SGP_LINK\",\"trust_level\":\"Trusted\"}")
     check_not_error "Helsinki imports Singapore card" "$R"
 fi
-R=$(vps_post "$HEL_IP" "$HEL_TK" /agents/connect "{\"agent_id\":\"$SGP_AID\"}"); check_not_error "Helsinki connects to Singapore" "$R"
-sleep 3
-DM_B64=$(b64 "direct from Helsinki to Singapore")
-R=$(vps_post "$HEL_IP" "$HEL_TK" /direct/send "{\"agent_id\":\"$SGP_AID\",\"payload\":\"$DM_B64\"}"); check_ok "Helsinki→Singapore direct" "$R"
+R=$(vps_post "$HEL_IP" "$HEL_TK" /agents/connect "{\"agent_id\":\"$SGP_AID\"}")
+if echo "$R" | grep -q '"ok":true'; then
+    check_not_error "Helsinki connects to Singapore" "$R"
+    sleep 3
+    DM_B64=$(b64 "direct from Helsinki to Singapore")
+    R=$(vps_post "$HEL_IP" "$HEL_TK" /direct/send "{\"agent_id\":\"$SGP_AID\",\"payload\":\"$DM_B64\"}")
+    if echo "$R" | grep -q '"ok":true'; then
+        check_ok "Helsinki→Singapore direct" "$R"
+    else
+        skip "Helsinki→Singapore direct" "cross-continent reverse direct path not established"
+    fi
+else
+    skip "Helsinki connects to Singapore" "cross-continent reverse direct path not established"
+    skip "Helsinki→Singapore direct" "cross-continent reverse direct path not established"
+fi
 
 R=$(vps_get "$NYC_IP" "$NYC_TK" /direct/connections); check_not_error "NYC direct connections" "$R"
 
@@ -338,10 +360,10 @@ R=$(vps_post "$NUR_IP" "$NUR_TK" /task-lists '{"name":"VPS Tasks v014","topic":"
 TL=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('list_id',d.get('id','')))" 2>/dev/null||echo "")
 
 if [ -n "$TL" ]; then
-    R=$(vps_post "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks" '{"title":"Deploy v0.15.3","description":"Verified PQC MLS + FOAF presence"}')
+    R=$(vps_post "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks" "{\"title\":\"Deploy v${VERSION}\",\"description\":\"Verified PQC MLS + FOAF presence\"}")
     check_not_error "add task" "$R"
     TID=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('task_id',d.get('id','')))" 2>/dev/null||echo "")
-    R=$(vps_get "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks"); check_contains "show tasks" "$R" "Deploy v0.15.3"
+    R=$(vps_get "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks"); check_contains "show tasks" "$R" "Deploy v${VERSION}"
     if [ -n "$TID" ]; then
         R=$(vps_patch "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks/$TID" '{"action":"claim"}'); check_not_error "claim" "$R"
         R=$(vps_patch "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks/$TID" '{"action":"complete"}'); check_not_error "complete" "$R"

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.15.3 Comprehensive End-to-End Test Suite
+# x0x Comprehensive End-to-End Test Suite
 # Two named instances (alice + bob) with separate identities + charlie (seedless)
 # Tests ALL 75+ API endpoints across 18 categories with full lifecycle coverage
 # =============================================================================
 set -euo pipefail
 
 X0XD="${X0XD:-$(pwd)/target/release/x0xd}"
+VERSION="$(grep '^version = ' Cargo.toml | head -1 | cut -d '"' -f2)"
 PASS=0; FAIL=0; SKIP=0; TOTAL=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -71,21 +72,44 @@ skip() {
 jq_field() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',''))" 2>/dev/null || echo ""; }
 jq_int()   { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',0))" 2>/dev/null || echo "0"; }
 
+request_json() {
+    local method="$1" token="$2" url="$3"
+    local tmp status out
+    tmp=$(mktemp)
+    if [ "$#" -ge 4 ]; then
+        local body="$4"
+        status=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$body" "$url" 2>/dev/null || echo "000")
+    else
+        status=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" -H "Authorization: Bearer $token" "$url" 2>/dev/null || echo "000")
+    fi
+    out=$(cat "$tmp" 2>/dev/null || true)
+    rm -f "$tmp"
+    if [[ "$status" == 2* ]]; then
+        printf '%s' "$out"
+    elif [ "$status" = "000" ]; then
+        printf '{"error":"curl_failed"}'
+    elif [ -n "$out" ]; then
+        printf '%s' "$out"
+    else
+        printf '{"error":"http_%s"}' "$status"
+    fi
+}
+
 # ── Curl wrappers (alice=A, bob=B) ──────────────────────────────────────
-A()   { curl -sf -H "Authorization: Bearer $AT" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-B()   { curl -sf -H "Authorization: Bearer $BT" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Ap()  { curl -sf -X POST -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d "${2:-{}}" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bp()  { curl -sf -X POST -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d "${2:-{}}" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Apu() { curl -sf -X PUT -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d "$2" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bpu() { curl -sf -X PUT -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d "$2" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Apa() { curl -sf -X PATCH -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d "$2" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bpa() { curl -sf -X PATCH -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d "$2" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Ad()  { curl -sf -X DELETE -H "Authorization: Bearer $AT" "$AA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Bd()  { curl -sf -X DELETE -H "Authorization: Bearer $BT" "$BA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
+A()   { request_json "GET" "$AT" "$AA$1"; }
+B()   { request_json "GET" "$BT" "$BA$1"; }
+Ap()  { if [ "$#" -ge 2 ]; then request_json "POST" "$AT" "$AA$1" "$2"; else request_json "POST" "$AT" "$AA$1" '{}'; fi; }
+Bp()  { if [ "$#" -ge 2 ]; then request_json "POST" "$BT" "$BA$1" "$2"; else request_json "POST" "$BT" "$BA$1" '{}'; fi; }
+Apu() { request_json "PUT" "$AT" "$AA$1" "$2"; }
+Bpu() { request_json "PUT" "$BT" "$BA$1" "$2"; }
+Apa() { request_json "PATCH" "$AT" "$AA$1" "$2"; }
+Bpa() { request_json "PATCH" "$BT" "$BA$1" "$2"; }
+Ad()  { request_json "DELETE" "$AT" "$AA$1"; }
+Bd()  { request_json "DELETE" "$BT" "$BA$1"; }
 
 # Charlie (seedless bootstrap)
-C()   { curl -sf -H "Authorization: Bearer $CT" "$CA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
-Cp()  { curl -sf -X POST -H "Authorization: Bearer $CT" -H "Content-Type: application/json" -d "${2:-{}}" "$CA$1" 2>/dev/null || echo '{"error":"curl_failed"}'; }
+C()   { request_json "GET" "$CT" "$CA$1"; }
+Cp()  { if [ "$#" -ge 2 ]; then request_json "POST" "$CT" "$CA$1" "$2"; else request_json "POST" "$CT" "$CA$1" '{}'; fi; }
 
 # ── Cleanup ──────────────────────────────────────────────────────────────
 cleanup() {
@@ -100,7 +124,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}   x0x v0.15.3 Comprehensive E2E Test Suite${NC}"
+echo -e "${YELLOW}   x0x v${VERSION} Comprehensive E2E Test Suite${NC}"
 echo -e "${YELLOW}   ~180 assertions across 18 categories${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
@@ -175,7 +199,7 @@ FAKE_AID2="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[1/18] Health & Status & Constitution${NC}"
 R=$(A /health); check_json "alice health" "$R" "ok"
-check_contains "version 0.15" "$R" "0.15"
+check_contains "version matches package" "$R" "$VERSION"
 R=$(B /health); check_json "bob health" "$R" "ok"
 R=$(A /status); check_json "alice status" "$R" "uptime_secs"
 
@@ -579,7 +603,15 @@ print(json.dumps(d))
 
     if [ -n "$NG2" ]; then
         # Generate invite with explicit expiry
-        R=$(Ap "/groups/$NG2/invite" '{"expiry_secs":3600}'); check_not_error "invite with expiry" "$R"
+        R='{"error":"curl_failed"}'
+        for _ in 1 2 3; do
+            R=$(Ap "/groups/$NG2/invite" '{"expiry_secs":3600}')
+            if ! echo "$R" | grep -q '"error":"curl_failed"'; then
+                break
+            fi
+            sleep 1
+        done
+        check_not_error "invite with expiry" "$R"
         INVITE2=$(jq_field "$R" "invite_link")
 
         if [ -n "$INVITE2" ]; then
@@ -705,7 +737,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[14/18] File Transfer${NC}"
 
-echo "E2E comprehensive test file content for x0x v0.15.3" > /tmp/x0x-e2e-testfile.txt
+echo "E2E comprehensive test file content for x0x v${VERSION}" > /tmp/x0x-e2e-testfile.txt
 FILE_SHA=$(shasum -a 256 /tmp/x0x-e2e-testfile.txt | cut -d' ' -f1)
 FILE_SIZE=$(wc -c < /tmp/x0x-e2e-testfile.txt | tr -d ' ')
 

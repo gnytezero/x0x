@@ -7,7 +7,7 @@ This directory contains architecture decision records for x0x.
 - [ADR 0002: Application-Level Keepalive](./0002-application-level-keepalive-for-direct-connections.md) — 15s SWIM Ping prevents QUIC idle timeout
 - [ADR 0003: Auto-Connect to Discovered Agents](./0003-auto-connect-to-discovered-agents.md) — identity listener auto-connects via `connect_addr()`
 - [ADR 0004: QUIC Stream and Channel Limits](./0004-quic-stream-and-channel-limits.md) — 1024 data channels, 10K uni streams
-- [ADR 0005: mDNS Local Network Discovery](./0005-mdns-local-network-discovery.md) — zero-config LAN agent discovery
+- [ADR 0005: mDNS Local Network Discovery](./0005-mdns-local-network-discovery.md) — superseded; LAN discovery now lives in ant-quic
 
 ## Accepted (Phase 1 Functionally Complete)
 

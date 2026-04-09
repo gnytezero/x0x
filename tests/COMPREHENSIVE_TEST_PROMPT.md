@@ -1295,9 +1295,9 @@ For EACH node (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo):
 
 ---
 
-## Phase 19: mDNS Local Network Discovery (40 assertions)
+## Phase 19: Transport-Layer LAN Discovery (40 assertions)
 
-mDNS enables zero-config LAN discovery via `_x0x._udp.local.` DNS-SD services. Each agent registers with TXT records containing `agent_id`, `machine_id`, `words`, and `version`. Discovery runs as "Phase mDNS" in `join_network()` before bootstrap.
+ant-quic now provides zero-config LAN discovery for x0x. x0x no longer registers its own `_x0x._udp.local.` service or runs a separate "Phase mDNS" inside `join_network()`. Validate LAN discovery through transport events, connected peers, and successful agent discovery instead of x0x-specific mDNS APIs.
 
 ### Test Infrastructure — Local Machines
 
@@ -1308,22 +1308,22 @@ mDNS enables zero-config LAN discovery via `_x0x._udp.local.` DNS-SD services. E
 
 Deploy x0xd: `scp target/release/x0xd studio1@100.118.167.101:/tmp/x0xd`
 
-### 19.1 mDNS Registration (5×)
+### 19.1 Transport Discovery Startup (5×)
 | # | Interface | Action | Expected |
 |---|-----------|--------|----------|
-| 1 | Logs | Start x0xd, check log for `mDNS: registered` | Instance name, port, identity words in log |
-| 2 | Logs | Verify instance name format | `x0x-{16 hex agent}-{16 hex machine}` (37 chars) |
-| 3 | curl | `GET /health` after startup | mDNS registration did not block startup |
-| 4 | Logs | Start with `AgentBuilder::with_mdns(false)` | No `mDNS: registered` log line |
-| 5 | Logs | TXT records contain full agent_id and machine_id | 64-char hex strings in log |
+| 1 | Logs | Start x0xd with network enabled | Startup completes without any x0x-local mDNS init step |
+| 2 | curl | `GET /health` after startup | Transport discovery did not block startup |
+| 3 | Logs | Verify ant-quic transport starts normally | Node status/events available |
+| 4 | API | Confirm no x0x `with_mdns` builder toggle remains | LAN discovery policy belongs to ant-quic |
+| 5 | API | Confirm no x0x `mdns_discovery()` accessor remains | Discovery is surfaced through transport connectivity, not a separate x0x module |
 
 ### 19.2 Same-Machine Discovery (5×)
 | # | Interface | Action | Expected |
 |---|-----------|--------|----------|
-| 1 | Logs | Start instance A, then B on same machine | B discovers A: `mDNS: discovered agent` in log |
-| 2 | Logs | B's log shows `Phase mDNS: discovered 1 LAN peer(s)` | Peer count correct |
-| 3 | Logs | B connects to A: `Phase mDNS: X/Y LAN addresses connected` | At least 1 address connected |
-| 4 | Logs | A discovers B via background browse | `mDNS: discovered agent` appears in A's log |
+| 1 | Logs | Start instance A, then B on same machine | B discovers and connects to A without manual peer input |
+| 2 | Logs | Check transport events/status | Peer discovery or connection events appear from ant-quic |
+| 3 | Logs | B connects to A over LAN | At least 1 direct connection succeeds |
+| 4 | Logs | A also sees B after startup | Bidirectional discovery/connectivity |
 | 5 | curl | `GET /peers` on B after mDNS connection | A's peer ID in peer list |
 
 ### 19.3 Address Filtering (5×)
@@ -1341,47 +1341,47 @@ Requires mDNS multicast between studio1 and studio2 (may need UniFi "Multicast E
 
 | # | Interface | Action | Expected |
 |---|-----------|--------|----------|
-| 1 | Logs | Start on studio1, then studio2 | studio2 discovers studio1 via mDNS |
+| 1 | Logs | Start on studio1, then studio2 | studio2 discovers studio1 via ant-quic LAN discovery |
 | 2 | Logs | studio1 discovers studio2 via background browse | Bidirectional discovery |
-| 3 | Logs | studio2 connects to studio1 via mDNS address | `Phase mDNS: X/Y LAN addresses connected` |
+| 3 | Logs | studio2 connects to studio1 via LAN address | Direct connection succeeds without manual bootstrap |
 | 4 | curl | `GET /peers` on studio2 | studio1's peer ID present |
 | 5 | curl | `GET /agents/discovered` on studio1 | studio2's agent_id in discovered list (after identity announce) |
 
-### 19.5 mDNS Idempotency & Lifecycle (5×)
+### 19.5 Transport Discovery Lifecycle (5×)
 | # | Test | Expected |
 |---|------|----------|
-| 1 | Call `join_network()` twice (programmatic test) | `start_browse()` only runs once (idempotent) |
-| 2 | Shutdown agent | `mDNS: shut down` in log, service unregistered |
-| 3 | Start new instance after shutdown | Fresh mDNS registration succeeds |
-| 4 | Kill process without graceful shutdown | Drop impl cleans up daemon thread |
-| 5 | Verify no stale mDNS registrations after restart | New instance name replaces old |
+| 1 | Call `join_network()` twice (programmatic test) | No duplicate discovery failures or regressions |
+| 2 | Shutdown agent | Clean shutdown; no transport teardown errors |
+| 3 | Start new instance after shutdown | Fresh LAN discovery still succeeds |
+| 4 | Kill process without graceful shutdown | Restarted node can rejoin LAN cleanly |
+| 5 | Verify no stale discovery state after restart | New run converges without manual cleanup |
 
-### 19.6 mDNS + Bootstrap Coexistence (5×)
+### 19.6 LAN Discovery + Bootstrap Coexistence (5×)
 | # | Test | Expected |
 |---|------|----------|
-| 1 | Start with mDNS + bootstrap enabled | mDNS phase runs first, then bootstrap phases |
-| 2 | mDNS finds peers → skips bootstrap if enough connected | Log shows `Phase mDNS: X/Y connected`, bootstrap may not run |
-| 3 | mDNS finds no peers → falls through to bootstrap | Bootstrap phases 0/1/2 execute normally |
-| 4 | mDNS + VPS bootstrap both contribute peers | Total connected includes both sources |
-| 5 | Seedless instance (no bootstrap) with mDNS | mDNS-only discovery works, no bootstrap attempted |
+| 1 | Start with LAN discovery + bootstrap enabled | Both can contribute peers without conflicting |
+| 2 | LAN discovery finds peers | Local connectivity succeeds without blocking bootstrap logic |
+| 3 | LAN discovery finds no peers | Bootstrap phases 0/1/2 execute normally |
+| 4 | LAN discovery + VPS bootstrap both contribute peers | Total connected includes both sources |
+| 5 | Seedless instance (no bootstrap) on a LAN | Transport-layer LAN discovery still works |
 
-### 19.7 mDNS Self-Filtering & Identity (5×)
+### 19.7 LAN Discovery Identity Rules (5×)
 | # | Test | Expected |
 |---|------|----------|
-| 1 | Agent does not discover itself | Own fullname filtered by exact match |
-| 2 | Two agents with same agent key on different machines | Different instance names (machine_id differs) |
-| 3 | Same machine, different agent keys | Different instance names (agent_id differs) |
-| 4 | Invalid TXT records from foreign service | Graceful skip with warning log |
-| 5 | Missing TXT fields from foreign service | Graceful skip with warning log |
+| 1 | Agent does not connect to itself | Self-filtering prevents self-dials |
+| 2 | Two agents with same agent key on different machines | Authenticated machine identities remain distinct |
+| 3 | Same machine, different agent keys | Distinct peers remain distinguishable |
+| 4 | Foreign LAN services exist | Non-x0x/non-ant-quic services are ignored |
+| 5 | Discovery hints disagree with handshake identity | QUIC-authenticated identity wins |
 
-### 19.8 mDNS Stress & Edge Cases (5×)
+### 19.8 LAN Discovery Stress & Edge Cases (5×)
 | # | Test | Expected |
 |---|------|----------|
 | 1 | 5 instances on same machine | All discover each other (N*(N-1) pairs) |
-| 2 | Rapid start/stop cycles | No stale registrations, no daemon leaks |
-| 3 | Instance removed → ServiceRemoved event | Discovered map entry removed |
-| 4 | mDNS browse timeout (no peers on isolated network) | Falls through to bootstrap within 3 seconds |
-| 5 | Large number of non-x0x mDNS services on LAN | Only `_x0x._udp.local.` services processed |
+| 2 | Rapid start/stop cycles | No stale registrations, no transport leaks |
+| 3 | Instance removed | Peers eventually disappear from connectivity/discovery views |
+| 4 | Isolated network with no LAN peers | Falls through to bootstrap without hanging |
+| 5 | Large number of unrelated LAN services | Only transport-relevant services are processed |
 
 ---
 

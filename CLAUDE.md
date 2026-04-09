@@ -55,7 +55,7 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 ### Network Stack (bottom to top)
 
 1. **Transport** (`network.rs`): Wraps `ant-quic::Node`. Implements `saorsa_gossip_transport::GossipTransport` trait. Handles PeerId conversion between ant-quic and gossip type systems.
-2. **mDNS Discovery** (`mdns.rs`): Zero-config LAN discovery via `_x0x._udp.local.` DNS-SD. Runs before bootstrap in `join_network()`. TXT records carry agent_id, machine_id, identity words, version. Uses `mdns-sd` crate. Enabled by default, disable with `AgentBuilder::with_mdns(false)`.
+2. **Connectivity & Discovery** (`network.rs` + ant-quic): ant-quic owns first-party mDNS LAN discovery, additive UPnP port mapping, bootstrap cache management, and unified outbound connection orchestration. x0x consumes those capabilities through `ant_quic::Node` instead of running a separate application-layer mDNS runtime.
 3. **Bootstrap** (`bootstrap.rs`): 6 hardcoded global nodes (port 5483). 3-round retry with exponential backoff (0s, 10s, 15s). Nodes are in `network.rs::DEFAULT_BOOTSTRAP_PEERS`.
 4. **Gossip** (`gossip/`): Thin orchestration over `saorsa-gossip-*` crates. `GossipRuntime` owns `PubSubManager` which provides topic-based pub/sub via epidemic broadcast.
 5. **Presence** (`presence.rs`): SOTA presence system via `saorsa-gossip-presence`. Beacons propagate on `GossipStreamType::Bulk`. Phi-Accrual lite adaptive failure detection (180–600s), FOAF random-walk discovery with trust-scoped privacy (`PresenceVisibility::Network` vs `Social`), bootstrap cache enrichment from beacons, quality-weighted FOAF peer selection. Surpasses libp2p presence; matches Tailscale for NAT-aware discovery.
@@ -96,7 +96,6 @@ lib.rs (Agent, AgentBuilder, TaskListHandle, KvStoreHandle)
   ├── groups/      ← GroupInfo, SignedInvite, AgentCard (high-level group mgmt)
   ├── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
   ├── presence.rs  ← SOTA presence: beacons, FOAF, adaptive detection, trust privacy
-  ├── mdns.rs      ← mDNS local discovery: _x0x._udp.local. DNS-SD registration + browse
   ├── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
   └── gui/         ← Embedded HTML GUI (compiled into binary via include_str!)
 ```
@@ -104,14 +103,14 @@ lib.rs (Agent, AgentBuilder, TaskListHandle, KvStoreHandle)
 ### Key API Surface
 
 ```rust
-// Create agent (auto-generates keys, connects to bootstrap)
+// Create agent (auto-generates keys, seeds transport connectivity)
 let agent = Agent::builder()
     .with_machine_key("/custom/path")     // optional
     .with_agent_key(imported_keypair)      // optional
     .with_user_key_path("~/.x0x/user.key") // optional, opt-in
     .build().await?;
 
-agent.join_network().await?;              // mDNS LAN discovery → bootstrap nodes
+agent.join_network().await?;              // ant-quic local discovery + bootstrap orchestration
 let rx = agent.subscribe("topic").await?; // Gossip pub/sub
 agent.publish("topic", payload).await?;
 
@@ -136,10 +135,7 @@ let cached = agent.cached_agent(&id).await?;       // Local cache lookup (no net
 let pw = agent.presence_system().unwrap();          // Access PresenceWrapper
 let config = pw.config();                           // PresenceConfig
 
-// mDNS — zero-config LAN discovery (enabled by default)
-// Agent::builder().with_mdns(false) to disable
-let mdns = agent.mdns_discovery().unwrap();         // Access MdnsDiscovery
-let lan_peers = mdns.discovered_peers().await;      // Peers found via _x0x._udp.local.
+// Local discovery is handled by ant-quic transport connectivity by default.
 
 // Named groups with invite links
 // (managed via REST API: POST /groups, POST /groups/:id/invite, etc.)

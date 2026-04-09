@@ -555,31 +555,22 @@ requests.post(f"{API}/publish", headers=HEADERS,
 
 ---
 
-## Local Network Discovery (mDNS)
+## Local Network Discovery
 
-x0x agents on the same LAN discover each other automatically via mDNS — no bootstrap nodes needed. Each agent registers as a `_x0x._udp.local.` DNS-SD service.
+x0x agents on the same LAN discover each other automatically through ant-quic's built-in mDNS support. x0x no longer carries a separate LAN discovery runtime or `_x0x._udp.local.` service layer.
 
 ```bash
 # Start two agents on the same network — they find each other instantly
 x0x start --name alice
 x0x start --name bob
-# Bob's log: "mDNS: discovered agent a3f4b2... at 192.168.1.42:51234 (ocean metal forest coral)"
+# Bob's log shows a peer connection without any manual bootstrap configuration
 ```
 
-mDNS runs as the first discovery phase in `join_network()`, before bootstrap. If LAN peers are found, the agent connects immediately — zero internet required.
+mDNS now lives in the transport layer. `Agent::join_network()` still handles gossip startup, cache reuse, and bootstrap orchestration, while ant-quic advertises, browses, and auto-connects LAN peers in the background with zero x0x-specific setup.
 
 **Rust API:**
 ```rust
-// mDNS is enabled by default
 let agent = Agent::builder().build().await?;
-
-// Disable mDNS if not needed
-let agent = Agent::builder().with_mdns(false).build().await?;
-
-// Check discovered LAN peers
-if let Some(mdns) = agent.mdns_discovery() {
-    let peers = mdns.discovered_peers().await;
-}
 ```
 
 ---
@@ -601,7 +592,7 @@ x0x tree               # Full command tree
 
 ```toml
 [dependencies]
-x0x = "0.15"
+x0x = "0.16"
 ```
 
 ```rust

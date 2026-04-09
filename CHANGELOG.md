@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.16.0] - 2026-04-09
+
+### Changed
+
+- Bumped `ant-quic` to `0.26.1`
+- Bumped `saorsa-gossip-*` crates to `0.5.14`
+- Removed x0x-owned mDNS runtime and builder/accessor surface in favor of ant-quic's built-in first-party LAN discovery and additive UPnP handling
+
+### Fixed
+
+- Updated end-to-end shell harnesses to preserve HTTP error bodies instead of collapsing non-2xx responses into generic `curl_failed`
+- Fixed `tests/e2e_full.sh` to honor `X0XD` and default to the release binary
+- Updated release and deployment scripts to derive the current version dynamically
+
 ## [v0.15.3] - 2026-04-07
 
 ### Changed

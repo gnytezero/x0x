@@ -113,9 +113,6 @@ pub mod direct;
 /// Presence system — beacons, FOAF discovery, and online/offline events.
 pub mod presence;
 
-/// mDNS local network discovery for zero-config LAN agent discovery.
-pub mod mdns;
-
 /// Self-update system with ML-DSA-65 signature verification and staged rollout.
 pub mod upgrade;
 
@@ -196,8 +193,6 @@ pub struct Agent {
     direct_listener_started: std::sync::atomic::AtomicBool,
     /// Presence system wrapper for beacons, FOAF discovery, and events.
     presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
-    /// mDNS local network discovery.
-    mdns: Option<std::sync::Arc<mdns::MdnsDiscovery>>,
     /// Whether the user has consented to disclosing their identity in
     /// announcements.  Set by `announce_identity(true, true)` and respected
     /// by the heartbeat so it doesn't erase a consented disclosure.
@@ -523,8 +518,6 @@ pub struct AgentBuilder {
     identity_ttl_secs: Option<u64>,
     /// Custom path for the contacts file.
     contact_store_path: Option<std::path::PathBuf>,
-    /// Whether mDNS local network discovery is enabled (default: true).
-    mdns_enabled: bool,
 }
 
 /// Context captured by the background identity heartbeat task.
@@ -763,7 +756,6 @@ impl Agent {
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
             contact_store_path: None,
-            mdns_enabled: true,
         }
     }
 
@@ -848,12 +840,6 @@ impl Agent {
     #[must_use]
     pub fn presence_system(&self) -> Option<&std::sync::Arc<presence::PresenceWrapper>> {
         self.presence.as_ref()
-    }
-
-    /// Get a reference to the mDNS discovery system, if enabled.
-    #[must_use]
-    pub fn mdns_discovery(&self) -> Option<&std::sync::Arc<mdns::MdnsDiscovery>> {
-        self.mdns.as_ref()
     }
 
     /// Get a reference to the contact store.
@@ -985,38 +971,47 @@ impl Agent {
         if info.needs_coordination() || !info.should_attempt_direct() {
             // Use the machine_id from discovery cache as the peer_id hint.
             // NOTE: This may be a zeroed placeholder if the peer was discovered via
-            // gossip and hasn't been verified via QUIC handshake yet. After hole-punching
-            // succeeds, we get the real peer_id from the handshake and update the cache.
+            // gossip and hasn't been verified via QUIC handshake yet.
             let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
+            let hint_was_zeroed = agent.machine_id.0 == [0u8; 32];
             match network.connect_peer(peer_id_hint).await {
-                Ok((addr, real_peer_id)) => {
-                    // The real_peer_id is verified by QUIC TLS handshake — use it
-                    // (may differ from the placeholder machine_id in the discovery cache).
-                    let real_machine_id = identity::MachineId(real_peer_id.0);
-                    // Enrich bootstrap cache with the verified peer_id
-                    if let Some(ref bc) = self.bootstrap_cache {
-                        bc.add_from_connection(real_peer_id, vec![addr], None).await;
-                        bc.record_success(&real_peer_id, 0).await;
-                    }
-                    // Update discovery cache with the real machine_id from QUIC handshake
-                    {
-                        let mut cache = self.identity_discovery_cache.write().await;
-                        if let Some(entry) = cache.get_mut(agent_id) {
-                            entry.machine_id = real_machine_id;
+                Ok((addr, verified_peer_id)) => {
+                    let verified_machine_id = identity::MachineId(verified_peer_id.0);
+
+                    // Only update caches if the original hint was not zeroed.
+                    // When the hint was zeroed, we connected to *some* peer at that address
+                    // but have no way to verify they are the agent we intended. Writing
+                    // an unverified peer_id into the caches could corrupt the bootstrap cache
+                    // with the wrong peer's identity.
+                    if !hint_was_zeroed {
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            bc.add_from_connection(verified_peer_id, vec![addr], None)
+                                .await;
+                            bc.record_success(&verified_peer_id, 0).await;
+                        }
+                        {
+                            let mut cache = self.identity_discovery_cache.write().await;
+                            if let Some(entry) = cache.get_mut(agent_id) {
+                                entry.machine_id = verified_machine_id;
+                            }
                         }
                     }
-                    // Register agent mapping for direct messaging using verified machine_id
-                    self.direct_messaging
-                        .mark_connected(agent.agent_id, real_machine_id)
-                        .await;
+
+                    // Only register for direct messaging and update caches when the hint
+                    // was non-zero. When the hint was zeroed, we connected to *some*
+                    // peer at that address but have no cryptographic way to verify they
+                    // are the agent we intended. Binding an unverified peer_id to an
+                    // agent_id could corrupt the direct-messaging registry with the
+                    // wrong peer's identity.
+                    if !hint_was_zeroed {
+                        self.direct_messaging
+                            .mark_connected(agent.agent_id, verified_machine_id)
+                            .await;
+                    }
                     return Ok(connectivity::ConnectOutcome::Coordinated(addr));
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "Hole-punch to {:?} failed: {}",
-                        agent.machine_id,
-                        e
-                    );
+                    tracing::debug!("Hole-punch to {:?} failed: {}", agent.machine_id, e);
                 }
             }
         }
@@ -1030,11 +1025,6 @@ impl Agent {
     /// persisted to disk. The background maintenance task saves periodically,
     /// but this guarantees a final save.
     pub async fn shutdown(&self) {
-        // Shut down mDNS discovery.
-        if let Some(ref m) = self.mdns {
-            m.shutdown().await;
-        }
-
         // Shut down presence beacons.
         if let Some(ref pw) = self.presence {
             pw.shutdown().await;
@@ -1873,46 +1863,9 @@ impl Agent {
         let min_connected = 3;
         let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
 
-        // Phase mDNS: Discover and connect to LAN peers before trying
-        // remote bootstrap nodes.  This gives instant connectivity on
-        // local networks without any internet access.
-        if let Some(ref m) = self.mdns {
-            if let Err(e) = m.start_browse().await {
-                tracing::warn!("mDNS browse failed (non-fatal): {e}");
-            } else {
-                // Poll for discovered peers with early exit — don't waste
-                // time if peers appear quickly, but cap at 3 seconds.
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    if !m.discovered_peers().await.is_empty()
-                        || tokio::time::Instant::now() >= deadline
-                    {
-                        break;
-                    }
-                }
-
-                let lan_peers = m.discovered_peers().await;
-                // Collect all non-loopback addresses from all discovered peers.
-                let addrs: Vec<std::net::SocketAddr> =
-                    lan_peers.iter().flat_map(|p| &p.addrs).copied().collect();
-                if !addrs.is_empty() {
-                    tracing::info!(
-                        "Phase mDNS: discovered {} LAN peer(s) ({} addresses), connecting",
-                        lan_peers.len(),
-                        addrs.len()
-                    );
-                    let (succeeded, _failed) =
-                        self.connect_peers_parallel_tracked(network, &addrs).await;
-                    all_connected.extend(&succeeded);
-                    tracing::info!(
-                        "Phase mDNS: {}/{} LAN addresses connected",
-                        succeeded.len(),
-                        addrs.len()
-                    );
-                }
-            }
-        }
+        // ant-quic now owns first-party mDNS discovery and auto-connect.
+        // x0x keeps bootstrap/cache orchestration here, while the transport
+        // layer handles zero-config LAN discovery internally.
 
         // Phase 0: Try quality-scored coordinator peers from bootstrap cache.
         // The bootstrap cache learns about coordinator-capable peers passively
@@ -3216,17 +3169,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Enable or disable mDNS local network discovery.
-    ///
-    /// When enabled (default), the agent registers itself as a
-    /// `_x0x._udp.local.` DNS-SD service so other agents on the same
-    /// LAN can discover and connect without bootstrap nodes.
-    #[must_use]
-    pub fn with_mdns(mut self, enabled: bool) -> Self {
-        self.mdns_enabled = enabled;
-        self
-    }
-
     /// Build and initialise the agent.
     ///
     /// This performs the following:
@@ -3480,38 +3422,6 @@ impl AgentBuilder {
             None
         };
 
-        // Create mDNS discovery if enabled and network is configured.
-        let mdns_discovery = if self.mdns_enabled && network.is_some() {
-            // Compute four-word identity for TXT records.
-            let encoder = four_word_networking::IdentityEncoder::new();
-            let words = encoder
-                .encode_agent(identity.agent_id().as_bytes())
-                .map(|w| w.to_string())
-                .unwrap_or_default();
-
-            // Use the actual bound QUIC port (may be OS-assigned ephemeral).
-            let quic_port = if let Some(ref net) = network {
-                net.bound_addr().await.map(|a| a.port()).unwrap_or(5483)
-            } else {
-                5483
-            };
-
-            match mdns::MdnsDiscovery::new(
-                &identity.agent_id(),
-                &identity.machine_id(),
-                &words,
-                quic_port,
-            ) {
-                Ok(m) => Some(std::sync::Arc::new(m)),
-                Err(e) => {
-                    tracing::warn!("mDNS initialization failed (non-fatal): {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -3532,7 +3442,6 @@ impl AgentBuilder {
             direct_messaging,
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
             presence,
-            mdns: mdns_discovery,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }

@@ -495,7 +495,7 @@ R=$(alice transfers); check_not_error "list transfers" "$R"
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[13/13] Presence & Misc${NC}"
 
-R=$(alice presence); check_not_error "presence" "$R"
+R=$(alice presence online); check_not_error "presence online" "$R"
 R=$(alice_text tree); check_contains "command tree" "$R" "direct"
 
 # ═════════════════════════════════════════════════════════════════════════
