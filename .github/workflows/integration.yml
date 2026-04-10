@@ -18,7 +18,7 @@ jobs:
     name: API Coverage Guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Symlink dependencies
@@ -38,7 +38,7 @@ jobs:
     name: Property Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Symlink dependencies
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Symlink dependencies
@@ -91,7 +91,7 @@ jobs:
     timeout-minutes: 90
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Symlink dependencies
@@ -110,7 +110,7 @@ jobs:
         run: bash tests/soak/run_soak.sh --duration 1h
       - name: Upload soak results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: soak-results
           path: tests/soak/results/

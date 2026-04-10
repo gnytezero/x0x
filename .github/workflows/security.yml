@@ -18,16 +18,16 @@ jobs:
     name: Cargo Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Checkout ant-quic
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: saorsa-labs/ant-quic
           path: .deps/ant-quic
 
       - name: Checkout saorsa-gossip
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: saorsa-labs/saorsa-gossip
           path: .deps/saorsa-gossip
@@ -50,7 +50,7 @@ jobs:
     name: Panic Scanner
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Make script executable
         run: chmod +x scripts/check-panics.sh
