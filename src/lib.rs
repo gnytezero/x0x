@@ -189,6 +189,8 @@ pub struct Agent {
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
     /// Direct messaging infrastructure for point-to-point communication.
     direct_messaging: std::sync::Arc<direct::DirectMessaging>,
+    /// Ensures network event reconciliation listener is spawned once.
+    network_event_listener_started: std::sync::atomic::AtomicBool,
     /// Ensures direct message listener is spawned once.
     direct_listener_started: std::sync::atomic::AtomicBool,
     /// Presence system wrapper for beacons, FOAF discovery, and events.
@@ -869,6 +871,140 @@ impl Agent {
             .map(connectivity::ReachabilityInfo::from_discovered)
     }
 
+    async fn seed_transport_peer_hints_for_target(
+        &self,
+        network: &network::NetworkNode,
+        target: &DiscoveredAgent,
+    ) -> error::Result<()> {
+        fn merge_helper_hint(
+            hints: &mut std::collections::HashMap<
+                ant_quic::PeerId,
+                (
+                    Vec<std::net::SocketAddr>,
+                    ant_quic::bootstrap_cache::PeerCapabilities,
+                ),
+            >,
+            peer_id: ant_quic::PeerId,
+            addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+            supports_coordination: bool,
+            supports_relay: bool,
+        ) {
+            let entry = hints.entry(peer_id).or_insert_with(|| {
+                (
+                    Vec::new(),
+                    ant_quic::bootstrap_cache::PeerCapabilities::default(),
+                )
+            });
+            for addr in addrs {
+                if !entry.0.contains(&addr) {
+                    entry.0.push(addr);
+                }
+            }
+            if supports_coordination {
+                entry.1.supports_coordination = true;
+            }
+            if supports_relay {
+                entry.1.supports_relay = true;
+            }
+        }
+
+        let target_peer_id = ant_quic::PeerId(target.machine_id.0);
+        if target.machine_id.0 != [0u8; 32] {
+            network
+                .upsert_peer_hints(target_peer_id, target.addresses.clone(), None)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to upsert target peer hints: {e}"
+                    )))
+                })?;
+        }
+
+        let mut helper_hints: std::collections::HashMap<
+            ant_quic::PeerId,
+            (
+                Vec<std::net::SocketAddr>,
+                ant_quic::bootstrap_cache::PeerCapabilities,
+            ),
+        > = std::collections::HashMap::new();
+
+        if let Some(ref cache) = self.bootstrap_cache {
+            for peer in cache.select_coordinators(6).await {
+                merge_helper_hint(
+                    &mut helper_hints,
+                    peer.peer_id,
+                    peer.preferred_addresses(),
+                    true,
+                    false,
+                );
+            }
+            for peer in cache.select_relay_peers(6).await {
+                merge_helper_hint(
+                    &mut helper_hints,
+                    peer.peer_id,
+                    peer.preferred_addresses(),
+                    false,
+                    true,
+                );
+            }
+        }
+
+        if let Some(ref adapter) = self.gossip_cache_adapter {
+            let mut adverts = adapter.get_all_adverts();
+            adverts.sort_by(|a, b| b.score.cmp(&a.score));
+            for advert in adverts.into_iter().take(12) {
+                let advert_peer_id = ant_quic::PeerId(*advert.peer.as_bytes());
+                if advert_peer_id == target_peer_id {
+                    continue;
+                }
+                merge_helper_hint(
+                    &mut helper_hints,
+                    advert_peer_id,
+                    advert.addr_hints.into_iter().map(|hint| hint.addr),
+                    advert.roles.coordinator || advert.roles.rendezvous,
+                    advert.roles.relay,
+                );
+            }
+        }
+
+        let discovered: Vec<DiscoveredAgent> = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.values().cloned().collect()
+        };
+        for candidate in discovered {
+            if candidate.agent_id == target.agent_id
+                || candidate.machine_id == target.machine_id
+                || candidate.machine_id.0 == [0u8; 32]
+            {
+                continue;
+            }
+            merge_helper_hint(
+                &mut helper_hints,
+                ant_quic::PeerId(candidate.machine_id.0),
+                candidate.addresses.iter().copied(),
+                candidate.is_coordinator == Some(true),
+                candidate.is_relay == Some(true),
+            );
+        }
+
+        for (peer_id, (mut addrs, caps)) in helper_hints {
+            addrs.retain(|addr| !target.addresses.contains(addr));
+            if addrs.is_empty() && !caps.supports_coordination && !caps.supports_relay {
+                continue;
+            }
+            network
+                .upsert_peer_hints(peer_id, addrs, Some(caps))
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to upsert helper peer hints: {e}"
+                    )))
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Attempt to connect to an agent by its identity.
     ///
     /// Looks up the agent in the discovery cache, then tries to establish
@@ -912,10 +1048,29 @@ impl Agent {
         //    LAN/private agents may have no publicly-routable addresses in
         //    their announcement but are still reachable via the existing
         //    gossip QUIC connection.
-        let machine_peer_id = ant_quic::PeerId(agent.machine_id.0);
-        if network.is_connected(&machine_peer_id).await {
+        let connected_machine_id = if agent.machine_id.0 != [0u8; 32]
+            && network
+                .is_connected(&ant_quic::PeerId(agent.machine_id.0))
+                .await
+        {
+            Some(agent.machine_id)
+        } else {
+            match self.direct_messaging.get_machine_id(agent_id).await {
+                Some(machine_id) if network.is_connected(&ant_quic::PeerId(machine_id.0)).await => {
+                    Some(machine_id)
+                }
+                _ => None,
+            }
+        };
+        if let Some(machine_id) = connected_machine_id {
+            if machine_id != agent.machine_id {
+                let mut cache = self.identity_discovery_cache.write().await;
+                if let Some(entry) = cache.get_mut(agent_id) {
+                    entry.machine_id = machine_id;
+                }
+            }
             self.direct_messaging
-                .mark_connected(agent.agent_id, agent.machine_id)
+                .mark_connected(agent.agent_id, machine_id)
                 .await;
             return if let Some(addr) = info.addresses.first() {
                 Ok(connectivity::ConnectOutcome::Direct(*addr))
@@ -963,18 +1118,27 @@ impl Agent {
             }
         }
 
-        // 4. If direct failed and coordination may help, use peer-ID hole-punching.
-        //    node.connect(peer_id) calls connect_to_peer(peer_id, None) which uses
-        //    the bootstrap nodes (already in known_peers) as implicit coordinators
-        //    for QUIC extension-frame hole-punching (PUNCH_ME_NOW). This is fundamentally
-        //    different from connect_addr which is raw QUIC with no NAT traversal.
+        // 4. If direct failed and coordination may help, use peer-ID dialing
+        //    with explicit address hints. This lets ant-quic combine the
+        //    authenticated peer ID with known addresses from x0x discovery /
+        //    imported cards, unlocking the full direct → hole-punch → relay path.
         if info.needs_coordination() || !info.should_attempt_direct() {
             // Use the machine_id from discovery cache as the peer_id hint.
             // NOTE: This may be a zeroed placeholder if the peer was discovered via
             // gossip and hasn't been verified via QUIC handshake yet.
             let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
             let hint_was_zeroed = agent.machine_id.0 == [0u8; 32];
-            match network.connect_peer(peer_id_hint).await {
+            self.seed_transport_peer_hints_for_target(network, &agent)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to seed transport peer hints: {e}"
+                    )))
+                })?;
+            let coordinated_result = network
+                .connect_peer_with_addrs(peer_id_hint, info.addresses.clone())
+                .await;
+            match coordinated_result {
                 Ok((addr, verified_peer_id)) => {
                     let verified_machine_id = identity::MachineId(verified_peer_id.0);
 
@@ -1011,7 +1175,11 @@ impl Agent {
                     return Ok(connectivity::ConnectOutcome::Coordinated(addr));
                 }
                 Err(e) => {
-                    tracing::debug!("Hole-punch to {:?} failed: {}", agent.machine_id, e);
+                    tracing::debug!(
+                        "Coordinated connect to {:?} failed: {}",
+                        agent.machine_id,
+                        e
+                    );
                 }
             }
         }
@@ -1078,7 +1246,10 @@ impl Agent {
             error::NetworkError::NodeCreation("network not initialized".to_string())
         })?;
 
-        // Look up machine_id from discovery cache, falling back to DirectMessaging registry
+        // Resolve the best known machine_id, preferring a machine that is
+        // actually connected right now. Discovery cache entries can lag behind
+        // the direct-messaging registry when an inbound connection is accepted
+        // and later reconciled from transport events.
         let cached_machine_id = {
             let cache = self.identity_discovery_cache.read().await;
             cache
@@ -1086,23 +1257,30 @@ impl Agent {
                 .map(|d| d.machine_id)
                 .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
         };
-        let machine_id = match cached_machine_id {
-            Some(id) => id,
-            None => {
-                // Fallback: check DirectMessaging agent→machine registry
-                // (populated when we receive direct messages or after connect_to_agent)
-                match self.direct_messaging.get_machine_id(agent_id).await {
-                    Some(id) => id,
-                    None => {
-                        // Last resort: try connect_to_agent which may discover the
-                        // machine_id via QUIC handshake and update the cache.
-                        let _ = self.connect_to_agent(agent_id).await;
-                        self.direct_messaging
-                            .get_machine_id(agent_id)
-                            .await
-                            .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?
+        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+
+        let machine_id = match (cached_machine_id, registry_machine_id) {
+            (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => id,
+            (_, Some(id)) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+                if cached_machine_id != Some(id) {
+                    let mut cache = self.identity_discovery_cache.write().await;
+                    if let Some(entry) = cache.get_mut(agent_id) {
+                        entry.machine_id = id;
                     }
                 }
+                id
+            }
+            (Some(id), None) => id,
+            (Some(id), Some(_)) => id,
+            (None, Some(id)) => id,
+            (None, None) => {
+                // Last resort: try connect_to_agent which may discover the
+                // machine_id via QUIC handshake and update the cache.
+                let _ = self.connect_to_agent(agent_id).await;
+                self.direct_messaging
+                    .get_machine_id(agent_id)
+                    .await
+                    .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?
             }
         };
 
@@ -1134,7 +1312,7 @@ impl Agent {
     ///
     /// This method does **not** apply trust filtering from `ContactStore`.
     /// Messages from blocked agents will still be delivered. Use
-    /// [`recv_direct_filtered()`](Self::recv_direct_filtered) if you need
+    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) if you need
     /// trust-based filtering.
     ///
     /// # Returns
@@ -1156,50 +1334,31 @@ impl Agent {
 
     /// Receive the next direct message, filtering by trust level.
     ///
-    /// Messages from blocked agents are silently dropped. This mirrors the
-    /// behavior of gossip pub/sub message filtering.
+    /// All messages now carry pre-computed `verified` and `trust_decision`
+    /// fields from the identity discovery cache and contact store. This
+    /// method passes through all messages — applications should inspect
+    /// `msg.trust_decision` and `msg.verified` to decide how to handle
+    /// each message.
     ///
     /// # Returns
     ///
     /// The received [`DirectMessage`], or `None` if the channel closes.
-    /// Messages from blocked senders are dropped and the method continues
-    /// waiting for the next acceptable message.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Block an agent
-    /// {
-    ///     let mut contacts = agent.contacts().write().await;
-    ///     contacts.set_trust(&bad_agent_id, TrustLevel::Blocked);
-    /// }
-    ///
-    /// // Messages from blocked agents are silently dropped
     /// loop {
-    ///     if let Some(msg) = agent.recv_direct_filtered().await {
-    ///         // msg.sender is not in the blocked list
-    ///         // (note: sender is self-asserted, see DirectMessage docs)
+    ///     if let Some(msg) = agent.recv_direct_annotated().await {
+    ///         match msg.trust_decision {
+    ///             Some(TrustDecision::RejectBlocked) => continue, // skip
+    ///             Some(TrustDecision::Accept) if msg.verified => { /* trusted */ }
+    ///             _ => { /* handle accordingly */ }
+    ///         }
     ///     }
     /// }
     /// ```
-    pub async fn recv_direct_filtered(&self) -> Option<direct::DirectMessage> {
-        loop {
-            let msg = self.recv_direct_inner().await?;
-
-            // Check trust level
-            let contacts = self.contact_store.read().await;
-            if let Some(contact) = contacts.get(&msg.sender) {
-                if contact.trust_level == contacts::TrustLevel::Blocked {
-                    tracing::debug!(
-                        "Dropping direct message from blocked agent {:?}",
-                        msg.sender
-                    );
-                    continue;
-                }
-            }
-
-            return Some(msg);
-        }
+    pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
+        self.recv_direct_inner().await
     }
 
     /// Internal helper for receiving direct messages.
@@ -1552,6 +1711,7 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
         let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let direct_messaging = std::sync::Arc::clone(&self.direct_messaging);
         let network = self.network.as_ref().map(std::sync::Arc::clone);
         let own_agent_id = self.agent_id();
 
@@ -1678,6 +1838,25 @@ impl Agent {
                         is_coordinator: announcement.is_coordinator,
                     },
                 );
+
+                // Identity announcements are the strongest agent↔machine binding we have.
+                // Register the mapping immediately so reverse direct-send can resolve the
+                // machine even before the first inbound direct payload arrives.
+                direct_messaging
+                    .register_agent(announcement.agent_id, announcement.machine_id)
+                    .await;
+
+                // Reconcile the agent-level direct-message registry if the transport peer
+                // is already connected (for example an inbound accept that happened before
+                // this announcement reached us).
+                if let Some(ref net) = &network {
+                    let ant_peer_id = ant_quic::PeerId(announcement.machine_id.0);
+                    if net.is_connected(&ant_peer_id).await {
+                        direct_messaging
+                            .mark_connected(announcement.agent_id, announcement.machine_id)
+                            .await;
+                    }
+                }
 
                 // Auto-connect to discovered agents so pub/sub messages can route
                 // between peers that share bootstrap nodes but aren't directly connected.
@@ -1856,6 +2035,7 @@ impl Agent {
             tracing::info!("Gossip runtime started");
         }
         self.start_identity_listener().await?;
+        self.start_network_event_listener();
         self.start_direct_listener();
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
@@ -2297,6 +2477,24 @@ impl Agent {
         self.identity_discovery_cache.read().await.get(id).cloned()
     }
 
+    /// Check whether a claimed `AgentId` is verified as belonging to the
+    /// given `MachineId` in the identity discovery cache.
+    ///
+    /// Returns `true` if the cache contains a signed identity announcement
+    /// binding this agent to this machine. Returns `false` if the agent is
+    /// unknown or bound to a different machine.
+    pub async fn is_agent_machine_verified(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        let cache = self.identity_discovery_cache.read().await;
+        cache
+            .get(agent_id)
+            .map(|entry| entry.machine_id == *machine_id)
+            .unwrap_or(false)
+    }
+
     /// Discover agents via Friend-of-a-Friend (FOAF) random walk.
     ///
     /// Initiates a FOAF query on the global presence topic with the given `ttl`
@@ -2583,6 +2781,80 @@ impl Agent {
     /// Idempotent — if the heartbeat is already running, returns `Ok(())` immediately.
     /// The heartbeat re-announces this agent's identity at `heartbeat_interval_secs`
     /// intervals so that late-joining peers can discover it without waiting for a
+    /// Start the network event reconciliation listener.
+    ///
+    /// This bridges transport-level peer connect/disconnect events into the
+    /// agent-level direct messaging registry so inbound accepted connections are
+    /// usable for reverse direct sends before the first inbound direct payload.
+    fn start_network_event_listener(&self) {
+        if self
+            .network_event_listener_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let Some(network) = self.network.as_ref().map(std::sync::Arc::clone) else {
+            return;
+        };
+        let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let dm = std::sync::Arc::clone(&self.direct_messaging);
+
+        tokio::spawn(async move {
+            let mut rx = network.subscribe();
+            tracing::info!("Network event reconciliation listener started");
+
+            loop {
+                let event = match rx.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("Network event listener lagged by {skipped} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+
+                match event {
+                    network::NetworkEvent::PeerConnected { peer_id, .. } => {
+                        let machine_id = identity::MachineId(peer_id);
+                        let cached_agent_id = {
+                            let cache = cache.read().await;
+                            cache
+                                .values()
+                                .find(|entry| entry.machine_id == machine_id)
+                                .map(|entry| entry.agent_id)
+                        };
+                        let agent_id = match cached_agent_id {
+                            Some(agent_id) => Some(agent_id),
+                            None => dm.lookup_agent(&machine_id).await,
+                        };
+                        if let Some(agent_id) = agent_id {
+                            dm.mark_connected(agent_id, machine_id).await;
+                        }
+                    }
+                    network::NetworkEvent::PeerDisconnected { peer_id } => {
+                        let machine_id = identity::MachineId(peer_id);
+                        let cached_agent_id = {
+                            let cache = cache.read().await;
+                            cache
+                                .values()
+                                .find(|entry| entry.machine_id == machine_id)
+                                .map(|entry| entry.agent_id)
+                        };
+                        let agent_id = match cached_agent_id {
+                            Some(agent_id) => Some(agent_id),
+                            None => dm.lookup_agent(&machine_id).await,
+                        };
+                        if let Some(agent_id) = agent_id {
+                            dm.mark_disconnected(&agent_id).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     /// Start the direct message listener background task.
     ///
     /// This task reads raw direct messages from the network layer and
@@ -2602,6 +2874,8 @@ impl Agent {
             return;
         };
         let dm = std::sync::Arc::clone(&self.direct_messaging);
+        let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let contact_store = std::sync::Arc::clone(&self.contact_store);
 
         tokio::spawn(async move {
             tracing::info!("Direct message listener started");
@@ -2623,11 +2897,32 @@ impl Agent {
                 let machine_id = identity::MachineId(ant_peer_id.0);
                 let data = payload[32..].to_vec();
 
-                // Register the agent→machine mapping for future lookups
-                dm.register_agent(sender, machine_id).await;
+                // Verify AgentId→MachineId binding against identity discovery cache.
+                let verified = {
+                    let cache = discovery_cache.read().await;
+                    cache
+                        .get(&sender)
+                        .map(|entry| entry.machine_id == machine_id)
+                        .unwrap_or(false)
+                };
 
-                // Broadcast to all subscribe_direct() receivers
-                dm.handle_incoming(machine_id, sender, data).await;
+                // Evaluate trust for the (AgentId, MachineId) pair.
+                let trust_decision = {
+                    let contacts = contact_store.read().await;
+                    let evaluator = trust::TrustEvaluator::new(&contacts);
+                    let ctx = trust::TrustContext {
+                        agent_id: &sender,
+                        machine_id: &machine_id,
+                    };
+                    Some(evaluator.evaluate(&ctx))
+                };
+
+                // Register and mark the sender as connected for future reverse direct sends.
+                dm.mark_connected(sender, machine_id).await;
+
+                // Broadcast to all subscribe_direct() receivers with verification info.
+                dm.handle_incoming(machine_id, sender, data, verified, trust_decision)
+                    .await;
             }
         });
     }
@@ -2855,10 +3150,26 @@ impl Agent {
     /// * `agent` - The agent entry to insert.
     #[doc(hidden)]
     pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
+        let agent_id = agent.agent_id;
+        let machine_id = agent.machine_id;
         self.identity_discovery_cache
             .write()
             .await
-            .insert(agent.agent_id, agent);
+            .insert(agent_id, agent);
+
+        if machine_id.0 != [0u8; 32] {
+            self.direct_messaging
+                .register_agent(agent_id, machine_id)
+                .await;
+            if let Some(ref network) = self.network {
+                let ant_peer_id = ant_quic::PeerId(machine_id.0);
+                if network.is_connected(&ant_peer_id).await {
+                    self.direct_messaging
+                        .mark_connected(agent_id, machine_id)
+                        .await;
+                }
+            }
+        }
     }
 
     /// Create a new collaborative task list bound to a topic.
@@ -3440,6 +3751,7 @@ impl AgentBuilder {
             rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
             contact_store,
             direct_messaging,
+            network_event_listener_started: std::sync::atomic::AtomicBool::new(false),
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

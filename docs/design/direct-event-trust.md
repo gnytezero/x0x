@@ -106,7 +106,7 @@ No changes to `src/direct.rs`, `src/contacts.rs`, or `src/trust.rs`.
 
 ## What This Does NOT Do
 
-- Does not add trust-based filtering (already exists via `recv_direct_filtered()`).
+- Does not add trust-based filtering (trust annotations via `recv_direct_annotated()`).
 - Does not change the `DirectMessage` wire format.
 - Does not use full `TrustEvaluator` with machine-pinning decisions — reports raw trust level from contact store. Consumers needing the full decision can combine `verified` + `trust_level` or call `/trust/evaluate`.
 

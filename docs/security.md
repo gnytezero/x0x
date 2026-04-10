@@ -38,4 +38,4 @@ x0x uses raw public keys for TLS authentication — not X.509 certificates, not 
 
 The `sender` field in direct messages is self-asserted and not cryptographically verified at the application layer. However, `machine_id` IS authenticated via the QUIC connection's ML-DSA-65 handshake. The claimed sender AgentId is only as trustworthy as the machine that sent it.
 
-`recv_direct_filtered()` drops messages from blocked agents, but the filter operates on the self-asserted sender field.
+`recv_direct_annotated()` returns all messages with `verified` and `trust_decision` annotations. Applications inspect these fields to decide how to handle each message.

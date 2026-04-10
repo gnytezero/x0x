@@ -395,6 +395,8 @@ enum WsOutbound {
         machine_id: String,
         payload: String,
         received_at: u64,
+        verified: bool,
+        trust_decision: Option<String>,
     },
     #[serde(rename = "subscribed")]
     Subscribed { topics: Vec<String> },
@@ -3304,10 +3306,11 @@ async fn presence_events(
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
-                Ok(x0x::presence::PresenceEvent::AgentOnline { agent_id, .. }) => {
+                Ok(x0x::presence::PresenceEvent::AgentOnline { agent_id, reachable, .. }) => {
                     let data = serde_json::json!({
                         "event": "online",
-                        "agent_id": hex::encode(agent_id.as_bytes())
+                        "agent_id": hex::encode(agent_id.as_bytes()),
+                        "reachable": reachable
                     })
                     .to_string();
                     yield Ok::<Event, std::convert::Infallible>(
@@ -4853,7 +4856,9 @@ async fn direct_events_sse(
                         "sender": hex::encode(msg.sender.as_bytes()),
                         "machine_id": hex::encode(msg.machine_id.as_bytes()),
                         "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
-                        "received_at": msg.received_at
+                        "received_at": msg.received_at,
+                        "verified": msg.verified,
+                        "trust_decision": msg.trust_decision.map(|d| d.to_string())
                     });
                     let event = Event::default()
                         .event("direct_message")
@@ -5702,6 +5707,8 @@ async fn handle_ws_connection(
                     machine_id: hex::encode(msg.machine_id.as_bytes()),
                     payload: base64::engine::general_purpose::STANDARD.encode(&msg.payload),
                     received_at: msg.received_at,
+                    verified: msg.verified,
+                    trust_decision: msg.trust_decision.map(|d| d.to_string()),
                 };
                 if tx.send(out).is_err() {
                     break;

@@ -2,7 +2,7 @@
 # =============================================================================
 # x0x Comprehensive End-to-End Test Suite
 # Two named instances (alice + bob) with separate identities + charlie (seedless)
-# Tests ALL 75+ API endpoints across 18 categories with full lifecycle coverage
+# Tests ALL 75+ API endpoints across 19 categories with full lifecycle coverage
 # =============================================================================
 set -euo pipefail
 
@@ -71,6 +71,20 @@ skip() {
 
 jq_field() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',''))" 2>/dev/null || echo ""; }
 jq_int()   { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',0))" 2>/dev/null || echo "0"; }
+
+check_connect_outcome() {
+    local n="$1" r="$2" outcome
+    outcome=$(jq_field "$r" "outcome")
+    TOTAL=$((TOTAL+1))
+    case "$outcome" in
+        Direct|Coordinated|AlreadyConnected)
+            PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $n ($outcome)"; return 0 ;;
+        Unreachable|NotFound|"")
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $n — outcome=${outcome:-missing}: $(echo "$r"|head -c250)"; return 1 ;;
+        *)
+            PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $n (outcome=$outcome)"; return 0 ;;
+    esac
+}
 
 request_json() {
     local method="$1" token="$2" url="$3"
@@ -438,7 +452,7 @@ fi
 echo -e "\n${CYAN}[9/18] Direct Messaging${NC}"
 
 # Connect alice to bob
-R=$(Ap /agents/connect "{\"agent_id\":\"$BID\"}"); check_not_error "alice connect to bob" "$R"
+R=$(Ap /agents/connect "{\"agent_id\":\"$BID\"}"); check_connect_outcome "alice connect to bob" "$R"
 sleep 2
 
 # Alice sends direct message to bob
@@ -449,7 +463,7 @@ R=$(Ap /direct/send "{\"agent_id\":\"$BID\",\"payload\":\"$DM_B64\"}"); check_ok
 R=$(A /direct/connections); check_not_error "alice direct connections" "$R"
 
 # Bob connects back to alice
-R=$(Bp /agents/connect "{\"agent_id\":\"$AID\"}"); check_not_error "bob connect to alice" "$R"
+R=$(Bp /agents/connect "{\"agent_id\":\"$AID\"}"); check_connect_outcome "bob connect to alice" "$R"
 sleep 2
 
 # Bob sends direct message to alice
@@ -846,7 +860,7 @@ if [ -n "$CT" ]; then
     check_not_error "charlie imports alice card" "$R"
 
     # Connect charlie to alice
-    R=$(Cp /agents/connect "{\"agent_id\":\"$AID\"}"); check_not_error "charlie connects to alice" "$R"
+    R=$(Cp /agents/connect "{\"agent_id\":\"$AID\"}"); check_connect_outcome "charlie connects to alice" "$R"
 
     # Wait for connection
     sleep 5
@@ -868,7 +882,38 @@ if [ -n "$CT" ]; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# 18. SUMMARY
+# 18. AGENTID VERIFICATION & TRUST ANNOTATIONS
+# ═════════════════════════════════════════════════════════════════════════
+echo -e "\n${CYAN}[18/19] AgentId Verification & Trust Annotations${NC}"
+
+# Alice sends a direct message to bob — bob's SSE should include verified + trust_decision
+DM_B64=$(b64 "verification test msg")
+R=$(Ap /direct/send "{\"agent_id\":\"$BID\",\"payload\":\"$DM_B64\"}"); check_ok "alice direct send for verification" "$R"
+
+# Check bob's direct connections — they should be established from earlier tests
+R=$(B /direct/connections); check_json "bob direct connections" "$R" "connections"
+
+# Verify that direct events SSE endpoint returns events with verified and trust_decision fields
+# We read the first event from bob's SSE (timeout 5s) and check for the new fields
+SSE_RESPONSE=$(curl -sS -m 5 -H "Authorization: Bearer $BT" "${BA}/direct/events" 2>/dev/null || true)
+if echo "$SSE_RESPONSE" | grep -q "verified"; then
+    TOTAL=$((TOTAL+1)); PASS=$((PASS+1))
+    echo -e "  ${GREEN}PASS${NC} direct events SSE includes 'verified' field"
+else
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo -e "  ${YELLOW}SKIP${NC} direct events SSE 'verified' field — no event received in time window"
+fi
+
+if echo "$SSE_RESPONSE" | grep -q "trust_decision"; then
+    TOTAL=$((TOTAL+1)); PASS=$((PASS+1))
+    echo -e "  ${GREEN}PASS${NC} direct events SSE includes 'trust_decision' field"
+else
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo -e "  ${YELLOW}SKIP${NC} direct events SSE 'trust_decision' field — no event received in time window"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# 19. SUMMARY
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then

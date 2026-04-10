@@ -370,6 +370,13 @@ pub enum PresenceEvent {
         agent_id: AgentId,
         /// Network addresses advertised by the agent.
         addresses: Vec<String>,
+        /// Whether we have an active QUIC connection to this agent's machine.
+        ///
+        /// - `Some(true)` — we have a live connection (strongly reachable).
+        /// - `Some(false)` — no active connection (beacon observed via gossip
+        ///   but agent may be unreachable from us).
+        /// - `None` — network layer unavailable, connectivity unknown.
+        reachable: Option<bool>,
     },
     /// An agent has gone offline (beacon expired).
     AgentOffline {
@@ -418,6 +425,10 @@ pub struct PresenceWrapper {
     /// Protected by an `Arc<RwLock<…>>` so the event loop can mutate it
     /// without holding the `PresenceWrapper` itself.
     peer_stats: Arc<RwLock<HashMap<PeerId, PeerBeaconStats>>>,
+    /// Network node reference for checking active QUIC connections.
+    ///
+    /// Used by the event loop to populate `PresenceEvent::AgentOnline::reachable`.
+    network: Arc<NetworkNode>,
 }
 
 impl PresenceWrapper {
@@ -451,6 +462,7 @@ impl PresenceWrapper {
         let groups: Arc<RwLock<HashMap<TopicId, GroupContext>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
+        let network_for_wrapper = Arc::clone(&network);
         let manager = PresenceManager::new_with_identity(
             peer_id,
             network,
@@ -469,6 +481,7 @@ impl PresenceWrapper {
             event_tx,
             bootstrap_cache,
             peer_stats: Arc::new(RwLock::new(HashMap::new())),
+            network: network_for_wrapper,
         })
     }
 
@@ -542,6 +555,7 @@ impl PresenceWrapper {
         let bootstrap_cache = self.bootstrap_cache.clone();
         let peer_stats = Arc::clone(&self.peer_stats);
         let adaptive_fallback = self.config.adaptive_timeout_fallback_secs;
+        let network = Arc::clone(&self.network);
 
         let handle = tokio::spawn(async move {
             let mut previous: HashSet<PeerId> = HashSet::new();
@@ -588,10 +602,16 @@ impl PresenceWrapper {
                     let addresses: Vec<String> =
                         socket_addrs.iter().map(|a| a.to_string()).collect();
 
+                    // Check if we have an active QUIC connection to this peer.
+                    let ant_peer_id_for_check = ant_quic::PeerId(*peer.as_bytes());
+                    let connected_peers = network.connected_peers().await;
+                    let reachable = Some(connected_peers.contains(&ant_peer_id_for_check));
+
                     if event_tx
                         .send(PresenceEvent::AgentOnline {
                             agent_id,
                             addresses,
+                            reachable,
                         })
                         .is_err()
                     {

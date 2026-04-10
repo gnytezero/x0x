@@ -26,23 +26,20 @@
 //!
 //! ## Security Model
 //!
-//! **Sender identity is self-asserted.** The `sender` field in [`DirectMessage`]
-//! is claimed by the sender and not cryptographically verified against the AgentId.
-//! However, the underlying QUIC connection *is* authenticated by the sender's
+//! **Sender identity verification.** Each [`DirectMessage`] carries a `verified`
+//! field that indicates whether the claimed `sender` AgentId was cross-referenced
+//! against the identity discovery cache (which contains signed identity
+//! announcements). When `verified` is `true`, the AgentId→MachineId binding
+//! was confirmed. When `false`, the AgentId is self-asserted only.
+//!
+//! The underlying QUIC connection is always authenticated by the sender's
 //! [`MachineId`](crate::identity::MachineId) via ML-DSA-65 signatures.
 //!
-//! This means:
-//! - You can trust which *machine* sent the message (via `machine_id`)
-//! - The claimed `sender` AgentId is only as trustworthy as that machine
-//! - A malicious machine could claim any AgentId
-//!
-//! For high-trust scenarios, verify the AgentId→MachineId binding against
-//! a known-good source (e.g., a signed identity announcement you've cached).
-//!
-//! **Trust filtering:** Unlike gossip pub/sub, direct messages do not
-//! automatically filter based on [`ContactStore`](crate::contacts::ContactStore)
-//! trust levels. Use [`Agent::recv_direct_filtered()`](crate::Agent::recv_direct_filtered)
-//! if you need trust-based filtering.
+//! **Trust annotations.** Each message also carries a `trust_decision` field
+//! from [`TrustEvaluator`](crate::trust::TrustEvaluator), reflecting the
+//! full trust evaluation including contact store trust level and machine
+//! pinning. Messages are never dropped — applications inspect these fields
+//! to decide how to handle each message.
 //!
 //! ## Example
 //!
@@ -61,6 +58,7 @@
 
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
+use crate::trust::TrustDecision;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,7 +86,8 @@ pub struct DirectMessage {
     /// The AgentId claimed by the sender.
     ///
     /// **Warning:** This is self-asserted and not cryptographically verified.
-    /// Use `machine_id` for authenticated sender identity.
+    /// Use `machine_id` for authenticated sender identity, or check the
+    /// `verified` field which cross-references the identity discovery cache.
     pub sender: AgentId,
     /// The MachineId the message was sent from (authenticated via QUIC).
     ///
@@ -99,12 +98,42 @@ pub struct DirectMessage {
     pub payload: Vec<u8>,
     /// Unix timestamp (milliseconds) when the message was received.
     pub received_at: u64,
+    /// Whether the sender's AgentId was verified against the identity
+    /// discovery cache.
+    ///
+    /// `true` if the cache contains an entry mapping this `sender` AgentId
+    /// to this `machine_id`. `false` if the AgentId could not be verified
+    /// (self-asserted only — the sender may still be legitimate but hasn't
+    /// been seen via a signed identity announcement yet).
+    pub verified: bool,
+    /// Trust decision from [`TrustEvaluator`](crate::trust::TrustEvaluator)
+    /// for the `(sender, machine_id)` pair.
+    ///
+    /// `None` if the trust system was unavailable at receive time.
+    /// When present, reflects the full trust evaluation including contact
+    /// store trust level and machine pinning.
+    pub trust_decision: Option<TrustDecision>,
 }
 
 impl DirectMessage {
-    /// Create a new DirectMessage.
+    /// Create a new `DirectMessage` with default verification fields.
+    ///
+    /// `verified` defaults to `false` and `trust_decision` to `None`.
+    /// Use [`new_verified`](Self::new_verified) to set these fields.
     #[must_use]
     pub fn new(sender: AgentId, machine_id: MachineId, payload: Vec<u8>) -> Self {
+        Self::new_verified(sender, machine_id, payload, false, None)
+    }
+
+    /// Create a new `DirectMessage` with explicit verification fields.
+    #[must_use]
+    pub fn new_verified(
+        sender: AgentId,
+        machine_id: MachineId,
+        payload: Vec<u8>,
+        verified: bool,
+        trust_decision: Option<TrustDecision>,
+    ) -> Self {
         let received_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -115,6 +144,8 @@ impl DirectMessage {
             machine_id,
             payload,
             received_at,
+            verified,
+            trust_decision,
         }
     }
 
@@ -273,13 +304,23 @@ impl DirectMessaging {
     /// Process an incoming direct message from the network.
     ///
     /// Called by the network layer when a direct message is received.
+    /// The `verified` and `trust_decision` fields are populated by the
+    /// caller based on the identity discovery cache and contact store.
     pub async fn handle_incoming(
         &self,
         machine_id: MachineId,
         sender_agent_id: AgentId,
         payload: Vec<u8>,
+        verified: bool,
+        trust_decision: Option<TrustDecision>,
     ) {
-        let msg = DirectMessage::new(sender_agent_id, machine_id, payload);
+        let msg = DirectMessage::new_verified(
+            sender_agent_id,
+            machine_id,
+            payload,
+            verified,
+            trust_decision,
+        );
 
         // Broadcast to all subscribers
         if self.message_tx.receiver_count() > 0 {
@@ -431,13 +472,15 @@ mod tests {
         let machine_id = MachineId([2u8; 32]);
         let payload = b"test message".to_vec();
 
-        dm.handle_incoming(machine_id, sender, payload.clone())
+        dm.handle_incoming(machine_id, sender, payload.clone(), true, None)
             .await;
 
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.sender, sender);
         assert_eq!(msg.machine_id, machine_id);
         assert_eq!(msg.payload, payload);
+        assert!(msg.verified);
+        assert!(msg.trust_decision.is_none());
     }
 
     #[test]

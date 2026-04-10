@@ -36,7 +36,8 @@ use crate::contacts::{ContactStore, IdentityType, TrustLevel};
 use crate::identity::{AgentId, MachineId};
 
 /// The outcome of a trust evaluation for a `(AgentId, MachineId)` pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TrustDecision {
     /// Accept the message — identity and machine are trusted.
     Accept,
