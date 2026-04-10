@@ -23,6 +23,19 @@ check_eq()        { local n="$1" got="$2" want="$3"; TOTAL=$((TOTAL+1)); if [ "$
 skip()            { local n="$1" r="$2"; TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1)); echo -e "  ${YELLOW}SKIP${NC} $n — $r"; }
 
 jq_field() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',''))" 2>/dev/null || echo ""; }
+check_connect_outcome() {
+    local n="$1" r="$2" outcome
+    outcome=$(jq_field "$r" "outcome")
+    TOTAL=$((TOTAL+1))
+    case "$outcome" in
+        Direct|Coordinated|AlreadyConnected)
+            PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $n ($outcome)"; return 0 ;;
+        Unreachable|NotFound|"")
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $n — outcome=${outcome:-missing}: $(echo "$r"|head -c250)"; return 1 ;;
+        *)
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $n — unexpected outcome=$outcome: $(echo "$r"|head -c250)"; return 1 ;;
+    esac
+}
 
 # ── Load tokens from deploy script or use SSH fallback ──────────────────
 declare -A NODE_IPS=(
@@ -228,19 +241,13 @@ if [ -n "$TKY_LINK" ]; then
 fi
 
 R=$(vps_post "$NYC_IP" "$NYC_TK" /agents/connect "{\"agent_id\":\"$TKY_AID\"}")
-if echo "$R" | grep -q '"ok":true'; then
-    check_not_error "NYC connects to Tokyo" "$R"
+if check_connect_outcome "NYC connects to Tokyo" "$R"; then
     sleep 3
     DM_B64=$(b64 "direct message from NYC to Tokyo across the Pacific")
     R=$(vps_post "$NYC_IP" "$NYC_TK" /direct/send "{\"agent_id\":\"$TKY_AID\",\"payload\":\"$DM_B64\"}")
-    if echo "$R" | grep -q '"ok":true'; then
-        check_ok "NYC→Tokyo direct send" "$R"
-    else
-        skip "NYC→Tokyo direct send" "cross-continent reverse direct path not established"
-    fi
+    check_ok "NYC→Tokyo direct send" "$R"
 else
-    skip "NYC connects to Tokyo" "cross-continent reverse direct path not established"
-    skip "NYC→Tokyo direct send" "cross-continent reverse direct path not established"
+    skip "NYC→Tokyo direct send" "connection did not establish"
 fi
 
 # Helsinki→Singapore
@@ -251,19 +258,13 @@ if [ -n "$SGP_LINK" ]; then
     check_not_error "Helsinki imports Singapore card" "$R"
 fi
 R=$(vps_post "$HEL_IP" "$HEL_TK" /agents/connect "{\"agent_id\":\"$SGP_AID\"}")
-if echo "$R" | grep -q '"ok":true'; then
-    check_not_error "Helsinki connects to Singapore" "$R"
+if check_connect_outcome "Helsinki connects to Singapore" "$R"; then
     sleep 3
     DM_B64=$(b64 "direct from Helsinki to Singapore")
     R=$(vps_post "$HEL_IP" "$HEL_TK" /direct/send "{\"agent_id\":\"$SGP_AID\",\"payload\":\"$DM_B64\"}")
-    if echo "$R" | grep -q '"ok":true'; then
-        check_ok "Helsinki→Singapore direct" "$R"
-    else
-        skip "Helsinki→Singapore direct" "cross-continent reverse direct path not established"
-    fi
+    check_ok "Helsinki→Singapore direct" "$R"
 else
-    skip "Helsinki connects to Singapore" "cross-continent reverse direct path not established"
-    skip "Helsinki→Singapore direct" "cross-continent reverse direct path not established"
+    skip "Helsinki→Singapore direct" "connection did not establish"
 fi
 
 R=$(vps_get "$NYC_IP" "$NYC_TK" /direct/connections); check_not_error "NYC direct connections" "$R"

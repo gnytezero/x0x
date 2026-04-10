@@ -38,6 +38,19 @@ skip()            { local n="$1" r="$2"; TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1)); e
 
 jq_field() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',''))" 2>/dev/null || echo ""; }
 jq_int()   { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',0))" 2>/dev/null || echo "0"; }
+check_connect_outcome() {
+    local n="$1" r="$2" outcome
+    outcome=$(jq_field "$r" "outcome")
+    TOTAL=$((TOTAL+1))
+    case "$outcome" in
+        Direct|Coordinated|AlreadyConnected)
+            PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $n ($outcome)"; return 0 ;;
+        Unreachable|NotFound|"")
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $n — outcome=${outcome:-missing}: $(echo "$r"|head -c250)"; return 1 ;;
+        *)
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $n — unexpected outcome=$outcome: $(echo "$r"|head -c250)"; return 1 ;;
+    esac
+}
 
 SSH="ssh -C -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
 
@@ -307,7 +320,7 @@ fi
 echo -e "\n${CYAN}[5/12] Direct Messaging (local ↔ NYC)${NC}"
 
 # Local connects to NYC
-R=$(Lp /agents/connect "{\"agent_id\":\"$NYC_AID\"}"); check_not_error "local connects to NYC" "$R"
+R=$(Lp /agents/connect "{\"agent_id\":\"$NYC_AID\"}"); check_connect_outcome "local connects to NYC" "$R"
 sleep 3
 
 # Local sends direct message to NYC
@@ -319,18 +332,12 @@ R=$(L /direct/connections); check_not_error "local direct connections" "$R"
 
 # NYC sends direct message back to local
 R=$(vps_api "$NYC_IP" "$NYC_TK" POST /agents/connect "{\"agent_id\":\"$LOCAL_AID\"}")
-if echo "$R" | grep -q '"ok":true'; then
-    check_not_error "NYC connects to local" "$R"
+if check_connect_outcome "NYC connects to local" "$R"; then
     sleep 3
     DM_B64=$(b64 "hello from NYC back to local agent")
     R=$(vps_api "$NYC_IP" "$NYC_TK" POST /direct/send "{\"agent_id\":\"$LOCAL_AID\",\"payload\":\"$DM_B64\"}")
-    if echo "$R" | grep -q '"ok":true'; then
-        check_ok "NYC→local direct send" "$R"
-    else
-        skip "NYC→local direct send" "local node not reverse-reachable from VPS"
-    fi
+    check_ok "NYC→local direct send" "$R"
 else
-    skip "NYC connects to local" "local node not reverse-reachable from VPS"
     skip "NYC→local direct send" "local node not reverse-reachable from VPS"
 fi
 

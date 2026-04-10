@@ -23,7 +23,7 @@
 //! - `45.77.176.184:5483` - Tokyo, JP
 
 use crate::error::{NetworkError, NetworkResult};
-use ant_quic::{Node, NodeConfig, TransportAddr};
+use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
 use serde::{Deserialize, Serialize};
@@ -585,6 +585,61 @@ impl NetworkNode {
         });
 
         Ok((addr, peer_conn.peer_id))
+    }
+
+    /// Connect to a specific peer by ID using explicit address hints.
+    ///
+    /// This lets the transport combine peer-authenticated dialing with caller-
+    /// supplied address candidates, which is important when higher layers know
+    /// candidate addresses (for example from imported agent cards) but ant-quic
+    /// has not yet learned them itself.
+    pub async fn connect_peer_with_addrs(
+        &self,
+        peer_id: AntPeerId,
+        addrs: Vec<SocketAddr>,
+    ) -> NetworkResult<(SocketAddr, AntPeerId)> {
+        let node = self.require_node().await?;
+        let start = std::time::Instant::now();
+        let peer_conn = node
+            .connect_peer_with_addrs(peer_id, addrs)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+
+        let addr = match peer_conn.remote_addr {
+            TransportAddr::Udp(socket_addr) => socket_addr,
+            _ => {
+                return Err(NetworkError::ConnectionFailed(
+                    "Unsupported transport type".to_string(),
+                ))
+            }
+        };
+
+        let rtt_ms = start.elapsed().as_millis() as u32;
+        if let Some(ref cache) = self.bootstrap_cache {
+            cache
+                .add_from_connection(peer_conn.peer_id, vec![addr], None)
+                .await;
+            cache.record_success(&peer_conn.peer_id, rtt_ms).await;
+        }
+
+        self.emit_event(NetworkEvent::PeerConnected {
+            peer_id: peer_conn.peer_id.0,
+            address: addr,
+        });
+
+        Ok((addr, peer_conn.peer_id))
+    }
+
+    /// Merge externally discovered peer hints into ant-quic's transport view.
+    pub async fn upsert_peer_hints(
+        &self,
+        peer_id: AntPeerId,
+        addrs: Vec<SocketAddr>,
+        capabilities: Option<PeerCapabilities>,
+    ) -> NetworkResult<()> {
+        let node = self.require_node().await?;
+        node.upsert_peer_hints(peer_id, addrs, capabilities).await;
+        Ok(())
     }
 
     /// Disconnect from a peer.
