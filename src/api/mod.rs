@@ -493,6 +493,28 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Leave or delete a group",
         category: "named-groups",
     },
+    // ── Phase D.3: state-commit chain ────────────────────────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/state",
+        cli_name: "group state",
+        description: "Inspect the signed state-commit chain for a group",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/state/seal",
+        cli_name: "group state-seal",
+        description: "Advance the state-commit chain and republish signed card",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/state/withdraw",
+        cli_name: "group state-withdraw",
+        description: "Seal a terminal withdrawal commit and supersede public card",
+        category: "named-groups",
+    },
     // ── Named groups: policy, roles, join requests, discovery ───────────
     EndpointDef {
         method: Method::Patch,

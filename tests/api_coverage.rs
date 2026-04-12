@@ -115,6 +115,10 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Post, "/groups/:id/secure/decrypt"),
     (Method::Post, "/groups/:id/secure/reseal"),
     (Method::Post, "/groups/secure/open-envelope"),
+    // ── Phase D.3: state-commit chain ───────────────────────────────────
+    (Method::Get, "/groups/:id/state"),
+    (Method::Post, "/groups/:id/state/seal"),
+    (Method::Post, "/groups/:id/state/withdraw"),
     // ── Task lists ──────────────────────────────────────────────────────
     (Method::Get, "/task-lists"),
     (Method::Post, "/task-lists"),

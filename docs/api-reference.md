@@ -230,7 +230,32 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
+| GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
+| POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
+| POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave or delete the group |
+
+### Phase D.3 — state-commit chain
+
+Each named group maintains a signed commit chain:
+
+- `GET /groups/:id/state` returns `{ group_id (stable), genesis,
+  state_revision, state_hash, prev_state_hash, security_binding,
+  withdrawn, roster_root, policy_hash, public_meta_hash }`.
+- `POST /groups/:id/state/seal` (owner/admin) advances the chain by one
+  revision and republishes the authority-signed public `GroupCard` to
+  the global discovery topic. Returns the signed `GroupStateCommit`.
+- `POST /groups/:id/state/withdraw` (owner) seals a terminal
+  higher-revision commit with `withdrawn=true` and broadcasts the
+  withdrawal card. Peers evict stale listings on receipt regardless of
+  TTL.
+
+Cards and commits carry ML-DSA-65 signatures. Peers verify both the
+signature and the chain link (`prev_state_hash`) before accepting; stale
+revisions are silently dropped.
+
+**Honest scope — v1 secure model is GSS, not MLS TreeKEM.** See
+`docs/primers/groups.md` for what GSS provides and does not provide.
 
 ## Collaborative task lists
 

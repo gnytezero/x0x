@@ -16,8 +16,9 @@ pub mod kem_envelope;
 pub mod member;
 pub mod policy;
 pub mod request;
+pub mod state_commit;
 
-use crate::identity::AgentId;
+use crate::identity::{AgentId, AgentKeypair};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -28,6 +29,11 @@ pub use self::policy::{
     GroupPolicySummary, GroupReadAccess, GroupWriteAccess,
 };
 pub use self::request::{JoinRequest, JoinRequestStatus};
+pub use self::state_commit::{
+    compute_policy_hash, compute_public_meta_hash, compute_roster_root, compute_state_hash,
+    ActionKind, ApplyContext, ApplyError, GroupGenesis, GroupPublicMeta, GroupStateCommit,
+    CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN, STATE_COMMIT_DOMAIN,
+};
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -94,6 +100,47 @@ pub struct GroupInfo {
     /// Monotonic epoch for the shared secret. Incremented on rekey (ban/remove).
     #[serde(default)]
     pub secret_epoch: u64,
+
+    // ── Phase D.3: Stable identity + evolving validity ──────────────────
+    /// Stable genesis record — establishes the group's permanent `group_id`.
+    /// Reconstructed from `mls_group_id` + creator + created_at when
+    /// migrating pre-D.3 blobs (see [`GroupInfo::migrate_from_v1`]).
+    #[serde(default)]
+    pub genesis: Option<state_commit::GroupGenesis>,
+    /// Monotonic revision of the signed state-commit chain. 0 = genesis
+    /// (no authority-signed commits yet); bumped on every accepted event.
+    #[serde(default)]
+    pub state_revision: u64,
+    /// Current `state_hash` — commitment to (group_id, revision, prev_hash,
+    /// roster_root, policy_hash, public_meta_hash, security_binding,
+    /// withdrawn). Recomputed by `recompute_state_hash()` after every
+    /// mutation.
+    #[serde(default)]
+    pub state_hash: String,
+    /// Previous `state_hash` so receivers can verify chain linking. None
+    /// at genesis.
+    #[serde(default)]
+    pub prev_state_hash: Option<String>,
+    /// Current security binding — for `MlsEncrypted` groups, a string of
+    /// the form `"gss:epoch=N"` so roster/policy/epoch changes cannot
+    /// silently drift apart. `None` for `SignedPublic`.
+    #[serde(default)]
+    pub security_binding: Option<String>,
+    /// Optional tags for public discovery (Phase C.2 will hash these into
+    /// shard topics). Only meaningful for `PublicDirectory` groups.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Optional avatar URL for public cards.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    /// Optional banner URL for public cards.
+    #[serde(default)]
+    pub banner_url: Option<String>,
+    /// Withdrawal/hidden supersession marker. Once set by a higher-revision
+    /// signed commit, no further non-withdrawal actions may apply and
+    /// subsequent public cards must carry the withdrawal flag.
+    #[serde(default)]
+    pub withdrawn: bool,
 }
 
 impl GroupInfo {
@@ -154,7 +201,15 @@ impl GroupInfo {
             None
         };
 
-        Self {
+        // Phase D.3: stable genesis. Derive the genesis record so the same
+        // creator+timestamp+nonce deterministically yields the same
+        // `group_id`. For backward compatibility with existing callers, we
+        // keep `mls_group_id` as the persisted topic-derivation key, but
+        // `genesis.group_id` is the stable authoritative identifier.
+        let genesis = state_commit::GroupGenesis::new(creator_hex.clone(), now);
+
+        let confidentiality = policy.confidentiality;
+        let mut info = Self {
             members: BTreeSet::new(),
             display_names: HashMap::new(),
             membership_revision: 0,
@@ -175,7 +230,22 @@ impl GroupInfo {
             discovery_card_topic,
             shared_secret,
             secret_epoch: 0,
-        }
+
+            genesis: Some(genesis),
+            state_revision: 0,
+            state_hash: String::new(),
+            prev_state_hash: None,
+            security_binding: match confidentiality {
+                GroupConfidentiality::MlsEncrypted => Some("gss:epoch=0".into()),
+                GroupConfidentiality::SignedPublic => None,
+            },
+            tags: Vec::new(),
+            avatar_url: None,
+            banner_url: None,
+            withdrawn: false,
+        };
+        info.recompute_state_hash();
+        info
     }
 
     /// Rotate the group's shared secret (called on ban/remove in MlsEncrypted
@@ -185,6 +255,9 @@ impl GroupInfo {
     ///
     /// Callers must arrange to distribute the new secret to remaining members
     /// (never to the departed/banned peer).
+    ///
+    /// Phase D.3: also refreshes `security_binding` so the next state commit
+    /// incorporates the new epoch into `state_hash`.
     #[must_use]
     pub fn rotate_shared_secret(&mut self) -> (Vec<u8>, u64) {
         use rand::RngCore;
@@ -192,7 +265,162 @@ impl GroupInfo {
         rand::thread_rng().fill_bytes(&mut new_secret);
         self.secret_epoch = self.secret_epoch.saturating_add(1);
         self.shared_secret = Some(new_secret.clone());
+        self.security_binding = Some(format!("gss:epoch={}", self.secret_epoch));
         (new_secret, self.secret_epoch)
+    }
+
+    // ── Phase D.3: state-commit chain ──────────────────────────────────
+
+    /// The stable `group_id` (Phase D.3). Falls back to `mls_group_id` for
+    /// pre-D.3 groups where genesis has not yet been reconstructed.
+    #[must_use]
+    pub fn stable_group_id(&self) -> &str {
+        self.genesis
+            .as_ref()
+            .map(|g| g.group_id.as_str())
+            .unwrap_or(self.mls_group_id.as_str())
+    }
+
+    /// Snapshot of the public metadata that contributes to the state hash.
+    #[must_use]
+    pub fn public_meta(&self) -> state_commit::GroupPublicMeta {
+        state_commit::GroupPublicMeta {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            tags: self.tags.clone(),
+            avatar_url: self.avatar_url.clone(),
+            banner_url: self.banner_url.clone(),
+        }
+    }
+
+    /// Recompute and store `state_hash` from the current fields. Called
+    /// after every mutation; also called by constructors and the v1
+    /// migration path so new and migrated groups have a valid hash.
+    pub fn recompute_state_hash(&mut self) {
+        let roster_root = state_commit::compute_roster_root(&self.members_v2);
+        let policy_hash = state_commit::compute_policy_hash(&self.policy);
+        let meta_hash = state_commit::compute_public_meta_hash(&self.public_meta());
+        self.state_hash = state_commit::compute_state_hash(
+            self.stable_group_id(),
+            self.state_revision,
+            self.prev_state_hash.as_deref(),
+            &roster_root,
+            &policy_hash,
+            &meta_hash,
+            self.security_binding.as_deref(),
+            self.withdrawn,
+        );
+    }
+
+    /// Seal the current (already-mutated) state into a signed commit.
+    ///
+    /// - bumps `state_revision` by 1,
+    /// - records `prev_state_hash = self.state_hash` (pre-bump hash),
+    /// - recomputes the new `state_hash`,
+    /// - returns a signed [`state_commit::GroupStateCommit`].
+    ///
+    /// Callers must mutate the group first (e.g. `add_member`, `ban_member`,
+    /// policy update) **and then** call `seal_commit` to produce the
+    /// authority-signed commit that can be published and verified by peers.
+    pub fn seal_commit(
+        &mut self,
+        keypair: &AgentKeypair,
+        now_ms: u64,
+    ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        // Ensure the genesis record is present — callers may reach here via
+        // migrated paths that didn't set it yet.
+        if self.genesis.is_none() {
+            let creator_hex = hex::encode(self.creator.as_bytes());
+            self.genesis = Some(state_commit::GroupGenesis::with_existing_id(
+                self.mls_group_id.clone(),
+                creator_hex,
+                self.created_at,
+                // Deterministic nonce from mls_group_id so migration is
+                // idempotent across daemon restarts.
+                hex::encode(blake3::hash(self.mls_group_id.as_bytes()).as_bytes()),
+            ));
+        }
+        // NOTE: do NOT recompute here. `self.state_hash` reflects the
+        // *last committed* state; that is what the new commit's
+        // `prev_state_hash` must link to. Mutations the caller made
+        // since the last commit are intentionally not yet reflected in
+        // `self.state_hash` — the recompute below folds them in under
+        // the new revision.
+        let prev = self.state_hash.clone();
+        self.state_revision = self.state_revision.saturating_add(1);
+        self.prev_state_hash = Some(prev.clone());
+        self.updated_at = now_ms;
+        self.recompute_state_hash();
+
+        let roster_root = state_commit::compute_roster_root(&self.members_v2);
+        let policy_hash = state_commit::compute_policy_hash(&self.policy);
+        let meta_hash = state_commit::compute_public_meta_hash(&self.public_meta());
+
+        state_commit::GroupStateCommit::sign(
+            self.stable_group_id().to_string(),
+            self.state_revision,
+            Some(prev),
+            roster_root,
+            policy_hash,
+            meta_hash,
+            self.security_binding.clone(),
+            self.withdrawn,
+            now_ms,
+            keypair,
+        )
+    }
+
+    /// Mark the group as withdrawn and seal the terminal higher-revision
+    /// commit. A withdrawn group is superseded immediately for public
+    /// discovery purposes — peers holding stale public cards must drop them
+    /// on receipt of this commit regardless of TTL.
+    ///
+    /// Withdrawal is owner-authored; callers must check role before calling.
+    pub fn seal_withdrawal(
+        &mut self,
+        keypair: &AgentKeypair,
+        now_ms: u64,
+    ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        self.withdrawn = true;
+        self.seal_commit(keypair, now_ms)
+    }
+
+    /// Accept a peer-authored signed commit on the apply-side.
+    ///
+    /// Performs [`state_commit::validate_apply`] with the given action kind
+    /// and, on success, updates the local chain fields
+    /// (`state_revision`, `state_hash`, `prev_state_hash`, `withdrawn`) to
+    /// mirror the commit. Domain-specific mutations (roster/policy/meta)
+    /// are the caller's responsibility and must be performed **before**
+    /// calling this method, so the post-mutation recomputed hash matches
+    /// `commit.state_hash`.
+    pub fn apply_commit(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+        action_kind: state_commit::ActionKind,
+    ) -> Result<(), state_commit::ApplyError> {
+        let ctx = state_commit::ApplyContext {
+            current_state_hash: &self.state_hash,
+            current_revision: self.state_revision,
+            current_withdrawn: self.withdrawn,
+            members_v2: &self.members_v2,
+            group_id: self.stable_group_id(),
+        };
+        state_commit::validate_apply(&ctx, commit, action_kind)?;
+
+        // After the caller has mutated local state to mirror the committed
+        // action, verify our recomputed hash matches the commit's claim.
+        self.state_revision = commit.revision;
+        self.prev_state_hash = commit.prev_state_hash.clone();
+        self.withdrawn = commit.withdrawn;
+        self.recompute_state_hash();
+        if self.state_hash != commit.state_hash {
+            return Err(state_commit::ApplyError::StateHashMismatch {
+                expected: commit.state_hash.clone(),
+                got: self.state_hash.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Derive the per-message AEAD key from the group's current shared secret.
@@ -222,32 +450,62 @@ impl GroupInfo {
     }
 
     /// Migrate v1 (BTreeSet + display_names) data into v2 structured members.
-    /// Idempotent: no-op if `members_v2` is already populated.
+    /// Also backfills Phase D.3 stable-genesis + state-hash fields for
+    /// blobs written before D.3 landed. Idempotent: may be called multiple
+    /// times.
     pub fn migrate_from_v1(&mut self) {
-        if !self.members_v2.is_empty() {
-            return;
+        if self.members_v2.is_empty() {
+            let now = now_millis();
+            let creator_hex = hex::encode(self.creator.as_bytes());
+            let mut all_ids: BTreeSet<String> = self.members.clone();
+            all_ids.insert(creator_hex.clone());
+            for id in self.display_names.keys() {
+                all_ids.insert(id.clone());
+            }
+            for id in all_ids {
+                let display_name = self.display_names.get(&id).cloned();
+                let member = if id == creator_hex {
+                    GroupMember::new_owner(id.clone(), display_name, now)
+                } else {
+                    GroupMember::new_member(
+                        id.clone(),
+                        display_name,
+                        Some(creator_hex.clone()),
+                        now,
+                    )
+                };
+                self.members_v2.insert(id, member);
+            }
+            if self.roster_revision == 0 {
+                self.roster_revision = self.membership_revision;
+            }
+            if self.updated_at == 0 {
+                self.updated_at = self.created_at;
+            }
         }
-        let now = now_millis();
-        let creator_hex = hex::encode(self.creator.as_bytes());
-        let mut all_ids: BTreeSet<String> = self.members.clone();
-        all_ids.insert(creator_hex.clone());
-        for id in self.display_names.keys() {
-            all_ids.insert(id.clone());
+        // Phase D.3: backfill stable-genesis deterministically from the
+        // existing mls_group_id so migrated blobs carry the same
+        // `stable_group_id` across restarts.
+        if self.genesis.is_none() {
+            let creator_hex = hex::encode(self.creator.as_bytes());
+            let nonce = hex::encode(blake3::hash(self.mls_group_id.as_bytes()).as_bytes());
+            self.genesis = Some(state_commit::GroupGenesis::with_existing_id(
+                self.mls_group_id.clone(),
+                creator_hex,
+                self.created_at,
+                nonce,
+            ));
         }
-        for id in all_ids {
-            let display_name = self.display_names.get(&id).cloned();
-            let member = if id == creator_hex {
-                GroupMember::new_owner(id.clone(), display_name, now)
-            } else {
-                GroupMember::new_member(id.clone(), display_name, Some(creator_hex.clone()), now)
-            };
-            self.members_v2.insert(id, member);
+        // Phase D.3: if security_binding is unset on an MlsEncrypted group,
+        // derive it from the current secret_epoch.
+        if self.security_binding.is_none()
+            && self.policy.confidentiality == GroupConfidentiality::MlsEncrypted
+        {
+            self.security_binding = Some(format!("gss:epoch={}", self.secret_epoch));
         }
-        if self.roster_revision == 0 {
-            self.roster_revision = self.membership_revision;
-        }
-        if self.updated_at == 0 {
-            self.updated_at = self.created_at;
+        // Phase D.3: recompute state_hash if absent.
+        if self.state_hash.is_empty() {
+            self.recompute_state_hash();
         }
     }
 
@@ -458,21 +716,30 @@ impl GroupInfo {
 
     /// Build a shareable discoverable `GroupCard` from this group's state.
     /// Returns None if the group is `Hidden`.
+    ///
+    /// The returned card carries the Phase D.3 state-commit binding
+    /// (`revision`, `state_hash`, `prev_state_hash`, `issued_at`,
+    /// `expires_at`, `withdrawn`) but is **unsigned**. Callers with the
+    /// authority's keypair should call `GroupCard::sign` before
+    /// publishing to turn it into a verifiable public artifact.
     #[must_use]
     pub fn to_group_card(&self) -> Option<GroupCard> {
-        if self.policy.discoverability == GroupDiscoverability::Hidden {
+        if self.policy.discoverability == GroupDiscoverability::Hidden && !self.withdrawn {
             return None;
         }
         let owner = self
             .owner_agent_id()
             .unwrap_or_else(|| hex::encode(self.creator.as_bytes()));
+        let issued_at = now_millis();
+        let expires_at =
+            issued_at.saturating_add(state_commit::DEFAULT_CARD_TTL_SECS.saturating_mul(1_000));
         Some(GroupCard {
-            group_id: self.mls_group_id.clone(),
+            group_id: self.stable_group_id().to_string(),
             name: self.name.clone(),
             description: self.description.clone(),
-            avatar_url: None,
-            banner_url: None,
-            tags: Vec::new(),
+            avatar_url: self.avatar_url.clone(),
+            banner_url: self.banner_url.clone(),
+            tags: self.tags.clone(),
             policy_summary: GroupPolicySummary::from(&self.policy),
             owner_agent_id: owner,
             admin_count: self.active_admin_count() as u32,
@@ -480,7 +747,33 @@ impl GroupInfo {
             created_at: self.created_at,
             updated_at: self.updated_at,
             request_access_enabled: self.policy.admission == GroupAdmission::RequestAccess,
+            revision: self.state_revision,
+            state_hash: self.state_hash.clone(),
+            prev_state_hash: self.prev_state_hash.clone(),
+            issued_at,
+            expires_at,
+            authority_agent_id: String::new(),
+            authority_public_key: String::new(),
+            withdrawn: self.withdrawn,
+            signature: String::new(),
         })
+    }
+
+    /// Build and sign a `GroupCard` in one step.
+    ///
+    /// Returns None if the group is `Hidden` AND not withdrawn. Callers
+    /// publishing a withdrawal card must call `seal_withdrawal()` first to
+    /// advance the state chain, then this helper to emit the terminal
+    /// signed card.
+    pub fn to_signed_group_card(
+        &self,
+        keypair: &AgentKeypair,
+    ) -> Result<Option<GroupCard>, state_commit::ApplyError> {
+        let Some(mut card) = self.to_group_card() else {
+            return Ok(None);
+        };
+        card.sign(keypair)?;
+        Ok(Some(card))
     }
 }
 

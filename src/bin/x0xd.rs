@@ -1383,6 +1383,10 @@ async fn main() -> Result<()> {
         )
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
+        // Phase D.3 — state-commit chain endpoints.
+        .route("/groups/:id/state", get(get_group_state))
+        .route("/groups/:id/state/seal", post(seal_group_state))
+        .route("/groups/:id/state/withdraw", post(withdraw_group_state))
         .route("/groups/:id", delete(leave_group))
         // KvStore endpoints
         .route("/stores", get(list_kv_stores))
@@ -4127,6 +4131,11 @@ struct AddNamedGroupMemberRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+// Phase D.3 enlarged GroupCard with a ~6 KB authority signature and a
+// long ML-KEM envelope. Boxing any one variant would force serde-boxed
+// wire format breaks; the in-memory size delta is irrelevant compared
+// to the gossip plumbing cost.
+#[allow(clippy::large_enum_variant)]
 enum NamedGroupMetadataEvent {
     MemberAdded {
         group_id: String,
@@ -4361,44 +4370,95 @@ fn named_group_member_values_all(info: &x0x::groups::GroupInfo) -> Vec<serde_jso
 const GLOBAL_GROUP_DISCOVERY_TOPIC: &str = "x0x.discovery.groups";
 
 /// Publish a group's card to the global discovery topic when it is discoverable.
-/// No-op if the group is Hidden.
+/// No-op if the group is Hidden and not withdrawn.
+///
+/// Phase D.3: the card carries the current committed `state_hash` and is
+/// signed with the local agent's ML-DSA-65 key so peers can verify
+/// authority and apply higher-revision supersession deterministically.
+/// If `reseal=true`, this call also advances the state-commit chain
+/// (bumps revision, updates `prev_state_hash`) before signing the card —
+/// used by explicit `/state/seal` and `/state/withdraw` endpoints. When
+/// `reseal=false`, the card reflects the current already-sealed state.
 async fn publish_group_card_to_discovery(state: &AppState, group_id: &str) {
-    let maybe_event = {
-        let groups = state.named_groups.read().await;
-        groups
-            .get(group_id)
-            .and_then(|info| info.to_group_card())
-            .map(|card| NamedGroupMetadataEvent::GroupCardPublished {
-                group_id: group_id.to_string(),
-                card,
-            })
-    };
-    if let Some(event) = maybe_event {
-        match serde_json::to_vec(&event) {
-            Ok(bytes) => {
-                match state
-                    .agent
-                    .publish(GLOBAL_GROUP_DISCOVERY_TOPIC, bytes)
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::info!(
-                            group_id,
-                            topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
-                            "P0-1: published card to global discovery topic"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
-                            "failed to publish card to discovery topic: {e}"
-                        );
-                    }
+    publish_group_card_to_discovery_inner(state, group_id, false).await;
+}
+
+/// Like `publish_group_card_to_discovery` but advances the D.3 state
+/// commit chain first. Returns the newly-sealed commit on success.
+async fn publish_group_card_with_reseal(
+    state: &AppState,
+    group_id: &str,
+) -> Option<x0x::groups::GroupStateCommit> {
+    publish_group_card_to_discovery_inner(state, group_id, true).await
+}
+
+async fn publish_group_card_to_discovery_inner(
+    state: &AppState,
+    group_id: &str,
+    reseal: bool,
+) -> Option<x0x::groups::GroupStateCommit> {
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let (signed_card, commit) = {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(group_id)?;
+        // Reseal bumps the commit chain; non-reseal republishes the
+        // currently-sealed state (idempotent refresh).
+        let commit = if reseal {
+            match info.seal_commit(signing_kp, now_ms) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(group_id, "seal_commit failed: {e}");
+                    return None;
                 }
             }
-            Err(e) => tracing::debug!("failed to serialize discovery card: {e}"),
+        } else {
+            None
+        };
+        let mut card = info.to_group_card()?;
+        if let Err(e) = card.sign(signing_kp) {
+            tracing::warn!(group_id, "card sign failed: {e}");
+            return None;
         }
+        (card, commit)
+    };
+
+    if reseal {
+        save_named_groups(state).await;
     }
+
+    let event = NamedGroupMetadataEvent::GroupCardPublished {
+        group_id: group_id.to_string(),
+        card: signed_card,
+    };
+    match serde_json::to_vec(&event) {
+        Ok(bytes) => match state
+            .agent
+            .publish(GLOBAL_GROUP_DISCOVERY_TOPIC, bytes)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    group_id,
+                    topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
+                    reseal,
+                    "D.3: published signed card to global discovery topic"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
+                    "failed to publish card: {e}"
+                );
+            }
+        },
+        Err(e) => tracing::debug!("failed to serialize discovery card: {e}"),
+    }
+    commit
 }
 
 /// Subscribe to the global discovery topic and insert incoming cards into the cache.
@@ -4429,20 +4489,77 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                     );
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
                     if let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event {
-                        tracing::info!(
-                            group_id = %card.group_id,
-                            name = %card.name,
-                            "P0-1: caching discovered group card"
-                        );
+                        // Phase D.3: verify authority signature on signed
+                        // cards. Unsigned cards (pre-D.3 legacy peers) are
+                        // accepted for backward compatibility; signed cards
+                        // with a bad signature are dropped silently.
+                        if !card.signature.is_empty() {
+                            if let Err(e) = card.verify_signature() {
+                                tracing::warn!(
+                                    group_id = %card.group_id,
+                                    "D.3: dropped card with invalid signature: {e}"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Phase D.3: withdrawal supersession. A signed
+                        // withdrawal card evicts any existing cache entry
+                        // regardless of prior revision (it is, by
+                        // construction, a higher revision than anything
+                        // local since apply_commit enforced that at the
+                        // authority).
+                        if card.withdrawn {
+                            let mut cache = state.group_card_cache.write().await;
+                            let should_evict = cache
+                                .get(&card.group_id)
+                                .map(|existing| {
+                                    card.revision > existing.revision
+                                        || (card.revision == existing.revision
+                                            && card.issued_at >= existing.issued_at)
+                                })
+                                .unwrap_or(true);
+                            if should_evict {
+                                cache.remove(&card.group_id);
+                                tracing::info!(
+                                    group_id = %card.group_id,
+                                    revision = card.revision,
+                                    "D.3: withdrawal card superseded prior listing"
+                                );
+                            }
+                            continue;
+                        }
+
                         // Only accept discoverable cards.
                         if card.policy_summary.discoverability
-                            != x0x::groups::GroupDiscoverability::Hidden
+                            == x0x::groups::GroupDiscoverability::Hidden
                         {
-                            state
-                                .group_card_cache
-                                .write()
-                                .await
-                                .insert(card.group_id.clone(), card);
+                            continue;
+                        }
+
+                        // Phase D.3: higher revision supersedes lower
+                        // immediately (independent of TTL). On ties, higher
+                        // issued_at wins.
+                        let mut cache = state.group_card_cache.write().await;
+                        let should_insert = match cache.get(&card.group_id) {
+                            Some(existing) => card.supersedes(existing),
+                            None => true,
+                        };
+                        if should_insert {
+                            tracing::info!(
+                                group_id = %card.group_id,
+                                name = %card.name,
+                                revision = card.revision,
+                                "D.3: caching discovered group card (signed={})",
+                                !card.signature.is_empty()
+                            );
+                            cache.insert(card.group_id.clone(), card);
+                        } else {
+                            tracing::debug!(
+                                group_id = %card.group_id,
+                                revision = card.revision,
+                                "D.3: dropped stale card (already have higher rev)"
+                            );
                         }
                     }
                 }
@@ -5655,6 +5772,163 @@ async fn remove_named_group_member(
             "epoch": epoch,
             "member_count": members.len(),
             "members": members,
+        })),
+    )
+}
+
+/// GET /groups/:id/state — Phase D.3: inspect the stable-identity +
+/// state-commit chain view of a group.
+///
+/// Returns `{ group_id, genesis, state_revision, state_hash,
+/// prev_state_hash, security_binding, withdrawn, roster_root,
+/// policy_hash, public_meta_hash }`. Available to any active member.
+async fn get_group_state(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !info.has_active_member(&local_hex) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
+        );
+    }
+    let roster_root = x0x::groups::compute_roster_root(&info.members_v2);
+    let policy_hash = x0x::groups::compute_policy_hash(&info.policy);
+    let public_meta_hash = x0x::groups::compute_public_meta_hash(&info.public_meta());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": info.stable_group_id(),
+            "mls_group_id": info.mls_group_id,
+            "genesis": info.genesis,
+            "state_revision": info.state_revision,
+            "state_hash": info.state_hash,
+            "prev_state_hash": info.prev_state_hash,
+            "security_binding": info.security_binding,
+            "withdrawn": info.withdrawn,
+            "roster_root": roster_root,
+            "policy_hash": policy_hash,
+            "public_meta_hash": public_meta_hash,
+        })),
+    )
+}
+
+/// POST /groups/:id/state/seal — Phase D.3: advance the state-commit
+/// chain and republish the signed public card (no-op payload change —
+/// used to refresh / repair / force-propagate the chain).
+///
+/// Owner or admin only.
+async fn seal_group_state(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        let role = info.caller_role(&local_hex);
+        if !role
+            .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
+            .unwrap_or(false)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "owner or admin required to seal state"
+                })),
+            );
+        }
+    }
+    let commit = publish_group_card_with_reseal(&state, &id).await;
+    let Some(commit) = commit else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": "seal failed" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "commit": commit,
+        })),
+    )
+}
+
+/// POST /groups/:id/state/withdraw — Phase D.3: seal a terminal
+/// withdrawal commit and publish the withdrawn card. Higher revision
+/// supersedes any prior public card regardless of TTL; peers evict
+/// stale listings on receipt.
+///
+/// Owner only.
+async fn withdraw_group_state(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let signing_kp = state.agent.identity().agent_keypair();
+
+    let commit = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if info.caller_role(&local_hex) != Some(x0x::groups::GroupRole::Owner) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "owner required to withdraw"
+                })),
+            );
+        }
+        match info.seal_withdrawal(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("withdrawal seal failed: {e}")
+                    })),
+                );
+            }
+        }
+    };
+    save_named_groups(&state).await;
+
+    // Publish the withdrawn card (to_group_card now returns Some() for
+    // withdrawn groups regardless of discoverability so peers get the
+    // supersession signal).
+    let _ = publish_group_card_to_discovery_inner(&state, &id, false).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "commit": commit,
         })),
     )
 }

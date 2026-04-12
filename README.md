@@ -377,6 +377,25 @@ x0x group list
 
 Current note: creator-authored named-space member add/remove and creator delete now propagate across subscribed peers, and removed peers drop the space locally. This is much stronger than a purely local roster, but it is still not yet a full distributed admin/ACL system by itself.
 
+### Phase D.3 — stable identity + evolving validity
+
+Each group has a **stable `group_id`** plus an authority-signed **state-commit chain** (`revision`, `prev_state_hash`, `state_hash`, owner/admin ML-DSA-65 signature). Public directory cards are ML-DSA-65 signed and peers supersede by revision immediately — stale cards are dropped regardless of TTL. Owners can **withdraw** a group to evict its public card across the reachable partition.
+
+```bash
+# Inspect the signed chain
+x0x group state <group_id>
+
+# Advance the chain + rebroadcast the signed public card
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://$API/groups/<group_id>/state/seal"
+
+# Terminal withdrawal (owner)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://$API/groups/<group_id>/state/withdraw"
+```
+
+v1 secure model is **GSS** (Group Shared Secret rekey-on-ban via ML-KEM-768 sealed envelopes), not MLS TreeKEM. See `docs/primers/groups.md` for what GSS provides and does not provide.
+
 ---
 
 ## Build Apps on x0x

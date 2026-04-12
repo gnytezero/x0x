@@ -10,15 +10,58 @@ Implementation is in progress across multiple phases and branches. This document
 
 ### Execution phases
 
-| Phase | Scope | Purpose |
-|-------|-------|---------|
-| Phase A | Policy + roles | Establish named groups as first-class policy-governed spaces |
-| Phase B | Join requests | Add request-access lifecycle and admin approval/rejection |
-| Phase C | Discovery cards | Define public/contact-scoped discovery objects and manual import/bootstrap |
-| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes |
-| Phase D | Secure enforcement | Bind roster/policy changes to MLS state and future-access revocation |
-| Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics |
-| Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence |
+| Phase | Scope | Purpose | Status |
+|-------|-------|---------|--------|
+| Phase A | Policy + roles | Establish named groups as first-class policy-governed spaces | **landed** |
+| Phase B | Join requests | Add request-access lifecycle and admin approval/rejection | **landed** |
+| Phase C | Discovery cards | Define public/contact-scoped discovery objects and manual import/bootstrap | **landed (bridge-level)** |
+| Phase D.2 | Secure share distribution | Cross-daemon sealed rekey-on-ban via ML-KEM-768 envelopes (interim) | **landed** |
+| Phase D.3 | Stable identity + state commits | `GroupGenesis`, `GroupStateCommit`, signed `GroupCard`, apply-side validation, withdrawal supersession | **landed** |
+| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **next** |
+| Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | planned |
+| Phase D.4 | Strict apply-side enforcement | Move every state-changing action through `apply_event`; secure/roster binding invariant tests | planned |
+| Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence | planned |
+
+### Phase D.3 implementation notes
+
+Phase D.3 landed these primitives:
+
+- `src/groups/state_commit.rs` — `GroupGenesis`, `GroupStateCommit`,
+  `GroupPublicMeta`, component hashes (`compute_roster_root`,
+  `compute_policy_hash`, `compute_public_meta_hash`,
+  `compute_state_hash`), `validate_apply` with the five apply-side
+  checks from §"Apply-side validation".
+- `GroupInfo` gains `genesis`, `state_revision`, `state_hash`,
+  `prev_state_hash`, `security_binding`, `withdrawn`, `tags`,
+  `avatar_url`, `banner_url`. Helpers: `seal_commit`,
+  `seal_withdrawal`, `apply_commit`, `recompute_state_hash`,
+  `stable_group_id`.
+- `GroupCard` carries `revision`, `state_hash`, `prev_state_hash`,
+  `issued_at`, `expires_at`, `authority_agent_id`,
+  `authority_public_key`, `withdrawn`, and `signature`. Method
+  `sign(&AgentKeypair)` + `verify_signature()` + `supersedes(&other)`.
+- Three new endpoints: `GET /groups/:id/state`,
+  `POST /groups/:id/state/seal`, `POST /groups/:id/state/withdraw`.
+- Global discovery listener verifies card signatures before caching and
+  enforces higher-revision supersession + withdrawal eviction
+  regardless of TTL.
+
+**Not yet migrated to apply_event in Phase D.3**: the existing
+per-action metadata events (`MemberAdded`, `PolicyUpdated`, etc.) still
+use the pre-D.3 per-field revision counters (`policy_revision`,
+`roster_revision`). Phase D.4 completes the migration so every
+state-changing action flows through `seal_commit`/`apply_commit`.
+
+### Honest v1 secure model
+
+x0x v1 ships **GSS** (Group Shared Secret) rekey-on-ban, not full MLS
+TreeKEM. The `security_binding` field in `GroupStateCommit` carries the
+current `gss:epoch=N` so the state chain cannot silently drift from the
+secure plane. GSS provides cross-daemon encrypt/decrypt + rekey-on-ban
+future-access revocation (proven in
+`tests/e2e_named_groups.sh` §2); it does **not** provide per-message
+forward secrecy within an epoch or MLS TreeKEM semantics. Full TreeKEM
+is planned follow-up work.
 
 ## Why this exists
 

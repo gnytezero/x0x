@@ -103,6 +103,9 @@ This is the shorter, at-a-glance API map for `x0xd`. For the full reference, req
 | POST | `/groups/:id/invite` | `x0x group invite` | Generate invite link |
 | POST | `/groups/join` | `x0x group join` | Join from invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |
+| GET | `/groups/:id/state` | `x0x group state` | **Phase D.3**: signed state-commit chain inspection |
+| POST | `/groups/:id/state/seal` | `x0x group state-seal` | **Phase D.3**: advance commit chain + republish signed card |
+| POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw` | **Phase D.3**: seal terminal withdrawal |
 | DELETE | `/groups/:id` | `x0x group leave` | Leave or delete group |
 
 ## Collaborative data

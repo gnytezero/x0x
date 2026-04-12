@@ -2,6 +2,73 @@
 
 > Status: current upstream `x0x v0.16.0` has two separate group surfaces: `x0x group ...` for named groups and invites, and `x0x groups ...` for low-level MLS helpers. They are related, but they are not yet one turnkey secure group-chat product.
 
+## Stable identity + evolving validity (Phase D.3)
+
+Every named group has two identifiers:
+
+- a **stable `group_id`** derived from the creator's agent id + creation
+  timestamp + a random nonce. This never changes — renames, role changes,
+  roster churn all preserve it.
+- an **evolving `state_hash`** that commits to the group's current
+  effective state: roster (active + banned), role assignments, policy,
+  public metadata, security binding, and withdrawal status.
+
+Every authoritative state change produces a signed
+[`GroupStateCommit`](../design/named-groups-full-model.md#stable-identity-vs-evolving-validity)
+with a monotonic `revision`, a `prev_state_hash` linking to the previous
+commit, and an ML-DSA-65 signature by the actor. Peers verify the
+signature, revision monotonicity, and chain linkage before accepting the
+commit; stale actions and chain breaks are rejected.
+
+Public directory cards carry the same authority signature. Higher
+revisions supersede lower ones immediately on peers — TTL is only cache
+cleanup, not the primary validity mechanism. Owners can seal a terminal
+**withdrawal** commit that instructs peers to evict any prior public
+card regardless of TTL.
+
+```bash
+# Inspect the signed state chain
+x0x group state <group_id>
+# or
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/<group_id>/state"
+
+# Advance the chain + republish the signed card (owner/admin)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://$API/groups/<group_id>/state/seal"
+
+# Terminally withdraw / hide the group (owner)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://$API/groups/<group_id>/state/withdraw"
+```
+
+### Honest v1 secure model — Group Shared Secret (GSS)
+
+For `MlsEncrypted` groups x0x v1 ships **GSS**, not MLS TreeKEM:
+
+- a 32-byte shared secret is generated at group creation;
+- on ban / remove, the secret is rotated to a new `epoch` and the new
+  secret is sealed individually to each remaining member's published
+  ML-KEM-768 public key (see `/groups/:id/secure/reseal`);
+- per-message AEAD keys are derived from `(secret, epoch, group_id)`
+  with BLAKE3;
+- the current `secret_epoch` is folded into `security_binding` and
+  therefore into `state_hash` — changes to membership and the secure
+  plane cannot silently drift.
+
+**What GSS provides**
+- cross-daemon encrypt/decrypt proven end-to-end (alice/bob/charlie with
+  independent keystores round-trip in `tests/e2e_named_groups.sh`);
+- rekey-on-ban: a banned peer loses access to future epoch content
+  because the new secret is never sealed to them;
+- post-quantum confidentiality on the envelope (ML-KEM-768 + ChaCha20-Poly1305).
+
+**What GSS does NOT provide**
+- per-message forward secrecy within a single epoch;
+- full MLS TreeKEM semantics (PSK, exporter secrets, resumption, etc.);
+- forgetting plaintext/ciphertext a removed peer already received.
+
+Full MLS TreeKEM is planned follow-up work and is not a v1 blocker.
+
 ## Setup once
 
 Install x0x from the current upstream release or `SKILL.md` flow in the repo: [github.com/saorsa-labs/x0x](https://github.com/saorsa-labs/x0x). Then start the daemon with `x0x start` or `x0xd`.
