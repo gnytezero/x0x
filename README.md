@@ -396,6 +396,23 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 v1 secure model is **GSS** (Group Shared Secret rekey-on-ban via ML-KEM-768 sealed envelopes), not MLS TreeKEM. See `docs/primers/groups.md` for what GSS provides and does not provide.
 
+### Phase C.2 — distributed shard discovery
+
+Public groups are indexed via **tag / name / exact-id shards** over PlumTree — no DHT, no special node roles. Subscribe to the shards you care about; the daemon anti-entropies and caches signed cards automatically. Privacy is enforced defensively at publish AND receive: `Hidden` never touches any topic, `ListedToContacts` is pushed pairwise to Trusted contacts via direct-message, `PublicDirectory` fans out to shards.
+
+```bash
+# Subscribe to a tag
+x0x group discover-subscribe tag ai
+
+# Find groups tagged 'ai' in your reachable partition
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/discover?q=ai"
+
+# Presence-social browse
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/discover/nearby"
+```
+
+Subscriptions persist in `~/.x0x/directory-subscriptions.json` and resubscribe with 0–30s jitter at startup.
+
 ---
 
 ## Build Apps on x0x

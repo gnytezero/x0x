@@ -17,7 +17,7 @@ Implementation is in progress across multiple phases and branches. This document
 | Phase C | Discovery cards | Define public/contact-scoped discovery objects and manual import/bootstrap | **landed (bridge-level)** |
 | Phase D.2 | Secure share distribution | Cross-daemon sealed rekey-on-ban via ML-KEM-768 envelopes (interim) | **landed** |
 | Phase D.3 | Stable identity + state commits | `GroupGenesis`, `GroupStateCommit`, signed `GroupCard`, apply-side validation, withdrawal supersession | **landed** |
-| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **next** |
+| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **landed** |
 | Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | planned |
 | Phase D.4 | Strict apply-side enforcement | Move every state-changing action through `apply_event`; secure/roster binding invariant tests | planned |
 | Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence | planned |
@@ -51,6 +51,47 @@ per-action metadata events (`MemberAdded`, `PolicyUpdated`, etc.) still
 use the pre-D.3 per-field revision counters (`policy_revision`,
 `roster_revision`). Phase D.4 completes the migration so every
 state-changing action flows through `seal_commit`/`apply_commit`.
+
+### Phase C.2 implementation notes
+
+Phase C.2 landed the distributed discovery index:
+
+- `src/groups/discovery.rs` — shard computation (`shard_of`,
+  `topic_for`, `shards_for_public`), `DirectoryShardCache` (bounded
+  LRU, keyed by `group_id`, supersedes by revision, evicts on
+  withdrawal), `DirectoryMessage::{Card, Digest, Pull}`,
+  `DigestEntry`, `SubscriptionSet` + `SubscriptionRecord`, privacy
+  guard `may_publish_to_public_shards`.
+- `publish_group_card_to_discovery` now fans out to tag + name + id
+  shards for `PublicDirectory` groups. Hidden stays local. ListedToContacts
+  goes via pairwise `LTC_CARD_FRAME_PREFIX`-framed direct messages to
+  each Trusted/Known contact.
+- Shard listener verifies card signatures, drops non-PublicDirectory
+  cards defensively, supersedes by revision, evicts on withdrawal.
+- Digest/Pull AE: periodic digest emission (60s), receiver compares and
+  pulls missing/stale cards.
+- Persistence: subscription set in
+  `~/.x0x/directory-subscriptions.json`; staggered resubscribe at
+  startup with 0–30s jitter.
+- Four new endpoints: `GET /groups/discover/nearby`,
+  `GET /groups/discover/subscriptions`,
+  `POST /groups/discover/subscribe`,
+  `DELETE /groups/discover/subscribe/:kind/:shard`.
+
+**Privacy invariants enforced defensively at publish AND receive:**
+- `Hidden` never reaches any public topic.
+- `ListedToContacts` never reaches public shards (direct-message only).
+- Incoming shard cards whose claimed discoverability is not
+  `PublicDirectory` are dropped silently (log-warn).
+
+**What C.2 does NOT yet deliver (scope-bounded):**
+- FOAF-weighted nearby ranking — the endpoint returns all reachable
+  PublicDirectory cards without social weighting (D.4 / F scope).
+- `ListedToContacts` receive-side digest/pull protocol — current
+  implementation pushes full signed cards on every authority seal.
+  Incremental digest+pull over the contact channel is follow-up work.
+- Deprecation of the legacy `x0x.discovery.groups` bridge topic — it
+  is still dual-published for back-compat with pre-C.2 peers.
 
 ### Honest v1 secure model
 

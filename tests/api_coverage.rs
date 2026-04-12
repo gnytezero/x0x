@@ -109,6 +109,11 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Post, "/groups/:id/requests/:request_id/reject"),
     (Method::Delete, "/groups/:id/requests/:request_id"),
     (Method::Get, "/groups/discover"),
+    // ── Phase C.2: shard discovery ──────────────────────────────────────
+    (Method::Get, "/groups/discover/nearby"),
+    (Method::Get, "/groups/discover/subscriptions"),
+    (Method::Post, "/groups/discover/subscribe"),
+    (Method::Delete, "/groups/discover/subscribe/:kind/:shard"),
     (Method::Get, "/groups/cards/:id"),
     (Method::Post, "/groups/cards/import"),
     (Method::Post, "/groups/:id/secure/encrypt"),

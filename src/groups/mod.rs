@@ -11,6 +11,7 @@
 
 pub mod card;
 pub mod directory;
+pub mod discovery;
 pub mod invite;
 pub mod kem_envelope;
 pub mod member;
@@ -23,6 +24,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use self::directory::GroupCard;
+pub use self::discovery::{
+    may_publish_to_public_shards, name_words, normalize_tag, shard_of, shards_for_public,
+    topic_for, DigestEntry, DirectoryMessage, DirectoryShardCache, ListedToContactsCard,
+    ListedToContactsDigest, ListedToContactsPull, ShardKind, SubscriptionRecord, SubscriptionSet,
+    DEFAULT_MAX_ENTRIES_PER_SHARD, DEFAULT_MAX_SUBSCRIPTIONS, DIRECTORY_TOPIC_PREFIX,
+    MAX_NAME_WORDS, MAX_TAGS_PER_GROUP, SHARD_COUNT,
+};
 pub use self::member::{GroupMember, GroupMemberState, GroupRole};
 pub use self::policy::{
     GroupAdmission, GroupConfidentiality, GroupDiscoverability, GroupPolicy, GroupPolicyPreset,

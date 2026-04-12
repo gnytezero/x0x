@@ -69,6 +69,58 @@ For `MlsEncrypted` groups x0x v1 ships **GSS**, not MLS TreeKEM:
 
 Full MLS TreeKEM is planned follow-up work and is not a v1 blocker.
 
+## Distributed shard discovery (Phase C.2)
+
+Public group discovery is a **sharded gossip index** over PlumTree — no
+DHT, no special node roles. Each `PublicDirectory` group publishes its
+signed `GroupCard` to:
+
+- one **tag shard** per normalised tag (`x0x.directory.tag.{N}`),
+- one **name shard** per whitespace-delimited name word
+  (`x0x.directory.name.{N}`),
+- exactly one **exact-id shard** (`x0x.directory.id.{N}`).
+
+Where `N = BLAKE3("x0x-group-tag" || lowercase(key)) % 65536`.
+
+Peers subscribe to shards of interest; subscriptions persist across
+daemon restart and resubscribe with 0–30s random jitter to avoid
+anti-entropy storms. Every 60s each subscriber emits a `Digest` on its
+shards; peers compare and issue `Pull` requests for missing/stale
+entries. Receivers verify each card's ML-DSA-65 signature before caching;
+the cache supersedes by revision and evicts on withdrawal regardless of
+TTL.
+
+```bash
+# Subscribe to a tag shard
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "http://$API/groups/discover/subscribe" \
+  -d '{"kind":"tag","key":"ai"}'
+
+# List my subscriptions
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/discover/subscriptions"
+
+# Presence-social browse (PublicDirectory only)
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/discover/nearby"
+
+# Unsubscribe
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://$API/groups/discover/subscribe/tag/42"
+```
+
+### Privacy contract — hard guarantees
+
+- **`Hidden`** groups never reach any public topic. They live entirely
+  in local state.
+- **`ListedToContacts`** groups never touch public shards. On every
+  authority seal, the signed card is pushed to each Trusted/Known
+  contact via direct-message with the framing
+  `X0X-LTC-CARD-V1\n<card-json>`. Receivers verify and cache into the
+  local card cache, never into the public shard cache.
+- **`PublicDirectory`** groups publish to tag + name + id shards. The
+  shard listener defensively drops any received card whose
+  discoverability is not `PublicDirectory` (would-be leak).
+
 ## Setup once
 
 Install x0x from the current upstream release or `SKILL.md` flow in the repo: [github.com/saorsa-labs/x0x](https://github.com/saorsa-labs/x0x). Then start the daemon with `x0x start` or `x0xd`.

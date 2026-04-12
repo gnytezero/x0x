@@ -342,6 +342,16 @@ struct AppState {
     group_metadata_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Cached group cards discovered via gossip or imported from peers.
     group_card_cache: RwLock<HashMap<String, x0x::groups::GroupCard>>,
+    /// Phase C.2: per-shard cache of signed cards received via
+    /// `x0x.directory.{tag|name|id}.{N}` gossip topics.
+    directory_cache: RwLock<x0x::groups::DirectoryShardCache>,
+    /// Phase C.2: persistent set of shard subscriptions. Survives
+    /// daemon restart (see `directory_subscriptions_path`).
+    directory_subscriptions: RwLock<x0x::groups::SubscriptionSet>,
+    /// Phase C.2: disk location for subscription persistence.
+    directory_subscriptions_path: PathBuf,
+    /// Phase C.2: background shard-listener tasks, keyed by (kind, shard).
+    directory_tasks: RwLock<HashMap<(x0x::groups::ShardKind, u32), tokio::task::JoinHandle<()>>>,
     /// Per-daemon ML-KEM-768 keypair used to open `SecureShareDelivered`
     /// envelopes addressed to this agent. Public half is published in the
     /// `/agent` response and in `JoinRequestCreated` so other daemons can
@@ -1122,6 +1132,10 @@ async fn main() -> Result<()> {
         named_groups_path,
         group_metadata_tasks: RwLock::new(HashMap::new()),
         group_card_cache: RwLock::new(HashMap::new()),
+        directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
+        directory_subscriptions: RwLock::new(x0x::groups::SubscriptionSet::default()),
+        directory_subscriptions_path: config.data_dir.join("directory-subscriptions.json"),
+        directory_tasks: RwLock::new(HashMap::new()),
         agent_kem_keypair,
         contacts,
         mls_groups: RwLock::new(mls_groups),
@@ -1150,6 +1164,12 @@ async fn main() -> Result<()> {
     // P0-1: subscribe to the global group discovery topic so remote public
     // groups populate the local card cache without manual import.
     spawn_global_discovery_listener(Arc::clone(&state)).await;
+    // Phase C.2: load persisted shard subscriptions and re-subscribe with
+    // staggered jitter to avoid anti-entropy storms.
+    spawn_directory_resubscribe(Arc::clone(&state)).await;
+    // Phase C.2: subscribe inbound direct messages for the
+    // ListedToContacts pairwise sync channel.
+    spawn_listed_to_contacts_listener(Arc::clone(&state)).await;
 
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
@@ -1341,6 +1361,20 @@ async fn main() -> Result<()> {
         .route("/groups", get(list_named_groups))
         // Static-prefix routes BEFORE /groups/:id so axum matches them first.
         .route("/groups/discover", get(discover_groups))
+        // Phase C.2: shard discovery + nearby + subscription management.
+        .route("/groups/discover/nearby", get(discover_groups_nearby))
+        .route(
+            "/groups/discover/subscriptions",
+            get(list_discovery_subscriptions),
+        )
+        .route(
+            "/groups/discover/subscribe",
+            post(create_discovery_subscription),
+        )
+        .route(
+            "/groups/discover/subscribe/:kind/:shard",
+            delete(delete_discovery_subscription),
+        )
         .route("/groups/cards/import", post(import_group_card))
         .route("/groups/cards/:id", get(get_group_card))
         .route("/groups/join", post(join_group_via_invite))
@@ -4431,9 +4465,12 @@ async fn publish_group_card_to_discovery_inner(
         save_named_groups(state).await;
     }
 
+    // Bridge-topic publish (kept for backward compat with older peers that
+    // haven't migrated to shard subscriptions yet). Phase C.2 adds shard
+    // fan-out below.
     let event = NamedGroupMetadataEvent::GroupCardPublished {
         group_id: group_id.to_string(),
-        card: signed_card,
+        card: signed_card.clone(),
     };
     match serde_json::to_vec(&event) {
         Ok(bytes) => match state
@@ -4458,6 +4495,52 @@ async fn publish_group_card_to_discovery_inner(
         },
         Err(e) => tracing::debug!("failed to serialize discovery card: {e}"),
     }
+
+    // Phase C.2: fan out to tag/name/id shards. PRIVACY GUARD — Hidden and
+    // ListedToContacts MUST NEVER reach public shards. This is enforced
+    // defensively here even though `to_group_card()` already returns None
+    // for Hidden (non-withdrawn) groups. ListedToContacts produces a card
+    // but we refuse to publish it on public shards — contact-scoped sync
+    // delivers those cards via the direct-message channel instead.
+    if !x0x::groups::may_publish_to_public_shards(signed_card.policy_summary.discoverability) {
+        if signed_card.policy_summary.discoverability
+            == x0x::groups::GroupDiscoverability::ListedToContacts
+        {
+            // Contact-scoped pairwise delivery: push the signed card via
+            // direct-message to each Trusted/Known contact. No public
+            // topic is touched.
+            publish_listed_to_contacts_card(state, signed_card.clone()).await;
+        } else {
+            tracing::debug!(
+                group_id,
+                discoverability = ?signed_card.policy_summary.discoverability,
+                "C.2: skipping fan-out (Hidden — stays local)"
+            );
+        }
+        return commit;
+    }
+
+    let shards =
+        x0x::groups::shards_for_public(&signed_card.tags, &signed_card.name, &signed_card.group_id);
+    for (kind, shard, key) in shards {
+        let topic = x0x::groups::topic_for(kind, shard);
+        let msg = x0x::groups::DirectoryMessage::Card {
+            card: Box::new(signed_card.clone()),
+        };
+        match state.agent.publish(&topic, msg.encode()).await {
+            Ok(()) => tracing::info!(
+                group_id = %signed_card.group_id,
+                topic = %topic,
+                %key,
+                "C.2: published signed card to shard"
+            ),
+            Err(e) => tracing::warn!(
+                topic = %topic,
+                "C.2: shard publish failed: {e}"
+            ),
+        }
+    }
+
     commit
 }
 
@@ -4561,6 +4644,454 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                                 "D.3: dropped stale card (already have higher rev)"
                             );
                         }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ────────────────────────── Phase C.2: shard subscriptions ──────────────
+
+/// Staggered-resubscribe jitter window, in milliseconds. Startup resubscribe
+/// picks a random delay in `[0, JITTER_MS)` per shard to avoid AE storms.
+const DIRECTORY_RESUBSCRIBE_JITTER_MS: u64 = 30_000;
+
+/// Interval between proactive digest emissions per subscribed shard, in
+/// seconds. Peers use these digests for AE reconciliation.
+const DIRECTORY_DIGEST_INTERVAL_SECS: u64 = 60;
+
+/// Load persisted directory subscriptions from disk (best-effort).
+async fn load_directory_subscriptions(state: &AppState) {
+    let path = &state.directory_subscriptions_path;
+    match tokio::fs::read(path).await {
+        Ok(bytes) => match serde_json::from_slice::<x0x::groups::SubscriptionSet>(&bytes) {
+            Ok(set) => {
+                let n = set.len();
+                *state.directory_subscriptions.write().await = set;
+                tracing::info!(
+                    "C.2: loaded {n} persisted directory subscriptions from {}",
+                    path.display()
+                );
+            }
+            Err(e) => tracing::warn!(
+                "C.2: failed to parse directory subscriptions file {}: {e}",
+                path.display()
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                "C.2: no persisted directory subscriptions at {}",
+                path.display()
+            );
+        }
+        Err(e) => tracing::warn!(
+            "C.2: failed to read directory subscriptions file {}: {e}",
+            path.display()
+        ),
+    }
+}
+
+/// Save the current subscription set to disk.
+async fn save_directory_subscriptions(state: &AppState) {
+    let set = state.directory_subscriptions.read().await.clone();
+    let path = state.directory_subscriptions_path.clone();
+    match serde_json::to_vec_pretty(&set) {
+        Ok(bytes) => {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                tracing::warn!(
+                    "C.2: failed to persist directory subscriptions to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => tracing::warn!("C.2: failed to serialise directory subscriptions: {e}"),
+    }
+}
+
+/// Subscribe to a single shard topic and spawn a listener. Idempotent:
+/// re-subscribing to an already-active shard is a no-op. Does not persist
+/// on its own — callers must call `save_directory_subscriptions` after
+/// mutating the subscription set.
+async fn subscribe_shard(state: Arc<AppState>, kind: x0x::groups::ShardKind, shard: u32) {
+    {
+        let tasks = state.directory_tasks.read().await;
+        if tasks.contains_key(&(kind, shard)) {
+            return;
+        }
+    }
+    let topic = x0x::groups::topic_for(kind, shard);
+    let mut sub = match state.agent.subscribe(&topic).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(topic = %topic, "C.2: failed to subscribe to shard: {e}");
+            return;
+        }
+    };
+    let state_for_listener = Arc::clone(&state);
+    let topic_for_log = topic.clone();
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    let handle = tokio::spawn(async move {
+        // Emit an initial digest on startup so peers can reciprocate.
+        emit_shard_digest(&state_for_listener, kind, shard).await;
+        let mut digest_ticker = tokio::time::interval(std::time::Duration::from_secs(
+            DIRECTORY_DIGEST_INTERVAL_SECS,
+        ));
+        digest_ticker.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                _ = digest_ticker.tick() => {
+                    emit_shard_digest(&state_for_listener, kind, shard).await;
+                }
+                maybe_msg = sub.recv() => {
+                    let Some(msg) = maybe_msg else { break; };
+                    handle_directory_message(&state_for_listener, kind, shard, &msg.payload).await;
+                }
+            }
+        }
+        tracing::info!(topic = %topic_for_log, "C.2: shard listener shut down");
+    });
+    state
+        .directory_tasks
+        .write()
+        .await
+        .insert((kind, shard), handle);
+    tracing::info!(topic = %topic, "C.2: subscribed to directory shard");
+}
+
+/// Unsubscribe from a shard (abort the listener task).
+async fn unsubscribe_shard(state: &AppState, kind: x0x::groups::ShardKind, shard: u32) {
+    if let Some(handle) = state.directory_tasks.write().await.remove(&(kind, shard)) {
+        handle.abort();
+        tracing::info!(
+            kind = ?kind,
+            shard,
+            "C.2: unsubscribed from directory shard"
+        );
+    }
+}
+
+/// Publish a digest of our known entries in a shard (AE summary).
+async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard: u32) {
+    let entries = state.directory_cache.read().await.shard_digest(kind, shard);
+    if entries.is_empty() {
+        return; // nothing to advertise yet
+    }
+    let msg = x0x::groups::DirectoryMessage::Digest {
+        shard,
+        kind,
+        entries,
+    };
+    let topic = x0x::groups::topic_for(kind, shard);
+    if let Err(e) = state.agent.publish(&topic, msg.encode()).await {
+        tracing::debug!(topic = %topic, "C.2: digest publish failed: {e}");
+    }
+}
+
+/// Re-publish our own signed cards for groups listed in a Pull request.
+async fn respond_to_pull(
+    state: &AppState,
+    kind: x0x::groups::ShardKind,
+    shard: u32,
+    group_ids: &[String],
+) {
+    let signing_kp = state.agent.identity().agent_keypair();
+    let topic = x0x::groups::topic_for(kind, shard);
+    let groups = state.named_groups.read().await;
+    for gid in group_ids {
+        // We only re-publish cards for groups we *own* / manage locally,
+        // not arbitrary cards from our cache (relays may re-publish cached
+        // blobs but cannot re-sign them). For cached cards, re-emit the
+        // already-signed copy unchanged.
+        if let Some(info) = groups.get(gid.as_str()) {
+            if !x0x::groups::may_publish_to_public_shards(info.policy.discoverability) {
+                continue;
+            }
+            if let Some(mut card) = info.to_group_card() {
+                if card.sign(signing_kp).is_ok() {
+                    let msg = x0x::groups::DirectoryMessage::Card {
+                        card: Box::new(card),
+                    };
+                    let _ = state.agent.publish(&topic, msg.encode()).await;
+                    continue;
+                }
+            }
+        }
+        // Fall back to re-broadcasting a cached card verbatim if we have one
+        // (relay-forward semantics).
+        if let Some(cached) = state.directory_cache.read().await.get(gid) {
+            let msg = x0x::groups::DirectoryMessage::Card {
+                card: Box::new(cached.clone()),
+            };
+            let _ = state.agent.publish(&topic, msg.encode()).await;
+        }
+    }
+}
+
+/// Handle one message arriving on a shard topic: Card / Digest / Pull.
+async fn handle_directory_message(
+    state: &AppState,
+    kind: x0x::groups::ShardKind,
+    shard: u32,
+    payload: &[u8],
+) {
+    let msg = match x0x::groups::DirectoryMessage::decode(payload) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(shard, ?kind, "C.2: dropped malformed directory msg: {e}");
+            return;
+        }
+    };
+    match msg {
+        x0x::groups::DirectoryMessage::Card { card } => {
+            // Require a signature on shard-delivered cards. Unsigned cards on
+            // a directory shard are treated as malformed (directory plane is
+            // authority-signed by construction) and dropped.
+            if card.signature.is_empty() {
+                tracing::debug!(
+                    group_id = %card.group_id,
+                    "C.2: dropped unsigned card on shard topic"
+                );
+                return;
+            }
+            if let Err(e) = card.verify_signature() {
+                tracing::warn!(
+                    group_id = %card.group_id,
+                    "C.2: dropped card with invalid signature: {e}"
+                );
+                return;
+            }
+            // Defensive privacy guard: a Hidden or ListedToContacts card must
+            // never appear on a public shard topic. Drop if seen.
+            if !x0x::groups::may_publish_to_public_shards(card.policy_summary.discoverability) {
+                tracing::warn!(
+                    group_id = %card.group_id,
+                    discoverability = ?card.policy_summary.discoverability,
+                    "C.2: dropped privacy-restricted card that leaked to public shard"
+                );
+                return;
+            }
+            let accepted = state
+                .directory_cache
+                .write()
+                .await
+                .insert(kind, shard, (*card).clone());
+            if accepted {
+                // Also update the legacy bridge cache so existing
+                // /groups/discover responses continue to reflect shard
+                // discoveries until D.4 deprecates that path.
+                if !card.withdrawn
+                    && card.policy_summary.discoverability
+                        != x0x::groups::GroupDiscoverability::Hidden
+                {
+                    state
+                        .group_card_cache
+                        .write()
+                        .await
+                        .insert(card.group_id.clone(), (*card).clone());
+                }
+                tracing::info!(
+                    group_id = %card.group_id,
+                    kind = ?kind,
+                    shard,
+                    revision = card.revision,
+                    "C.2: cached shard-delivered signed card"
+                );
+            }
+        }
+        x0x::groups::DirectoryMessage::Digest {
+            shard: peer_shard,
+            kind: peer_kind,
+            entries,
+        } => {
+            if peer_shard != shard || peer_kind != kind {
+                return;
+            }
+            let pulls = state
+                .directory_cache
+                .read()
+                .await
+                .pull_targets(kind, shard, &entries);
+            if !pulls.is_empty() {
+                let req = x0x::groups::DirectoryMessage::Pull {
+                    shard,
+                    kind,
+                    group_ids: pulls,
+                };
+                let topic = x0x::groups::topic_for(kind, shard);
+                let _ = state.agent.publish(&topic, req.encode()).await;
+            }
+        }
+        x0x::groups::DirectoryMessage::Pull {
+            shard: peer_shard,
+            kind: peer_kind,
+            group_ids,
+        } => {
+            if peer_shard != shard || peer_kind != kind {
+                return;
+            }
+            respond_to_pull(state, kind, shard, &group_ids).await;
+        }
+    }
+}
+
+/// Spawn all persisted shard subscriptions at startup, with jitter so the
+/// mesh doesn't storm on restart.
+async fn spawn_directory_resubscribe(state: Arc<AppState>) {
+    load_directory_subscriptions(&state).await;
+    let subs = state.directory_subscriptions.read().await.clone();
+    if subs.is_empty() {
+        return;
+    }
+    use rand::Rng;
+    for rec in subs.subscriptions {
+        let delay_ms = {
+            let mut rng = rand::thread_rng();
+            rng.gen_range(0..DIRECTORY_RESUBSCRIBE_JITTER_MS)
+        };
+        let state_for_spawn = Arc::clone(&state);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            subscribe_shard(state_for_spawn, rec.kind, rec.shard).await;
+        });
+    }
+}
+
+// ────────────────────── Phase C.2: ListedToContacts pairwise sync ───────
+
+/// Wire-framing prefix for a ListedToContacts card delivered over the
+/// direct-message channel. 16 bytes so receivers can do a single
+/// constant-length prefix match. Payload after the prefix is the JSON
+/// encoding of a signed [`x0x::groups::GroupCard`].
+const LTC_CARD_FRAME_PREFIX: &[u8; 16] = b"X0X-LTC-CARD-V1\n";
+
+/// Push a signed `ListedToContacts` `GroupCard` to each Trusted/Known
+/// contact via direct-message. Skips contacts we have no record of, any
+/// Blocked contacts, and the sender itself.
+///
+/// This is the privacy-correct distribution path for
+/// `ListedToContacts` groups: no public topic is touched. Delivery is
+/// O(N contacts), acceptable for the cardinality of this feature.
+async fn publish_listed_to_contacts_card(state: &AppState, card: x0x::groups::GroupCard) {
+    use x0x::contacts::TrustLevel;
+    let contacts = state.contacts.read().await;
+    let my_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let json = match serde_json::to_vec(&card) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(group_id = %card.group_id, "C.2/LTC: card serialize failed: {e}");
+            return;
+        }
+    };
+    let mut payload = Vec::with_capacity(LTC_CARD_FRAME_PREFIX.len() + json.len());
+    payload.extend_from_slice(LTC_CARD_FRAME_PREFIX);
+    payload.extend_from_slice(&json);
+
+    // Enumerate Trusted + Known contacts. Blocked and Unknown are skipped.
+    for contact in contacts.list() {
+        if contact.trust_level == TrustLevel::Blocked || contact.trust_level == TrustLevel::Unknown
+        {
+            continue;
+        }
+        let hex_id = hex::encode(contact.agent_id.as_bytes());
+        if hex_id == my_hex {
+            continue;
+        }
+        match state
+            .agent
+            .send_direct(&contact.agent_id, payload.clone())
+            .await
+        {
+            Ok(()) => tracing::info!(
+                group_id = %card.group_id,
+                recipient = %hex_id,
+                trust = ?contact.trust_level,
+                "C.2/LTC: delivered signed card to contact"
+            ),
+            Err(e) => tracing::debug!(
+                group_id = %card.group_id,
+                recipient = %hex_id,
+                "C.2/LTC: contact delivery failed: {e}"
+            ),
+        }
+    }
+}
+
+/// Background listener that consumes inbound direct messages and, when it
+/// sees an LTC-framed envelope, verifies the card signature and caches it
+/// in `group_card_cache` (never on public shards).
+async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
+    let mut direct_rx = state.agent.subscribe_direct();
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                maybe = direct_rx.recv() => {
+                    let Some(msg) = maybe else { break; };
+                    if msg.payload.len() < LTC_CARD_FRAME_PREFIX.len() {
+                        continue;
+                    }
+                    if &msg.payload[..LTC_CARD_FRAME_PREFIX.len()] != LTC_CARD_FRAME_PREFIX {
+                        continue;
+                    }
+                    let json = &msg.payload[LTC_CARD_FRAME_PREFIX.len()..];
+                    let card: x0x::groups::GroupCard = match serde_json::from_slice(json) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!("C.2/LTC: malformed card JSON: {e}");
+                            continue;
+                        }
+                    };
+                    // Require a signature; unsigned LTC cards are dropped.
+                    if card.signature.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = card.verify_signature() {
+                        tracing::warn!(
+                            group_id = %card.group_id,
+                            "C.2/LTC: dropped card with invalid signature: {e}"
+                        );
+                        continue;
+                    }
+                    // Defensive privacy guard: even via LTC delivery, a
+                    // card whose discoverability is not ListedToContacts
+                    // should not be cached as if it were. Accept only
+                    // ListedToContacts cards on this path.
+                    if card.policy_summary.discoverability
+                        != x0x::groups::GroupDiscoverability::ListedToContacts
+                    {
+                        tracing::warn!(
+                            group_id = %card.group_id,
+                            "C.2/LTC: dropped non-LTC card on contact channel"
+                        );
+                        continue;
+                    }
+                    if card.withdrawn {
+                        state.group_card_cache.write().await.remove(&card.group_id);
+                        tracing::info!(
+                            group_id = %card.group_id,
+                            "C.2/LTC: evicted withdrawn card from contact cache"
+                        );
+                        continue;
+                    }
+                    let mut cache = state.group_card_cache.write().await;
+                    let insert = match cache.get(&card.group_id) {
+                        Some(existing) => card.supersedes(existing),
+                        None => true,
+                    };
+                    if insert {
+                        tracing::info!(
+                            group_id = %card.group_id,
+                            sender = %hex::encode(msg.sender.as_bytes()),
+                            revision = card.revision,
+                            "C.2/LTC: cached ListedToContacts card from contact"
+                        );
+                        cache.insert(card.group_id.clone(), card);
                     }
                 }
             }
@@ -6838,9 +7369,30 @@ async fn cancel_join_request(
 }
 
 /// GET /groups/discover — list locally known discoverable groups.
-async fn discover_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn discover_groups(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
     let mut cards: HashMap<String, x0x::groups::GroupCard> =
         state.group_card_cache.read().await.clone();
+    // Phase C.2: merge in shard-cache contents. Entries keyed by group_id;
+    // higher-revision wins on collision.
+    {
+        let shard_cache = state.directory_cache.read().await;
+        for card in shard_cache.iter_all() {
+            let entry = cards.entry(card.group_id.clone());
+            match entry {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(card.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if card.supersedes(o.get()) {
+                        o.insert(card.clone());
+                    }
+                }
+            }
+        }
+    }
     // Also synthesize cards for any local groups the caller owns that are discoverable.
     let groups = state.named_groups.read().await;
     for info in groups.values() {
@@ -6848,10 +7400,194 @@ async fn discover_groups(State(state): State<Arc<AppState>>) -> impl IntoRespons
             cards.entry(info.mls_group_id.clone()).or_insert(card);
         }
     }
-    let list: Vec<&x0x::groups::GroupCard> = cards.values().collect();
+    let mut list: Vec<x0x::groups::GroupCard> = cards.into_values().collect();
+    // Phase C.2: honour `?q=` by filtering cards through the shard-cache
+    // search helper (matches tag/name/id case-insensitively).
+    if let Some(q) = params.get("q") {
+        if !q.trim().is_empty() {
+            let q_lc = q.trim().to_lowercase();
+            list.retain(|c| {
+                c.name.to_lowercase().contains(&q_lc)
+                    || c.tags.iter().any(|t| t.to_lowercase().contains(&q_lc))
+                    || c.group_id == q_lc
+            });
+        }
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "groups": list })),
+    )
+}
+
+/// GET /groups/discover/nearby — Phase C.2 presence-social browse.
+///
+/// Returns discoverable group cards weighted toward groups that peers
+/// reachable in the current partition are actively using. Privacy rules:
+/// - `Hidden` never appears.
+/// - `ListedToContacts` never appears on this endpoint (only on
+///   contact-scoped surfaces).
+/// - `PublicDirectory` appears subject to local presence/cache.
+///
+/// In this v1 implementation we weight purely by "is there at least one
+/// cached card for this group"; tighter FOAF-based weighting is follow-up
+/// work. The important privacy guarantees (no-leak for Hidden /
+/// ListedToContacts) are enforced here.
+async fn discover_groups_nearby(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut out: Vec<x0x::groups::GroupCard> = Vec::new();
+    // Shard cache first — these are cards we've seen via shard gossip.
+    {
+        let shard_cache = state.directory_cache.read().await;
+        for card in shard_cache.iter_all() {
+            if card.withdrawn {
+                continue;
+            }
+            if card.policy_summary.discoverability
+                != x0x::groups::GroupDiscoverability::PublicDirectory
+            {
+                continue;
+            }
+            if seen.insert(card.group_id.clone()) {
+                out.push(card.clone());
+            }
+        }
+    }
+    // Local groups we own that are PublicDirectory — merge them in.
+    {
+        let groups = state.named_groups.read().await;
+        for info in groups.values() {
+            if info.policy.discoverability != x0x::groups::GroupDiscoverability::PublicDirectory {
+                continue;
+            }
+            if let Some(card) = info.to_group_card() {
+                if seen.insert(card.group_id.clone()) {
+                    out.push(card);
+                }
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "groups": out })),
+    )
+}
+
+/// GET /groups/discover/subscriptions — list active shard subscriptions.
+async fn list_discovery_subscriptions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let subs = state.directory_subscriptions.read().await.clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "count": subs.len(),
+            "subscriptions": subs.subscriptions,
+        })),
+    )
+}
+
+/// POST /groups/discover/subscribe — subscribe to a shard derived from
+/// either `{ "kind": "tag|name|id", "key": "<token>" }` (shard is computed
+/// from the normalised key), or `{ "kind": "...", "shard": <u32> }` if
+/// the caller already knows the shard id.
+#[derive(Debug, Deserialize)]
+struct SubscribeDiscoveryRequest {
+    kind: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    shard: Option<u32>,
+}
+
+async fn create_discovery_subscription(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SubscribeDiscoveryRequest>,
+) -> impl IntoResponse {
+    let Some(kind) = x0x::groups::ShardKind::from_str(&req.kind) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "kind must be 'tag', 'name', or 'id'"
+            })),
+        );
+    };
+    let (shard, key) = match (req.shard, req.key.as_deref()) {
+        (Some(s), k) => (s, k.map(str::to_string)),
+        (None, Some(k)) => {
+            let normalised = match kind {
+                x0x::groups::ShardKind::Tag => x0x::groups::normalize_tag(k),
+                x0x::groups::ShardKind::Name => k.trim().to_lowercase(),
+                x0x::groups::ShardKind::Id => k.to_string(),
+            };
+            (x0x::groups::shard_of(kind, &normalised), Some(normalised))
+        }
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "either 'shard' or 'key' is required"
+                })),
+            );
+        }
+    };
+    if state.directory_subscriptions.read().await.len() >= x0x::groups::DEFAULT_MAX_SUBSCRIPTIONS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "subscription limit reached"
+            })),
+        );
+    }
+    let rec = x0x::groups::SubscriptionRecord {
+        kind,
+        shard,
+        key,
+        subscribed_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    let newly_added = state.directory_subscriptions.write().await.add(rec);
+    save_directory_subscriptions(&state).await;
+    subscribe_shard(Arc::clone(&state), kind, shard).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "newly_added": newly_added,
+            "kind": kind,
+            "shard": shard,
+            "topic": x0x::groups::topic_for(kind, shard),
+        })),
+    )
+}
+
+/// DELETE /groups/discover/subscribe/:kind/:shard — unsubscribe from a shard.
+async fn delete_discovery_subscription(
+    State(state): State<Arc<AppState>>,
+    Path((kind_str, shard)): Path<(String, u32)>,
+) -> impl IntoResponse {
+    let Some(kind) = x0x::groups::ShardKind::from_str(&kind_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "kind must be 'tag', 'name', or 'id'"
+            })),
+        );
+    };
+    let existed = state
+        .directory_subscriptions
+        .write()
+        .await
+        .remove(kind, shard);
+    save_directory_subscriptions(&state).await;
+    unsubscribe_shard(&state, kind, shard).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "existed": existed })),
     )
 }
 

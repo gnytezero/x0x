@@ -593,6 +593,35 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "List locally known discoverable groups",
         category: "named-groups",
     },
+    // ── Phase C.2: shard-based distributed discovery ─────────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/discover/nearby",
+        cli_name: "group discover-nearby",
+        description: "Presence-social browse of PublicDirectory groups",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/discover/subscriptions",
+        cli_name: "group discover-subscriptions",
+        description: "List active shard subscriptions",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/discover/subscribe",
+        cli_name: "group discover-subscribe",
+        description: "Subscribe to a tag/name/id directory shard",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/groups/discover/subscribe/:kind/:shard",
+        cli_name: "group discover-unsubscribe",
+        description: "Unsubscribe from a directory shard",
+        category: "named-groups",
+    },
     EndpointDef {
         method: Method::Get,
         path: "/groups/cards/:id",

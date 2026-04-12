@@ -233,7 +233,45 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
+| GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
+| GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
+| POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
+| DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave or delete the group |
+
+### Phase C.2 — distributed shard discovery
+
+x0x indexes `PublicDirectory` groups across **tag / name / exact-id
+shards** over PlumTree gossip. No DHT, no special node roles.
+
+Topic format: `x0x.directory.{tag|name|id}.{shard}` where
+`shard = BLAKE3(domain || lowercase(key)) % 65536`.
+
+- A group's tags fan out to tag shards (one per tag).
+- The group name fans out to name shards (one per whitespace-delimited word).
+- The `group_id` fans out to exactly one id shard.
+
+Peers subscribe to shards of interest via
+`POST /groups/discover/subscribe {"kind":"tag","key":"ai"}`. Subscriptions
+persist to `~/.x0x/directory-subscriptions.json` and are restored on
+restart with random jitter (0–30s) to avoid anti-entropy storms.
+
+Messages on shard topics are `DirectoryMessage::{Card, Digest, Pull}`:
+- `Card` — signed `GroupCard` (data plane). Receivers verify the
+  authority signature before caching; unsigned or bad-sig cards are
+  dropped. A defensive check drops any non-PublicDirectory card that
+  leaks onto a public shard.
+- `Digest` — periodic AE summary of known entries
+  `(group_id, revision, state_hash, expires_at)`.
+- `Pull` — peer asks the authority to re-broadcast specific group_ids
+  it's missing or has at a stale revision.
+
+**Privacy contract (hard guarantees):**
+- `Hidden` — never published to any topic.
+- `ListedToContacts` — never published to public shards; delivered
+  pairwise to Trusted/Known contacts via direct-message framing
+  (`X0X-LTC-CARD-V1\n<card-json>`).
+- `PublicDirectory` — published to tag + name + id shards.
 
 ### Phase D.3 — state-commit chain
 
