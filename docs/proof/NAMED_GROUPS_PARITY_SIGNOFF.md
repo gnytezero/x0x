@@ -38,9 +38,9 @@ unrecorded gap (zero across all surfaces below).
 | **x0xd REST** | **36 / 36** | `tests/api_coverage.rs` — every route handler in `src/bin/x0xd.rs` is in `ENDPOINTS` and has a test entry. 12 tests. | `tests/e2e_named_groups.sh` — 98 REST-driven assertions over a 3-daemon mesh; 3× clean archived. |
 | **x0x CLI** | **36 / 36** | `tests/parity_cli.rs` — spawns `x0x <cli_name> --help` for every endpoint. | `tests/e2e_feature_parity.sh` — 18 assertions per run, 3× clean archived. |
 | **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **23 / 36** wired, 13 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness queued for Phase 7. |
-| **Communitas Rust client** | **33 / 33** named-groups | `parity_manifest.rs` (vendored manifest copy). 14 tests. | `live_mutation_contract.rs`. |
+| **Communitas Rust client** | **36 / 36** named-groups | `parity_manifest.rs` (vendored manifest copy). The IMPLEMENTED list contains 36 entries; the test fails if any named-groups endpoint in the vendored manifest has no client method. 14 tests. | `live_mutation_contract.rs`. |
 | **Communitas Dioxus UI** | consumes the Rust client; UI surfaces `enum SpacePreset`, discover view, admin sheet, requests panel | preset round-trip unit test; 419/419 unit tests | UI driver queued for Phase 7. |
-| **Communitas Swift client** | **33 / 33** named-groups | `swift_parity.rs` — every Rust method has a Swift counterpart. | `swift test` — 42/42 pass. |
+| **Communitas Swift client** | **36 / 36** named-groups (every Rust method has a Swift counterpart) | `swift_parity.rs` — `parity_map_covers_all_rust_methods` walks `client.rs` for every public method and `swift_client_has_all_rust_methods` greps the Swift source for each one. | `swift test` — 42/42 pass. |
 | **Communitas SwiftUI** | preset picker, discover sheet, manage sheet (policy + state + roster + requests) | `swift build` clean | XCUITest queued for Phase 7. |
 
 ## Embedded GUI — explicit DEFERRED list (13 endpoints)
