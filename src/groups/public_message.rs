@@ -398,6 +398,48 @@ mod tests {
     }
 
     #[test]
+    fn verify_detects_state_hash_tamper() {
+        let kp = make_kp();
+        let mut msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
+        msg.state_hash_at_send = "state-hash-tampered".into();
+        assert!(msg.verify_signature().is_err());
+    }
+
+    #[test]
+    fn verify_detects_revision_tamper() {
+        let kp = make_kp();
+        let mut msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
+        msg.revision_at_send = 99;
+        assert!(msg.verify_signature().is_err());
+    }
+
+    #[test]
+    fn verify_detects_timestamp_tamper() {
+        let kp = make_kp();
+        let mut msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
+        msg.timestamp = 42_424;
+        assert!(msg.verify_signature().is_err());
+    }
+
+    #[test]
+    fn verify_detects_user_id_tamper() {
+        let kp = make_kp();
+        let mut msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            Some("deadbeef".into()),
+            GroupPublicMessageKind::Chat,
+            "x".into(),
+            1_000,
+        )
+        .unwrap();
+        msg.author_user_id = Some("cafebabe".into());
+        assert!(msg.verify_signature().is_err());
+    }
+
+    #[test]
     fn ingest_rejects_group_id_mismatch() {
         let kp = make_kp();
         let msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);

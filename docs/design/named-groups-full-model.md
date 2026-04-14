@@ -17,10 +17,10 @@ Implementation is in progress across multiple phases and branches. This document
 | Phase C | Discovery cards | Define public/contact-scoped discovery objects and manual import/bootstrap | **landed (bridge-level)** |
 | Phase D.2 | Secure share distribution | Cross-daemon sealed rekey-on-ban via ML-KEM-768 envelopes (interim) | **landed** |
 | Phase D.3 | Stable identity + state commits | `GroupGenesis`, `GroupStateCommit`, signed `GroupCard`, apply-side validation, withdrawal supersession | **landed** |
-| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **code landed, proof-debt open** — see `.planning/c2-proof-hardening.md` |
-| Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | **landed** |
-| Phase D.4 | Strict apply-side enforcement | Move every state-changing action through `apply_event`; secure/roster binding invariant tests | planned |
-| Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence | planned |
+| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **landed with clean live proof** — see `tests/proof-reports/PHASE_C2_REPORT.md` |
+| Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | **landed with live receive proof** — see `tests/proof-reports/PHASE_E_REPORT.md` |
+| Phase D.4 | Strict apply-side enforcement | Move every state-changing action through `apply_event`; secure/roster binding invariant tests | **working-tree landed with live proof; commit/merge state may lag** — see `tests/proof-reports/PHASE_D4_REPORT.md` |
+| Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence | **final hostile review / signoff candidate** — see `tests/proof-reports/PHASE_F_FINAL_SIGNOFF_REVIEW.md` |
 
 ### Phase D.3 implementation notes
 
@@ -46,11 +46,47 @@ Phase D.3 landed these primitives:
   enforces higher-revision supersession + withdrawal eviction
   regardless of TTL.
 
-**Not yet migrated to apply_event in Phase D.3**: the existing
-per-action metadata events (`MemberAdded`, `PolicyUpdated`, etc.) still
-use the pre-D.3 per-field revision counters (`policy_revision`,
-`roster_revision`). Phase D.4 completes the migration so every
-state-changing action flows through `seal_commit`/`apply_commit`.
+**Superseded by Phase D.4**: the remaining state-bearing metadata
+variants are now commit-wired. Per-field revision counters still exist
+for compatibility / response semantics, but the authoritative apply-side
+accept/reject gate is the signed `GroupStateCommit` chain.
+
+### Phase D.4 implementation notes
+
+Phase D.4 landed strict apply-side commit wiring for the remaining
+metadata-plane state changes:
+
+- `NamedGroupMetadataEvent` now carries a signed `GroupStateCommit` on
+  the state-bearing variants (`MemberAdded`, `MemberRemoved`,
+  `GroupDeleted`, `PolicyUpdated`, `MemberRoleUpdated`, `MemberBanned`,
+  `MemberUnbanned`, the join-request variants, and
+  `GroupMetadataUpdated`).
+- Receivers now validate the signed commit against the **pre-mutation**
+  view, mirror the payload mutation into a cloned `GroupInfo`, then call
+  `finalize_applied_commit(...)` to verify the recomputed post-mutation
+  `state_hash` matches the signed commit.
+- This closes the biggest D.3 caveat for metadata/roster actions:
+  accept/reject no longer depends only on ad-hoc `roster_revision` /
+  `policy_revision` comparisons.
+- Invite/join seeding now carries the authority's stable `group_id`,
+  `genesis_creation_nonce`, and policy/description snapshot so later D.4
+  commits can chain on peers that joined via invite without exposing a
+  divergent `genesis` payload.
+- Owner-authored metadata events now publish the stable D.3 `group_id`
+  rather than a local routing key, so imported stable-id stubs can apply
+  reject/approve/etc. updates correctly.
+- Imported discoverable stubs now accept a `metadata_topic` bootstrap hint
+  from the card so non-members can publish join-request events to the
+  authority's real metadata topic; newly signed cards bind that field in the
+  v2 card signature domain, while verification retains a legacy fallback for
+  older cards that omit it.
+- Deterministic pair-harness proof lives in `tests/named_group_d4_apply.rs`;
+  report in `tests/proof-reports/PHASE_D4_REPORT.md`.
+
+**Phase F status at current working-tree HEAD:** the dedicated live suites are
+clean, and the named-groups shell runner now has repeatable clean archived runs.
+The remaining work is procedural rather than architectural: merge/commit-state
+alignment, final review wording, and proof-artifact hygiene.
 
 ### Phase C.2 implementation notes
 
@@ -83,6 +119,10 @@ Phase C.2 landed the distributed discovery index:
 - `ListedToContacts` never reaches public shards (direct-message only).
 - Incoming shard cards whose claimed discoverability is not
   `PublicDirectory` are dropped silently (log-warn).
+
+The earlier `ListedToContacts` bridge leak found during hostile review is now
+fixed on both publish and receive paths, and Phase C.2 has three archived clean
+live proof runs plus a clean named-groups shell rerun.
 
 **What C.2 does NOT yet deliver (scope-bounded):**
 - FOAF-weighted nearby ranking — the endpoint returns all reachable
@@ -132,21 +172,23 @@ Phase E landed SignedPublic messaging:
   a new peer sees only what arrives while the listener is live).
 - Federation with external directory servers.
 
-**Open C.2 proof-debt** (tracked in
-[`.planning/c2-proof-hardening.md`](../../.planning/c2-proof-hardening.md)):
+**C.2 proof-hardening status:** closed.
 
-1. Positive live shard-delivery proof (path-attributed or bridge-
-   disabled) — current `/groups/discover` is path-ambiguous because
-   the bridge topic still dual-publishes.
-2. Live anti-entropy repair proof (late subscriber converges via
-   digest/pull without re-publish).
-3. LTC positive delivery proof (Trusted contact receives via LTC
-   direct path; Unknown/Blocked does not).
-4. Subscription persistence across daemon restart.
+The earlier C.2 proof-debt items are now covered by dedicated live proof:
 
-Until these close, C.2 is presented as "code landed and well-covered
-by unit/integration tests; live e2e proof incomplete," not as "fully
-proven."
+1. Positive shard-only nearby witness
+2. Late-subscriber digest/pull repair
+3. `ListedToContacts` positive + negative delivery proof
+4. Subscription persistence across daemon restart
+
+Canonical evidence:
+- `tests/proof-reports/PHASE_C2_REPORT.md`
+- `tests/proof-reports/named-groups-c2-hardening-run1.log`
+- `tests/proof-reports/named-groups-c2-hardening-run2.log`
+- `tests/proof-reports/named-groups-c2-hardening-run3.log`
+
+C.2 should no longer be described as "proof-debt open" at current
+working-tree HEAD.
 
 ### Honest v1 secure model
 

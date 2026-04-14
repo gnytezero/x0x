@@ -421,9 +421,21 @@ impl GroupInfo {
             group_id: self.stable_group_id(),
         };
         state_commit::validate_apply(&ctx, commit, action_kind)?;
+        self.finalize_applied_commit(commit)
+    }
 
-        // After the caller has mutated local state to mirror the committed
-        // action, verify our recomputed hash matches the commit's claim.
+    /// Finalize a commit **after** the caller has already performed
+    /// any action-specific pre-validation and mirrored the payload
+    /// mutation into `self`.
+    ///
+    /// This is the second half of D.4 apply-side handling: callers may
+    /// need the pre-mutation roster view to validate signer authority
+    /// (e.g. self-leave), then mutate local state, then verify the
+    /// recomputed post-mutation hash matches the signed commit.
+    pub fn finalize_applied_commit(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
         self.state_revision = commit.revision;
         self.prev_state_hash = commit.prev_state_hash.clone();
         self.withdrawn = commit.withdrawn;
@@ -446,7 +458,7 @@ impl GroupInfo {
         Some(Self::derive_message_key(
             secret,
             self.secret_epoch,
-            &self.mls_group_id,
+            self.stable_group_id(),
         ))
     }
 
@@ -761,6 +773,7 @@ impl GroupInfo {
             created_at: self.created_at,
             updated_at: self.updated_at,
             request_access_enabled: self.policy.admission == GroupAdmission::RequestAccess,
+            metadata_topic: Some(self.metadata_topic.clone()),
             revision: self.state_revision,
             state_hash: self.state_hash.clone(),
             prev_state_hash: self.prev_state_hash.clone(),

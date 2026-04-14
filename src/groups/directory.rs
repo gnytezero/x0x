@@ -45,6 +45,11 @@ pub struct GroupCard {
     pub created_at: u64,
     pub updated_at: u64,
     pub request_access_enabled: bool,
+    /// Bootstrap hint for non-member stubs so they can publish metadata-plane
+    /// request events to the authority's actual topic. For newly signed cards
+    /// this field is part of the v2 card signature domain.
+    #[serde(default)]
+    pub metadata_topic: Option<String>,
 
     // ── Phase D.3: state-commit binding and authority signature ─────────
     /// Monotonic revision of the signed state commit this card represents.
@@ -81,9 +86,7 @@ pub struct GroupCard {
 }
 
 impl GroupCard {
-    /// Canonical bytes signed by the authority to produce `signature`.
-    #[must_use]
-    pub fn signable_bytes(&self) -> Vec<u8> {
+    fn signable_bytes_legacy(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(512);
         buf.extend_from_slice(CARD_SIGNATURE_DOMAIN);
         push_len_prefixed(&mut buf, self.group_id.as_bytes());
@@ -105,9 +108,6 @@ impl GroupCard {
             &mut buf,
             self.banner_url.as_deref().unwrap_or("").as_bytes(),
         );
-        // Tags: length-prefixed count, sorted-deduped bytes so tag reorder
-        // or duplicates don't change the signature input (matches
-        // compute_public_meta_hash ordering in state_commit.rs).
         let mut tags = self.tags.clone();
         tags.sort();
         tags.dedup();
@@ -115,7 +115,6 @@ impl GroupCard {
         for t in &tags {
             push_len_prefixed(&mut buf, t.as_bytes());
         }
-        // Policy summary: bincode is deterministic for simple structs.
         let policy_bytes = bincode::serialize(&self.policy_summary).unwrap_or_default();
         push_len_prefixed(&mut buf, &policy_bytes);
         push_len_prefixed(&mut buf, self.owner_agent_id.as_bytes());
@@ -127,6 +126,17 @@ impl GroupCard {
         buf.push(if self.withdrawn { 1 } else { 0 });
         push_len_prefixed(&mut buf, self.authority_agent_id.as_bytes());
         push_len_prefixed(&mut buf, self.authority_public_key.as_bytes());
+        buf
+    }
+
+    /// Canonical v2 bytes signed by the authority to produce `signature`.
+    #[must_use]
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut buf = self.signable_bytes_legacy();
+        push_len_prefixed(
+            &mut buf,
+            self.metadata_topic.as_deref().unwrap_or("").as_bytes(),
+        );
         buf
     }
 
@@ -171,8 +181,17 @@ impl GroupCard {
             .map_err(|e| ApplyError::InvalidSignature(format!("bad sig hex: {e}")))?;
         let sig = MlDsaSignature::from_bytes(&sig_bytes)
             .map_err(|e| ApplyError::InvalidSignature(format!("bad sig: {e:?}")))?;
-        verify_with_ml_dsa(&pubkey, &self.signable_bytes(), &sig)
-            .map_err(|e| ApplyError::InvalidSignature(format!("card verify failed: {e:?}")))
+        if verify_with_ml_dsa(&pubkey, &self.signable_bytes(), &sig).is_ok() {
+            return Ok(());
+        }
+        if self.metadata_topic.is_none()
+            && verify_with_ml_dsa(&pubkey, &self.signable_bytes_legacy(), &sig).is_ok()
+        {
+            return Ok(());
+        }
+        Err(ApplyError::InvalidSignature(
+            "card verify failed for both v2 and legacy domains".into(),
+        ))
     }
 
     /// Seconds-since-epoch convenience for default card TTL.
@@ -232,6 +251,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             request_access_enabled: true,
+            metadata_topic: None,
             revision: 1,
             state_hash: "sh-1".into(),
             prev_state_hash: None,
@@ -336,5 +356,29 @@ mod tests {
     fn unsigned_card_verify_fails() {
         let c = sample_card();
         assert!(c.verify_signature().is_err());
+    }
+
+    #[test]
+    fn metadata_topic_is_bound_in_v2_signature() {
+        let kp = AgentKeypair::generate().unwrap();
+        let mut c = sample_card();
+        c.metadata_topic = Some("x0x.group.test.meta".into());
+        c.sign(&kp).unwrap();
+        c.verify_signature().unwrap();
+
+        let mut bad = c.clone();
+        bad.metadata_topic = Some("x0x.group.evil.meta".into());
+        assert!(bad.verify_signature().is_err());
+    }
+
+    #[test]
+    fn legacy_card_without_metadata_topic_still_verifies() {
+        let kp = AgentKeypair::generate().unwrap();
+        let mut c = sample_card();
+        c.authority_agent_id = hex::encode(kp.agent_id().as_bytes());
+        c.authority_public_key = hex::encode(kp.public_key().as_bytes());
+        let sig = sign_with_ml_dsa(kp.secret_key(), &c.signable_bytes_legacy()).unwrap();
+        c.signature = hex::encode(sig.as_bytes());
+        c.verify_signature().unwrap();
     }
 }

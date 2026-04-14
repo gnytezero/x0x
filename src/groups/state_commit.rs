@@ -475,9 +475,9 @@ pub enum ActionKind {
     /// Admin or higher: add/remove member, approve/reject request, ban, unban,
     /// role-change-of-member-or-below, metadata edit.
     AdminOrHigher,
-    /// Member-self: cancel own pending join request.
+    /// Active-member self-action (e.g. leave group).
     MemberSelf,
-    /// Non-member: create join request on a `RequestAccess` group.
+    /// Non-member or pending-requester action (e.g. create/cancel join request).
     NonMemberRequest,
 }
 

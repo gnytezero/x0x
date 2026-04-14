@@ -4,6 +4,7 @@
 //! Provides `AgentCluster` which manages 3 x0xd daemon processes
 //! (alice, bob, charlie) with mutual discovery for multi-agent testing.
 
+use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -12,6 +13,8 @@ use tokio::sync::OnceCell;
 /// A single x0xd daemon instance.
 pub struct AgentInstance {
     process: Child,
+    binary: PathBuf,
+    config_path: PathBuf,
     /// Instance name (e.g., "alice-12345").
     pub name: String,
     /// API address (e.g., "127.0.0.1:19101").
@@ -19,11 +22,67 @@ pub struct AgentInstance {
     /// Bearer token for authentication.
     pub api_token: String,
     /// Data directory (cleaned up on drop if temp).
-    _data_dir: PathBuf,
+    data_dir: PathBuf,
 }
 
 #[allow(dead_code)]
 impl AgentInstance {
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    pub fn directory_subscriptions_path(&self) -> PathBuf {
+        self.data_dir.join("directory-subscriptions.json")
+    }
+
+    pub async fn restart(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        self.process = Command::new(&self.binary)
+            .arg("--config")
+            .arg(&self.config_path)
+            .arg("--name")
+            .arg(&self.name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
+        self.refresh_runtime_state().await;
+    }
+
+    async fn refresh_runtime_state(&mut self) {
+        let api_addr = self.api_addr.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let client = reqwest::Client::new();
+        loop {
+            if let Ok(resp) = client.get(format!("http://{api_addr}/health")).send().await {
+                if resp.status().is_success() {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("x0xd {} did not become healthy within 30s", self.name);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let token_file = self.data_dir.join("api-token");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(token) = std::fs::read_to_string(&token_file) {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    self.api_token = token;
+                    return;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("Cannot find api-token for {}", self.name);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Full URL for a given API path.
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.api_addr, path)
@@ -159,25 +218,40 @@ pub async fn cluster() -> &'static AgentCluster {
 
 /// Start a fresh two-daemon pair with Bob bootstrapping to Alice.
 pub async fn pair() -> AgentPair {
+    pair_with_extra_config("").await
+}
+
+pub async fn trio_with_extra_config(extra_config: &str) -> AgentCluster {
+    create_cluster_with_extra_config(extra_config).await
+}
+
+/// Start a fresh pair with the same extra TOML appended to each daemon's
+/// generated config. Useful for test-only timing overrides.
+pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let base: u16 = 19300 + (suffix % 200) * 2;
+    let alice_api = allocate_unused_tcp_port();
+    let alice_bind = allocate_unused_udp_port();
+    let bob_api = allocate_unused_tcp_port();
+    let bob_bind = allocate_unused_udp_port();
 
     let alice = start_instance(
         &binary,
         &format!("pair-alice-{suffix}"),
-        base + 1,
-        base + 101,
+        alice_api,
+        alice_bind,
         "",
+        extra_config,
     )
     .await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     let bob = start_instance(
         &binary,
         &format!("pair-bob-{suffix}"),
-        base + 2,
-        base + 102,
-        &format!("bootstrap_peers = [\"127.0.0.1:{}\"]", base + 101),
+        bob_api,
+        bob_bind,
+        &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
+        extra_config,
     )
     .await;
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -195,15 +269,33 @@ const ROLLING_START_DELAY: Duration = Duration::from_secs(15);
 const MESH_SETTLE_TIME: Duration = Duration::from_secs(5);
 
 async fn create_cluster() -> AgentCluster {
+    create_cluster_with_extra_config("").await
+}
+
+async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
+    let alice_api = allocate_unused_tcp_port();
+    let alice_bind = allocate_unused_udp_port();
+    let bob_api = allocate_unused_tcp_port();
+    let bob_bind = allocate_unused_udp_port();
+    let charlie_api = allocate_unused_tcp_port();
+    let charlie_bind = allocate_unused_udp_port();
 
     // Rolling start: each node needs time for its QUIC listener to bind and
     // mDNS/bootstrap to propagate before the next node comes up. Starting
     // all three simultaneously causes connection races and mesh instability.
 
     eprintln!("[cluster] starting alice...");
-    let alice = start_instance(&binary, &format!("test-alice-{suffix}"), 19101, 19001, "").await;
+    let alice = start_instance(
+        &binary,
+        &format!("test-alice-{suffix}"),
+        alice_api,
+        alice_bind,
+        "",
+        extra_config,
+    )
+    .await;
 
     eprintln!(
         "[cluster] waiting {}s for alice to stabilise before starting bob...",
@@ -215,9 +307,10 @@ async fn create_cluster() -> AgentCluster {
     let bob = start_instance(
         &binary,
         &format!("test-bob-{suffix}"),
-        19102,
-        19002,
-        "bootstrap_peers = [\"127.0.0.1:19001\"]",
+        bob_api,
+        bob_bind,
+        &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
+        extra_config,
     )
     .await;
 
@@ -231,9 +324,10 @@ async fn create_cluster() -> AgentCluster {
     let charlie = start_instance(
         &binary,
         &format!("test-charlie-{suffix}"),
-        19103,
-        19003,
-        "bootstrap_peers = [\"127.0.0.1:19001\"]",
+        charlie_api,
+        charlie_bind,
+        &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
+        extra_config,
     )
     .await;
 
@@ -309,14 +403,32 @@ fn find_x0xd_binary() -> PathBuf {
     );
 }
 
+fn allocate_unused_tcp_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral TCP port")
+        .local_addr()
+        .expect("tcp local addr")
+        .port()
+}
+
+fn allocate_unused_udp_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .expect("bind ephemeral UDP port")
+        .local_addr()
+        .expect("udp local addr")
+        .port()
+}
+
 async fn start_instance(
     binary: &PathBuf,
     name: &str,
     api_port: u16,
     bind_port: u16,
     bootstrap: &str,
+    extra_config: &str,
 ) -> AgentInstance {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
+    let _ = std::fs::remove_dir_all(&config_dir);
     let _ = std::fs::create_dir_all(&config_dir);
 
     // Kill stale daemons from prior failed runs that may still own these fixed ports.
@@ -335,18 +447,27 @@ async fn start_instance(
          bind_address = \"0.0.0.0:{bind_port}\"\n\
          data_dir = \"{}\"\n\
          log_level = \"warn\"\n\
-         {bootstrap}\n",
+         {bootstrap}\n\
+         {extra_config}\n",
         config_dir.display()
     );
     std::fs::write(&config_path, &config_content).expect("write config");
+
+    let stdout_path = config_dir.join("daemon.stdout.log");
+    let stderr_path = config_dir.join("daemon.stderr.log");
+    let stdout = std::fs::File::create(&stdout_path)
+        .unwrap_or_else(|e| panic!("Failed to create stdout log for {name}: {e}"));
+    let stderr = std::fs::File::create(&stderr_path)
+        .unwrap_or_else(|e| panic!("Failed to create stderr log for {name}: {e}"));
 
     let process = Command::new(binary)
         .arg("--config")
         .arg(&config_path)
         .arg("--name")
         .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .arg("--no-hard-coded-bootstrap")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
 
@@ -356,54 +477,16 @@ async fn start_instance(
     let api_addr = format!("127.0.0.1:{api_port}");
     let mut instance = AgentInstance {
         process,
+        binary: binary.clone(),
+        config_path: config_path.clone(),
         name: name.to_string(),
         api_addr: api_addr.clone(),
         api_token: String::new(), // placeholder — filled below
-        _data_dir: config_dir.clone(),
+        data_dir: config_dir.clone(),
     };
 
-    // Wait for health — if this panics, `instance` is dropped, killing the process.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let client = reqwest::Client::new();
-    loop {
-        if let Ok(resp) = client.get(format!("http://{api_addr}/health")).send().await {
-            if resp.status().is_success() {
-                break;
-            }
-        }
-        if tokio::time::Instant::now() > deadline {
-            // instance drops here, killing the process
-            panic!("x0xd {name} did not become healthy within 30s");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    // Read API token — if this panics, `instance` is dropped, killing the process.
-    let token_file = config_dir.join("api-token");
-    let api_token = if token_file.exists() {
-        std::fs::read_to_string(&token_file)
-            .expect("read api-token")
-            .trim()
-            .to_string()
-    } else {
-        // Try platform-specific data dir
-        let data_dir = if cfg!(target_os = "macos") {
-            dirs::home_dir()
-                .expect("home dir")
-                .join("Library/Application Support")
-                .join(format!("x0x-{name}"))
-        } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(format!("x0x-{name}"))
-        };
-        let alt_token = data_dir.join("api-token");
-        std::fs::read_to_string(&alt_token)
-            .unwrap_or_else(|_| panic!("Cannot find api-token for {name}"))
-            .trim()
-            .to_string()
-    };
-
-    instance.api_token = api_token;
+    // Wait for health / token — if this panics, `instance` is dropped,
+    // killing the process.
+    instance.refresh_runtime_state().await;
     instance
 }

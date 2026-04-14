@@ -161,6 +161,20 @@ struct DaemonConfig {
     /// When set, identity and data are scoped to this name.
     #[serde(default)]
     instance_name: Option<String>,
+
+    /// Override the shard digest anti-entropy interval (seconds) for tests.
+    #[serde(default)]
+    directory_digest_interval_secs: Option<u64>,
+
+    /// Override discoverable group card republish interval (seconds).
+    /// `Some(0)` disables the periodic republish loop for tests.
+    #[serde(default)]
+    group_card_republish_interval_secs: Option<u64>,
+
+    /// Override startup shard resubscribe jitter window (milliseconds)
+    /// for restart-persistence tests.
+    #[serde(default)]
+    directory_resubscribe_jitter_ms: Option<u64>,
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -312,6 +326,9 @@ impl Default for DaemonConfig {
             presence_event_poll_interval_secs: None,
             presence_offline_timeout_secs: None,
             instance_name: None,
+            directory_digest_interval_secs: None,
+            group_card_republish_interval_secs: None,
+            directory_resubscribe_jitter_ms: None,
         }
     }
 }
@@ -352,6 +369,10 @@ struct AppState {
     directory_subscriptions_path: PathBuf,
     /// Phase C.2: background shard-listener tasks, keyed by (kind, shard).
     directory_tasks: RwLock<HashMap<(x0x::groups::ShardKind, u32), tokio::task::JoinHandle<()>>>,
+    /// Phase C.2: digest anti-entropy interval in seconds.
+    directory_digest_interval_secs: u64,
+    /// Phase C.2: startup shard resubscribe jitter window in milliseconds.
+    directory_resubscribe_jitter_ms: u64,
     /// Phase E: per-group ring buffer of validated public messages.
     /// Keyed by `group_id`. Bounded by `PUBLIC_MESSAGE_HISTORY_CAP`.
     public_messages: RwLock<HashMap<String, Vec<x0x::groups::GroupPublicMessage>>>,
@@ -1141,6 +1162,12 @@ async fn main() -> Result<()> {
         directory_subscriptions: RwLock::new(x0x::groups::SubscriptionSet::default()),
         directory_subscriptions_path: config.data_dir.join("directory-subscriptions.json"),
         directory_tasks: RwLock::new(HashMap::new()),
+        directory_digest_interval_secs: config
+            .directory_digest_interval_secs
+            .unwrap_or(DIRECTORY_DIGEST_INTERVAL_SECS),
+        directory_resubscribe_jitter_ms: config
+            .directory_resubscribe_jitter_ms
+            .unwrap_or(DIRECTORY_RESUBSCRIBE_JITTER_MS),
         public_messages: RwLock::new(HashMap::new()),
         public_message_tasks: RwLock::new(HashMap::new()),
         agent_kem_keypair,
@@ -1190,35 +1217,37 @@ async fn main() -> Result<()> {
             .map(|(id, _)| id.clone())
             .collect()
     };
-    let state_for_republish = Arc::clone(&state);
-    tokio::spawn(async move {
-        // First publish after a short warmup so the gossip mesh has a chance
-        // to form. Then republish periodically so late joiners also see cards.
-        // Without this, a peer that starts after another daemon published
-        // would miss the initial card.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let mut shutdown = state_for_republish.shutdown_notify.subscribe();
-        loop {
-            let current_ids: Vec<String> = {
-                let groups = state_for_republish.named_groups.read().await;
-                groups
-                    .iter()
-                    .filter(|(_, info)| {
-                        info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
-                    })
-                    .map(|(id, _)| id.clone())
-                    .collect()
-            };
-            for id in current_ids {
-                publish_group_card_to_discovery(&state_for_republish, &id).await;
+    let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(15);
+    if republish_interval_secs > 0 {
+        let state_for_republish = Arc::clone(&state);
+        tokio::spawn(async move {
+            // First publish after a short warmup so the gossip mesh has a chance
+            // to form. Then republish periodically so late joiners also see cards.
+            // Without this, a peer that starts after another daemon published
+            // would miss the initial card.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut shutdown = state_for_republish.shutdown_notify.subscribe();
+            loop {
+                let current_ids: Vec<String> = {
+                    let groups = state_for_republish.named_groups.read().await;
+                    groups
+                        .iter()
+                        .filter(|(_, info)| {
+                            info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                for id in current_ids {
+                    publish_group_card_to_discovery(&state_for_republish, &id).await;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(republish_interval_secs)) => {}
+                    _ = shutdown.changed() => break,
+                }
             }
-            // Re-publish every 15s. Also acts as a heartbeat for churning peers.
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
-                _ = shutdown.changed() => break,
-            }
-        }
-    });
+        });
+    }
     // Consume the pre-computed list to avoid the dead-warning.
     let _ = discoverable_ids;
 
@@ -4187,23 +4216,31 @@ enum NamedGroupMetadataEvent {
         actor: String,
         agent_id: String,
         display_name: Option<String>,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     MemberRemoved {
         group_id: String,
         revision: u64,
         actor: String,
         agent_id: String,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     GroupDeleted {
         group_id: String,
         revision: u64,
         actor: String,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     PolicyUpdated {
         group_id: String,
         revision: u64,
         actor: String,
         policy: x0x::groups::GroupPolicy,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     MemberRoleUpdated {
         group_id: String,
@@ -4211,18 +4248,30 @@ enum NamedGroupMetadataEvent {
         actor: String,
         agent_id: String,
         role: x0x::groups::GroupRole,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     MemberBanned {
         group_id: String,
         revision: u64,
         actor: String,
         agent_id: String,
+        /// For MlsEncrypted groups, the new secret epoch committed into the
+        /// signed state hash. Receivers use this to update the security binding
+        /// before `finalize_applied_commit`, avoiding dependence on the later
+        /// `SecureShareDelivered` arrival order.
+        #[serde(default)]
+        secret_epoch: Option<u64>,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     MemberUnbanned {
         group_id: String,
         revision: u64,
         actor: String,
         agent_id: String,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     JoinRequestCreated {
         group_id: String,
@@ -4235,6 +4284,8 @@ enum NamedGroupMetadataEvent {
         /// Required for MlsEncrypted groups; optional for others.
         #[serde(default)]
         requester_kem_public_key_b64: Option<String>,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     JoinRequestApproved {
         group_id: String,
@@ -4242,17 +4293,23 @@ enum NamedGroupMetadataEvent {
         revision: u64,
         actor: String,
         requester_agent_id: String,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     JoinRequestRejected {
         group_id: String,
         request_id: String,
         actor: String,
         requester_agent_id: String,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     JoinRequestCancelled {
         group_id: String,
         request_id: String,
         requester_agent_id: String,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     GroupCardPublished {
         group_id: String,
@@ -4264,6 +4321,8 @@ enum NamedGroupMetadataEvent {
         actor: String,
         name: Option<String>,
         description: Option<String>,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
     },
     /// Phase D.2 (fixed): Cross-daemon delivery of the group's shared secret,
     /// sealed with ML-KEM-768 to the recipient's published public key.
@@ -4475,9 +4534,31 @@ async fn publish_group_card_to_discovery_inner(
         save_named_groups(state).await;
     }
 
+    // Phase C.2 privacy guard. Hidden and ListedToContacts MUST NEVER reach
+    // any public discovery surface — neither the legacy bridge topic nor the
+    // tag/name/id shard fan-out. ListedToContacts uses only the contact-scoped
+    // direct-message path below.
+    if !x0x::groups::may_publish_to_public_shards(signed_card.policy_summary.discoverability) {
+        if signed_card.policy_summary.discoverability
+            == x0x::groups::GroupDiscoverability::ListedToContacts
+        {
+            // Contact-scoped pairwise delivery: push the signed card via
+            // direct-message to each Trusted/Known contact. No public
+            // topic is touched.
+            publish_listed_to_contacts_card(state, signed_card.clone()).await;
+        } else {
+            tracing::debug!(
+                group_id,
+                discoverability = ?signed_card.policy_summary.discoverability,
+                "C.2: skipping fan-out (Hidden — stays local)"
+            );
+        }
+        return commit;
+    }
+
     // Bridge-topic publish (kept for backward compat with older peers that
-    // haven't migrated to shard subscriptions yet). Phase C.2 adds shard
-    // fan-out below.
+    // haven't migrated to shard subscriptions yet). Only PublicDirectory cards
+    // are allowed onto this public topic.
     let event = NamedGroupMetadataEvent::GroupCardPublished {
         group_id: group_id.to_string(),
         card: signed_card.clone(),
@@ -4506,32 +4587,14 @@ async fn publish_group_card_to_discovery_inner(
         Err(e) => tracing::debug!("failed to serialize discovery card: {e}"),
     }
 
-    // Phase C.2: fan out to tag/name/id shards. PRIVACY GUARD — Hidden and
-    // ListedToContacts MUST NEVER reach public shards. This is enforced
-    // defensively here even though `to_group_card()` already returns None
-    // for Hidden (non-withdrawn) groups. ListedToContacts produces a card
-    // but we refuse to publish it on public shards — contact-scoped sync
-    // delivers those cards via the direct-message channel instead.
-    if !x0x::groups::may_publish_to_public_shards(signed_card.policy_summary.discoverability) {
-        if signed_card.policy_summary.discoverability
-            == x0x::groups::GroupDiscoverability::ListedToContacts
-        {
-            // Contact-scoped pairwise delivery: push the signed card via
-            // direct-message to each Trusted/Known contact. No public
-            // topic is touched.
-            publish_listed_to_contacts_card(state, signed_card.clone()).await;
-        } else {
-            tracing::debug!(
-                group_id,
-                discoverability = ?signed_card.policy_summary.discoverability,
-                "C.2: skipping fan-out (Hidden — stays local)"
-            );
-        }
-        return commit;
-    }
-
     let shards =
         x0x::groups::shards_for_public(&signed_card.tags, &signed_card.name, &signed_card.group_id);
+    {
+        let mut cache = state.directory_cache.write().await;
+        for (kind, shard, _) in &shards {
+            let _ = cache.insert(*kind, *shard, signed_card.clone());
+        }
+    }
     for (kind, shard, key) in shards {
         let topic = x0x::groups::topic_for(kind, shard);
         let msg = x0x::groups::DirectoryMessage::Card {
@@ -4623,10 +4686,12 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                             continue;
                         }
 
-                        // Only accept discoverable cards.
-                        if card.policy_summary.discoverability
-                            == x0x::groups::GroupDiscoverability::Hidden
-                        {
+                        // Only accept cards that are allowed on a public
+                        // discovery surface. Hidden and ListedToContacts must
+                        // never be cached from the global discovery topic.
+                        if !x0x::groups::may_publish_to_public_shards(
+                            card.policy_summary.discoverability,
+                        ) {
                             continue;
                         }
 
@@ -4743,13 +4808,13 @@ async fn subscribe_shard(state: Arc<AppState>, kind: x0x::groups::ShardKind, sha
     };
     let state_for_listener = Arc::clone(&state);
     let topic_for_log = topic.clone();
+    let digest_interval_secs = state.directory_digest_interval_secs.max(1);
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
         // Emit an initial digest on startup so peers can reciprocate.
         emit_shard_digest(&state_for_listener, kind, shard).await;
-        let mut digest_ticker = tokio::time::interval(std::time::Duration::from_secs(
-            DIRECTORY_DIGEST_INTERVAL_SECS,
-        ));
+        let mut digest_ticker =
+            tokio::time::interval(std::time::Duration::from_secs(digest_interval_secs));
         digest_ticker.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
@@ -4815,20 +4880,23 @@ async fn respond_to_pull(
     for gid in group_ids {
         // We only re-publish cards for groups we *own* / manage locally,
         // not arbitrary cards from our cache (relays may re-publish cached
-        // blobs but cannot re-sign them). For cached cards, re-emit the
-        // already-signed copy unchanged.
-        if let Some(info) = groups.get(gid.as_str()) {
+        // blobs but cannot re-sign them). Pull requests use stable `group_id`,
+        // so resolve by either the local routing key or the D.3 stable id.
+        let owned_info = groups.get(gid.as_str()).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == gid.as_str())
+        });
+        if let Some(info) = owned_info {
             if !x0x::groups::may_publish_to_public_shards(info.policy.discoverability) {
                 continue;
             }
-            if let Some(mut card) = info.to_group_card() {
-                if card.sign(signing_kp).is_ok() {
-                    let msg = x0x::groups::DirectoryMessage::Card {
-                        card: Box::new(card),
-                    };
-                    let _ = state.agent.publish(&topic, msg.encode()).await;
-                    continue;
-                }
+            if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
+                let msg = x0x::groups::DirectoryMessage::Card {
+                    card: Box::new(card),
+                };
+                let _ = state.agent.publish(&topic, msg.encode()).await;
+                continue;
             }
         }
         // Fall back to re-broadcasting a cached card verbatim if we have one
@@ -4958,10 +5026,11 @@ async fn spawn_directory_resubscribe(state: Arc<AppState>) {
         return;
     }
     use rand::Rng;
+    let jitter_ms = state.directory_resubscribe_jitter_ms.max(1);
     for rec in subs.subscriptions {
         let delay_ms = {
             let mut rng = rand::thread_rng();
-            rng.gen_range(0..DIRECTORY_RESUBSCRIBE_JITTER_MS)
+            rng.gen_range(0..jitter_ms)
         };
         let state_for_spawn = Arc::clone(&state);
         tokio::spawn(async move {
@@ -5131,6 +5200,74 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
+fn apply_stateful_event_to_group<F>(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::GroupStateCommit,
+    action_kind: x0x::groups::ActionKind,
+    mutate: F,
+) -> Result<x0x::groups::GroupInfo, x0x::groups::ApplyError>
+where
+    F: FnOnce(&mut x0x::groups::GroupInfo),
+{
+    let ctx = x0x::groups::ApplyContext {
+        current_state_hash: &current.state_hash,
+        current_revision: current.state_revision,
+        current_withdrawn: current.withdrawn,
+        members_v2: &current.members_v2,
+        group_id: current.stable_group_id(),
+    };
+    x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind)?;
+    let mut next = current.clone();
+    mutate(&mut next);
+    next.finalize_applied_commit(commit)?;
+    Ok(next)
+}
+
+async fn refresh_group_card_cache_from_info(
+    state: &AppState,
+    key: &str,
+    info: &x0x::groups::GroupInfo,
+) {
+    let mut cache = state.group_card_cache.write().await;
+    let stable_key = info.stable_group_id().to_string();
+    match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
+        Ok(Some(card)) => {
+            cache.insert(key.to_string(), card.clone());
+            cache.insert(stable_key, card);
+        }
+        Ok(None) => {
+            cache.remove(key);
+            cache.remove(&stable_key);
+        }
+        Err(e) => {
+            tracing::warn!(group_key = %key, "failed to sign group card for cache refresh: {e}");
+            cache.remove(key);
+            cache.remove(&stable_key);
+        }
+    }
+}
+
+async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id: &str) {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).cloned()
+    };
+    if let Some(info) = info {
+        refresh_group_card_cache_from_info(state, group_id, &info).await;
+        let discoverable = info.withdrawn
+            || info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden;
+        if discoverable {
+            publish_group_card_to_discovery(state, group_id).await;
+        } else {
+            let mut cache = state.group_card_cache.write().await;
+            cache.remove(group_id);
+            cache.remove(info.stable_group_id());
+        }
+    } else {
+        state.group_card_cache.write().await.remove(group_id);
+    }
+}
+
 async fn apply_named_group_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -5160,7 +5297,17 @@ async fn apply_named_group_metadata_event(
 
     let sender_hex = hex::encode(sender.as_bytes());
     let mut groups = state.named_groups.write().await;
-    let Some(info) = groups.get_mut(&group_id) else {
+    let resolved_group_key = if groups.contains_key(&group_id) {
+        group_id.clone()
+    } else if let Some((key, _)) = groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == group_id)
+    {
+        key.clone()
+    } else {
+        return false;
+    };
+    let Some(info) = groups.get_mut(&resolved_group_key) else {
         return false;
     };
     let creator_hex = hex::encode(info.creator.as_bytes());
@@ -5172,24 +5319,38 @@ async fn apply_named_group_metadata_event(
             actor,
             agent_id,
             display_name,
+            commit,
             ..
         } => {
-            if sender_hex != creator_hex || actor != sender_hex || revision <= info.roster_revision
-            {
+            let Some(commit) = commit else {
+                return false;
+            };
+            if sender_hex != creator_hex || actor != sender_hex {
                 return false;
             }
-            info.roster_revision = revision;
-            info.add_member(
-                agent_id.clone(),
-                x0x::groups::GroupRole::Member,
-                Some(actor.clone()),
-                display_name.clone(),
-            );
-            if let Some(name) = display_name {
-                info.set_display_name(&agent_id, name);
-            }
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.add_member(
+                        agent_id.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(actor.clone()),
+                        display_name.clone(),
+                    );
+                    if let Some(name) = display_name.clone() {
+                        next.set_display_name(&agent_id, name);
+                    }
+                },
+            ) else {
+                return false;
+            };
+            *info = next;
             let mut mls_groups = state.mls_groups.write().await;
-            if let Some(group) = mls_groups.get_mut(&group_id) {
+            if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
                 if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
                     if !group.is_member(&member_id) {
                         let _ = group.add_member(member_id).await;
@@ -5197,7 +5358,9 @@ async fn apply_named_group_metadata_event(
                 }
             }
             drop(mls_groups);
+            let updated = info.clone();
             drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &updated).await;
             save_named_groups(state).await;
             save_mls_groups(state).await;
             false
@@ -5206,17 +5369,37 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             agent_id,
+            commit,
             ..
         } => {
+            let Some(commit) = commit else {
+                return false;
+            };
             let creator_auth = sender_hex == creator_hex && actor == sender_hex;
             let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
-            if (!creator_auth && !self_leave_auth) || revision <= info.roster_revision {
+            if !creator_auth && !self_leave_auth {
                 return false;
             }
-            info.roster_revision = revision;
-            info.remove_member(&agent_id, Some(actor.clone()));
+            let action_kind = if self_leave_auth {
+                x0x::groups::ActionKind::MemberSelf
+            } else {
+                x0x::groups::ActionKind::AdminOrHigher
+            };
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(&current, &commit, action_kind, |next| {
+                next.roster_revision = revision.max(next.roster_revision);
+                next.remove_member(&agent_id, Some(actor.clone()));
+            }) else {
+                return false;
+            };
+            let removed_self = agent_id == local_agent_hex;
+            if removed_self {
+                groups.remove(&resolved_group_key);
+            } else {
+                *info = next.clone();
+            }
             let mut mls_groups = state.mls_groups.write().await;
-            if let Some(group) = mls_groups.get_mut(&group_id) {
+            if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
                 if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
                     if group.is_member(&member_id) {
                         let _ = group.remove_member(member_id).await;
@@ -5224,32 +5407,57 @@ async fn apply_named_group_metadata_event(
                 }
             }
             drop(mls_groups);
-
-            let removed_self = agent_id == local_agent_hex;
-            if removed_self {
-                groups.remove(&group_id);
-            }
             drop(groups);
             if removed_self {
-                state.mls_groups.write().await.remove(&group_id);
+                state
+                    .group_card_cache
+                    .write()
+                    .await
+                    .remove(&resolved_group_key);
+                state.mls_groups.write().await.remove(&resolved_group_key);
                 save_named_groups(state).await;
                 save_mls_groups(state).await;
                 return true;
             }
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             save_mls_groups(state).await;
             false
         }
         NamedGroupMetadataEvent::GroupDeleted {
-            revision, actor, ..
+            revision,
+            actor,
+            commit,
+            ..
         } => {
-            if sender_hex != creator_hex || actor != sender_hex || revision <= info.roster_revision
+            let Some(commit) = commit else {
+                return false;
+            };
+            if sender_hex != creator_hex || actor != sender_hex {
+                return false;
+            }
+            let current = info.clone();
+            if apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::OwnerOnly,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.updated_at = commit.committed_at;
+                },
+            )
+            .is_err()
             {
                 return false;
             }
-            groups.remove(&group_id);
+            groups.remove(&resolved_group_key);
             drop(groups);
-            state.mls_groups.write().await.remove(&group_id);
+            state
+                .group_card_cache
+                .write()
+                .await
+                .remove(&resolved_group_key);
+            state.mls_groups.write().await.remove(&resolved_group_key);
             save_named_groups(state).await;
             save_mls_groups(state).await;
             true
@@ -5258,19 +5466,40 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             policy,
+            commit,
             ..
         } => {
+            let Some(commit) = commit else {
+                return false;
+            };
             let creator_auth = sender_hex == creator_hex && actor == sender_hex;
-            if !creator_auth || revision <= info.policy_revision {
+            if !creator_auth {
                 return false;
             }
-            info.policy_revision = revision;
-            info.policy = policy;
-            info.updated_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::OwnerOnly,
+                |next| {
+                    next.policy_revision = revision.max(next.policy_revision);
+                    next.policy = policy.clone();
+                    if next.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+                        && next.discovery_card_topic.is_none()
+                    {
+                        next.discovery_card_topic = Some(format!(
+                            "x0x.group.{}.card",
+                            &next.mls_group_id[..16.min(next.mls_group_id.len())]
+                        ));
+                    }
+                    next.updated_at = commit.committed_at;
+                },
+            ) else {
+                return false;
+            };
+            *info = next.clone();
             drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
         }
@@ -5279,37 +5508,53 @@ async fn apply_named_group_metadata_event(
             actor,
             agent_id,
             role,
+            commit,
             ..
         } => {
+            let Some(commit) = commit else {
+                return false;
+            };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized || revision <= info.roster_revision {
+            if !actor_authorized {
                 return false;
             }
-            // P0-5: target must exist and be active.
             let Some(target) = info.members_v2.get(&agent_id).cloned() else {
                 return false;
             };
             if target.is_removed() || target.is_banned() {
                 return false;
             }
-            // P0-5: admins cannot promote to/from Owner or peer-to-Admin.
             let actor_role_val = actor_role.unwrap_or(x0x::groups::GroupRole::Guest);
             if actor_role_val == x0x::groups::GroupRole::Admin
                 && (target.role == x0x::groups::GroupRole::Owner
                     || target.role == x0x::groups::GroupRole::Admin
-                    || role == x0x::groups::GroupRole::Owner)
+                    || role == x0x::groups::GroupRole::Owner
+                    || role == x0x::groups::GroupRole::Admin)
             {
                 return false;
             }
-            // P0-5: ownership transfer is explicitly out of scope here.
             if role == x0x::groups::GroupRole::Owner {
                 return false;
             }
-            info.roster_revision = revision;
-            info.set_member_role(&agent_id, role);
+            let action_kind = if target.role.at_least(x0x::groups::GroupRole::Admin)
+                || role.at_least(x0x::groups::GroupRole::Admin)
+            {
+                x0x::groups::ActionKind::OwnerOnly
+            } else {
+                x0x::groups::ActionKind::AdminOrHigher
+            };
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(&current, &commit, action_kind, |next| {
+                next.roster_revision = revision.max(next.roster_revision);
+                next.set_member_role(&agent_id, role);
+            }) else {
+                return false;
+            };
+            *info = next.clone();
             drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
         }
@@ -5317,21 +5562,45 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             agent_id,
+            secret_epoch,
+            commit,
             ..
         } => {
+            let Some(commit) = commit else {
+                return false;
+            };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized || revision <= info.roster_revision {
+            if !actor_authorized {
                 return false;
             }
-            // P0-5: cannot ban Owner.
             if info.caller_role(&agent_id) == Some(x0x::groups::GroupRole::Owner) {
                 return false;
             }
-            info.roster_revision = revision;
-            info.ban_member(&agent_id, Some(actor));
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.ban_member(&agent_id, Some(actor.clone()));
+                    if let Some(secret_epoch) = secret_epoch {
+                        let old_epoch = next.secret_epoch;
+                        next.secret_epoch = secret_epoch;
+                        next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
+                        if old_epoch < secret_epoch {
+                            next.shared_secret = None;
+                        }
+                    }
+                },
+            ) else {
+                return false;
+            };
+            *info = next.clone();
             drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
         }
@@ -5339,17 +5608,33 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             agent_id,
+            commit,
             ..
         } => {
+            let Some(commit) = commit else {
+                return false;
+            };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized || revision <= info.roster_revision {
+            if !actor_authorized {
                 return false;
             }
-            info.roster_revision = revision;
-            info.unban_member(&agent_id);
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.unban_member(&agent_id);
+                },
+            ) else {
+                return false;
+            };
+            *info = next.clone();
             drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
         }
@@ -5359,26 +5644,24 @@ async fn apply_named_group_metadata_event(
             message,
             ts,
             requester_kem_public_key_b64,
+            commit,
             ..
         } => {
-            // P0-5 apply-side invariants:
-            // 1. Only the requester themselves may emit their own JoinRequestCreated.
+            let Some(commit) = commit else {
+                return false;
+            };
             if sender_hex != requester_agent_id {
                 return false;
             }
-            // 2. The group must have admission == RequestAccess.
             if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
                 return false;
             }
-            // 3. The requester must not already be an active member.
             if info.has_active_member(&requester_agent_id) {
                 return false;
             }
-            // 4. The requester must not be banned.
             if info.is_banned(&requester_agent_id) {
                 return false;
             }
-            // 5. Duplicate pending request from same requester is rejected.
             if info
                 .join_requests
                 .values()
@@ -5386,45 +5669,52 @@ async fn apply_named_group_metadata_event(
             {
                 return false;
             }
-            // 6. Duplicate request_id is rejected.
             if info.join_requests.contains_key(&request_id) {
                 return false;
             }
-            let req = x0x::groups::JoinRequest {
-                request_id: request_id.clone(),
-                group_id: group_id.clone(),
-                requester_agent_id: requester_agent_id.clone(),
-                requester_user_id: None,
-                requested_role: x0x::groups::GroupRole::Member,
-                message,
-                created_at: ts,
-                reviewed_at: None,
-                reviewed_by: None,
-                status: x0x::groups::JoinRequestStatus::Pending,
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::NonMemberRequest,
+                |next| {
+                    let req = x0x::groups::JoinRequest {
+                        request_id: request_id.clone(),
+                        group_id: group_id.clone(),
+                        requester_agent_id: requester_agent_id.clone(),
+                        requester_user_id: None,
+                        requested_role: x0x::groups::GroupRole::Member,
+                        message: message.clone(),
+                        created_at: ts,
+                        reviewed_at: None,
+                        reviewed_by: None,
+                        status: x0x::groups::JoinRequestStatus::Pending,
+                    };
+                    next.join_requests.insert(request_id.clone(), req);
+                    if let Some(kem_b64) = requester_kem_public_key_b64.clone() {
+                        next.members_v2
+                            .entry(requester_agent_id.clone())
+                            .and_modify(|m| {
+                                m.kem_public_key_b64 = Some(kem_b64.clone());
+                            })
+                            .or_insert_with(|| x0x::groups::GroupMember {
+                                agent_id: requester_agent_id.clone(),
+                                user_id: None,
+                                role: x0x::groups::GroupRole::Member,
+                                state: x0x::groups::GroupMemberState::Pending,
+                                display_name: None,
+                                joined_at: ts,
+                                updated_at: ts,
+                                added_by: None,
+                                removed_by: None,
+                                kem_public_key_b64: Some(kem_b64),
+                            });
+                    }
+                },
+            ) else {
+                return false;
             };
-            info.join_requests.insert(request_id, req);
-            // Record the requester's KEM public key as a Pending member stub so
-            // the approver can seal to them immediately on approval.
-            if let Some(kem_b64) = requester_kem_public_key_b64 {
-                // Insert a pending entry with the key — will flip to Active on approval.
-                info.members_v2
-                    .entry(requester_agent_id.clone())
-                    .and_modify(|m| {
-                        m.kem_public_key_b64 = Some(kem_b64.clone());
-                    })
-                    .or_insert_with(|| x0x::groups::GroupMember {
-                        agent_id: requester_agent_id,
-                        user_id: None,
-                        role: x0x::groups::GroupRole::Member,
-                        state: x0x::groups::GroupMemberState::Pending,
-                        display_name: None,
-                        joined_at: ts,
-                        updated_at: ts,
-                        added_by: None,
-                        removed_by: None,
-                        kem_public_key_b64: Some(kem_b64),
-                    });
-            }
+            *info = next;
             drop(groups);
             save_named_groups(state).await;
             false
@@ -5434,16 +5724,18 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             requester_agent_id,
+            commit,
             ..
         } => {
-            // P0-5: actor must be admin+, same as sender, revision must advance.
+            let Some(commit) = commit else {
+                return false;
+            };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized || revision <= info.roster_revision {
+            if !actor_authorized {
                 return false;
             }
-            // P0-5: the request must exist and be Pending.
             let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
                 return false;
             };
@@ -5453,54 +5745,75 @@ async fn apply_named_group_metadata_event(
             if req_snapshot.requester_agent_id != requester_agent_id {
                 return false;
             }
-            // P0-5: a banned requester cannot be approved.
             if info.is_banned(&requester_agent_id) {
                 return false;
             }
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            if let Some(req) = info.join_requests.get_mut(&request_id) {
-                req.status = x0x::groups::JoinRequestStatus::Approved;
-                req.reviewed_by = Some(actor.clone());
-                req.reviewed_at = Some(now_ms);
-            }
-            info.roster_revision = revision;
-            info.add_member(
-                requester_agent_id,
-                x0x::groups::GroupRole::Member,
-                Some(actor),
-                None,
-            );
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    let now_ms = commit.committed_at;
+                    if let Some(req) = next.join_requests.get_mut(&request_id) {
+                        req.status = x0x::groups::JoinRequestStatus::Approved;
+                        req.reviewed_by = Some(actor.clone());
+                        req.reviewed_at = Some(now_ms);
+                    }
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.add_member(
+                        requester_agent_id.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(actor.clone()),
+                        None,
+                    );
+                },
+            ) else {
+                return false;
+            };
+            *info = next.clone();
             drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
         }
         NamedGroupMetadataEvent::JoinRequestRejected {
-            request_id, actor, ..
+            request_id,
+            actor,
+            commit,
+            ..
         } => {
-            // P0-5: actor must be admin+; request must exist and be Pending.
+            let Some(commit) = commit else {
+                return false;
+            };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 return false;
             }
-            let Some(req) = info.join_requests.get_mut(&request_id) else {
+            let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
                 return false;
             };
-            if !req.is_pending() {
+            if !req_snapshot.is_pending() {
                 return false;
             }
-            req.status = x0x::groups::JoinRequestStatus::Rejected;
-            req.reviewed_by = Some(actor.clone());
-            req.reviewed_at = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            );
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    if let Some(req) = next.join_requests.get_mut(&request_id) {
+                        req.status = x0x::groups::JoinRequestStatus::Rejected;
+                        req.reviewed_by = Some(actor.clone());
+                        req.reviewed_at = Some(commit.committed_at);
+                    }
+                },
+            ) else {
+                return false;
+            };
+            *info = next;
             drop(groups);
             save_named_groups(state).await;
             false
@@ -5508,22 +5821,35 @@ async fn apply_named_group_metadata_event(
         NamedGroupMetadataEvent::JoinRequestCancelled {
             request_id,
             requester_agent_id,
+            commit,
             ..
         } => {
-            // P0-5: only the requester may cancel, request must be Pending.
+            let Some(commit) = commit else {
+                return false;
+            };
             if sender_hex != requester_agent_id {
                 return false;
             }
-            let Some(req) = info.join_requests.get_mut(&request_id) else {
+            let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
                 return false;
             };
-            if req.requester_agent_id != requester_agent_id {
+            if req_snapshot.requester_agent_id != requester_agent_id || !req_snapshot.is_pending() {
                 return false;
             }
-            if !req.is_pending() {
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::NonMemberRequest,
+                |next| {
+                    if let Some(req) = next.join_requests.get_mut(&request_id) {
+                        req.status = x0x::groups::JoinRequestStatus::Cancelled;
+                    }
+                },
+            ) else {
                 return false;
-            }
-            req.status = x0x::groups::JoinRequestStatus::Cancelled;
+            };
+            *info = next;
             drop(groups);
             save_named_groups(state).await;
             false
@@ -5544,37 +5870,39 @@ async fn apply_named_group_metadata_event(
             actor,
             name,
             description,
+            commit,
             ..
         } => {
-            // Only an active Admin/Owner may update metadata, and the actor must
-            // be the same agent that signed the payload.
+            let Some(commit) = commit else {
+                return false;
+            };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized || revision <= info.roster_revision {
+            if !actor_authorized {
                 return false;
             }
-            info.roster_revision = revision;
-            if let Some(n) = name {
-                info.name = n;
-            }
-            if let Some(d) = description {
-                info.description = d;
-            }
-            info.updated_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            // If the group is discoverable, refresh the cached card.
-            let refreshed_card = info.to_group_card();
+            let current = info.clone();
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    if let Some(n) = name.clone() {
+                        next.name = n;
+                    }
+                    if let Some(d) = description.clone() {
+                        next.description = d;
+                    }
+                    next.updated_at = commit.committed_at;
+                },
+            ) else {
+                return false;
+            };
+            *info = next.clone();
             drop(groups);
-            if let Some(card) = refreshed_card {
-                state
-                    .group_card_cache
-                    .write()
-                    .await
-                    .insert(card.group_id.clone(), card);
-            }
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
         }
@@ -5603,8 +5931,13 @@ async fn apply_named_group_metadata_event(
             if !actor_authorized {
                 return false;
             }
-            // Ignore stale envelopes.
-            if secret_epoch <= info.secret_epoch && info.shared_secret.is_some() {
+            // Ignore stale envelopes. Equal-epoch delivery is still accepted
+            // if we only know the epoch/security_binding from a prior
+            // MemberBanned commit but have not yet received the actual shared
+            // secret material.
+            if secret_epoch < info.secret_epoch
+                || (secret_epoch == info.secret_epoch && info.shared_secret.is_some())
+            {
                 return false;
             }
             use base64::Engine as _;
@@ -5648,6 +5981,7 @@ async fn apply_named_group_metadata_event(
             };
             info.shared_secret = Some(secret.to_vec());
             info.secret_epoch = secret_epoch;
+            info.security_binding = Some(format!("gss:epoch={secret_epoch}"));
             drop(groups);
             save_named_groups(state).await;
             tracing::info!(
@@ -5790,13 +6124,19 @@ async fn create_named_group(
             // P0-1: If the group is discoverable, publish its card to the global
             // discovery topic so other daemons find it without manual import.
             if info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden {
-                if let Some(card) = info.to_group_card() {
-                    state
-                        .group_card_cache
-                        .write()
-                        .await
-                        .insert(group_id_hex.clone(), card);
-                    publish_group_card_to_discovery(&state, &group_id_hex).await;
+                match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
+                    Ok(Some(card)) => {
+                        let stable_group_id = info.stable_group_id().to_string();
+                        let mut cache = state.group_card_cache.write().await;
+                        cache.insert(group_id_hex.clone(), card.clone());
+                        cache.insert(stable_group_id, card);
+                        drop(cache);
+                        publish_group_card_to_discovery(&state, &group_id_hex).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(group_id = %group_id_hex, "failed to sign initial group card: {e}");
+                    }
                 }
             }
 
@@ -6061,9 +6401,11 @@ async fn send_group_public_message(
         }
     };
 
-    // Cache locally so the author sees their own message immediately,
-    // then publish to the public topic.
-    cache_public_message(&state, msg.clone()).await;
+    // Subscribe locally before publishing so the sender's pubsub runtime has
+    // the topic fully initialised before the first outbound message. This makes
+    // reverse-direction cross-daemon receive far more reliable on fresh topics.
+    spawn_public_message_listener(Arc::clone(&state), msg.group_id.clone()).await;
+
     let topic = x0x::groups::public_topic_for(&msg.group_id);
     let bytes = match serde_json::to_vec(&msg) {
         Ok(b) => b,
@@ -6079,10 +6421,17 @@ async fn send_group_public_message(
     };
     if let Err(e) = state.agent.publish(&topic, bytes).await {
         tracing::warn!(topic = %topic, "E: public-send publish failed: {e}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("publish failed: {e}")
+            })),
+        );
     }
-    // Ensure a listener is running on this topic so incoming peer
-    // messages are ingested.
-    spawn_public_message_listener(Arc::clone(&state), msg.group_id.clone()).await;
+    // Publish succeeded, so cache locally. The listener was started before the
+    // publish above to avoid first-message topic races.
+    cache_public_message(&state, msg.clone()).await;
 
     (
         StatusCode::OK,
@@ -6171,14 +6520,10 @@ async fn get_group_public_messages(
 async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
     let mut all = state.public_messages.write().await;
     let slot = all.entry(msg.group_id.clone()).or_default();
-    // Deduplicate by (author_agent_id, timestamp, body) — cheap guard
-    // against double-caching our own just-sent message after the
-    // listener echoes it back.
-    let dup = slot.iter().any(|m| {
-        m.author_agent_id == msg.author_agent_id
-            && m.timestamp == msg.timestamp
-            && m.body == msg.body
-    });
+    // Deduplicate by the stable message identity (`signature`) rather
+    // than a lossy (author,timestamp,body) tuple so legitimate repeated
+    // bodies sent in the same millisecond are still preserved.
+    let dup = slot.iter().any(|m| m.signature == msg.signature);
     if !dup {
         slot.push(msg);
         while slot.len() > PUBLIC_MESSAGE_HISTORY_CAP {
@@ -6224,11 +6569,20 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                     // Validate against current group view at apply-time.
                     let snapshot = {
                         let groups = state_for_listener.named_groups.read().await;
-                        groups.get(&group_id_for_listener).map(|info| (
-                            info.policy.clone(),
-                            info.members_v2.clone(),
-                            info.stable_group_id().to_string(),
-                        ))
+                        groups
+                            .get(&group_id_for_listener)
+                            .or_else(|| {
+                                groups.values().find(|info| {
+                                    info.stable_group_id() == group_id_for_listener.as_str()
+                                })
+                            })
+                            .map(|info| {
+                                (
+                                    info.policy.clone(),
+                                    info.members_v2.clone(),
+                                    info.stable_group_id().to_string(),
+                                )
+                            })
                     };
                     let Some((policy, members, stable_id)) = snapshot else {
                         continue;
@@ -6287,12 +6641,17 @@ async fn create_group_invite(
         )
             .into_response();
     }
-    let invite = x0x::groups::invite::SignedInvite::new(
+    let mut invite = x0x::groups::invite::SignedInvite::new(
         info.mls_group_id.clone(),
         info.name.clone(),
         &agent_id,
         req.expiry_secs,
     );
+    invite.stable_group_id = Some(info.stable_group_id().to_string());
+    invite.group_created_at = Some(info.created_at);
+    invite.group_description = Some(info.description.clone());
+    invite.policy = Some(info.policy.clone());
+    invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
 
     let link = invite.to_link();
 
@@ -6370,13 +6729,30 @@ async fn join_group_via_invite(
                 .insert(group_id_hex.clone(), group);
             save_mls_groups(&state).await;
 
-            // Create group info from invite
-            let mut info = x0x::groups::GroupInfo::new(
+            // Create group info from invite. D.4 requires the joiner to seed
+            // the same stable group identity + policy snapshot as the authority
+            // so later signed state commits can chain from the same base.
+            let mut info = x0x::groups::GroupInfo::with_policy(
                 invite.group_name.clone(),
-                String::new(),
+                invite.group_description.clone().unwrap_or_default(),
                 creator,
                 group_id_hex.clone(),
+                invite.policy.clone().unwrap_or_default(),
             );
+            if let Some(group_created_at) = invite.group_created_at {
+                info.created_at = group_created_at;
+            }
+            if let Some(stable_group_id) = invite.stable_group_id.clone() {
+                info.genesis = Some(x0x::groups::GroupGenesis::with_existing_id(
+                    stable_group_id,
+                    invite.inviter.clone(),
+                    info.created_at,
+                    invite.genesis_creation_nonce.clone().unwrap_or_else(|| {
+                        hex::encode(blake3::hash(group_id_hex.as_bytes()).as_bytes())
+                    }),
+                ));
+            }
+            info.recompute_state_hash();
 
             let joiner_hex = hex::encode(agent_id.as_bytes());
             info.add_member(
@@ -6482,6 +6858,8 @@ async fn add_named_group_member(
         }
     };
     let local_agent = state.agent.agent_id();
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
 
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
@@ -6512,14 +6890,24 @@ async fn add_named_group_member(
         info.add_member(
             agent_hex.clone(),
             x0x::groups::GroupRole::Member,
-            Some(actor_hex),
+            Some(actor_hex.clone()),
             req.display_name.clone(),
         );
         if let Some(display_name) = req.display_name.clone() {
             info.set_display_name(&agent_hex, display_name);
         }
         let revision = info.roster_revision;
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
         let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
         let members = named_group_member_values(info);
         drop(named_groups);
 
@@ -6541,16 +6929,18 @@ async fn add_named_group_member(
         save_named_groups(&state).await;
         save_mls_groups(&state).await;
         let event = NamedGroupMetadataEvent::MemberAdded {
-            group_id: id.clone(),
+            group_id: event_group_id,
             revision,
-            actor: hex::encode(local_agent.as_bytes()),
+            actor: actor_hex,
             agent_id: agent_hex,
             display_name: req.display_name,
+            commit: Some(commit),
         };
         (metadata_topic, event, members, epoch)
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -6579,6 +6969,8 @@ async fn remove_named_group_member(
     };
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
 
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
@@ -6615,7 +7007,17 @@ async fn remove_named_group_member(
         info.roster_revision = info.roster_revision.saturating_add(1);
         let revision = info.roster_revision;
         info.remove_member(&agent_id_hex, Some(hex::encode(local_agent.as_bytes())));
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
         let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
         let members = named_group_member_values(info);
         drop(named_groups);
 
@@ -6635,15 +7037,17 @@ async fn remove_named_group_member(
         save_named_groups(&state).await;
         save_mls_groups(&state).await;
         let event = NamedGroupMetadataEvent::MemberRemoved {
-            group_id: id.clone(),
+            group_id: event_group_id,
             revision,
             actor: local_agent_hex,
             agent_id: agent_id_hex.clone(),
+            commit: Some(commit),
         };
         (metadata_topic, event, members, epoch)
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -6821,40 +7225,73 @@ async fn leave_group(
 ) -> impl IntoResponse {
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
 
-    let removed_info = state.named_groups.write().await.remove(&id);
-    let Some(info) = removed_info else {
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "ok": false, "error": "group not found" })),
         );
     };
 
-    let revision = info.roster_revision.saturating_add(1);
-    let metadata_topic = info.metadata_topic.clone();
     let is_creator = local_agent == info.creator;
     let name = info.name.clone();
+    let metadata_topic = info.metadata_topic.clone();
+    let event_group_id = info.stable_group_id().to_string();
+    let event = if is_creator {
+        let revision = info.roster_revision.saturating_add(1);
+        let commit = match info.seal_withdrawal(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({ "ok": false, "error": format!("withdrawal seal failed: {e}") }),
+                    ),
+                );
+            }
+        };
+        NamedGroupMetadataEvent::GroupDeleted {
+            group_id: event_group_id.clone(),
+            revision,
+            actor: local_agent_hex.clone(),
+            commit: Some(commit),
+        }
+    } else {
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        let revision = info.roster_revision;
+        info.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
+        NamedGroupMetadataEvent::MemberRemoved {
+            group_id: event_group_id,
+            revision,
+            actor: local_agent_hex.clone(),
+            agent_id: local_agent_hex.clone(),
+            commit: Some(commit),
+        }
+    };
+    drop(groups);
 
+    save_named_groups(&state).await;
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    state.named_groups.write().await.remove(&id);
+    state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
-
-    let event = if is_creator {
-        NamedGroupMetadataEvent::GroupDeleted {
-            group_id: id.clone(),
-            revision,
-            actor: local_agent_hex,
-        }
-    } else {
-        NamedGroupMetadataEvent::MemberRemoved {
-            group_id: id.clone(),
-            revision,
-            actor: local_agent_hex.clone(),
-            agent_id: local_agent_hex,
-        }
-    };
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
 
     (
         StatusCode::OK,
@@ -6933,6 +7370,8 @@ async fn update_named_group(
     Json(req): Json<UpdateGroupRequest>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -6951,41 +7390,35 @@ async fn update_named_group(
     if let Some(desc) = req.description {
         info.description = desc;
     }
-    info.updated_at = now_millis_u64();
+    info.updated_at = now_ms;
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
+    let commit = match info.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     let updated_name = info.name.clone();
     let updated_desc = info.description.clone();
     let metadata_topic = info.metadata_topic.clone();
-    // Refresh the local card cache if the group is discoverable so
-    // /groups/discover immediately reflects the update.
-    let refreshed_card = info.to_group_card();
+    let event_group_id = info.stable_group_id().to_string();
     drop(groups);
     save_named_groups(&state).await;
-    if let Some(card) = refreshed_card {
-        state
-            .group_card_cache
-            .write()
-            .await
-            .insert(card.group_id.clone(), card.clone());
-        // Also republish the card so other peers update their caches.
-        let card_event = NamedGroupMetadataEvent::GroupCardPublished {
-            group_id: id.clone(),
-            card,
-        };
-        publish_named_group_metadata_event(&state, &metadata_topic, &card_event).await;
-        // Also publish to the global discovery topic (P0-1).
-        publish_group_card_to_discovery(&state, &id).await;
-    }
 
     let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
-        group_id: id.clone(),
+        group_id: event_group_id,
         revision,
         actor: caller_hex,
         name: name_update,
         description: desc_update,
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -7005,6 +7438,8 @@ async fn update_group_policy(
     Json(req): Json<UpdateGroupPolicyRequest>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -7047,7 +7482,7 @@ async fn update_group_policy(
     info.policy = new_policy.clone();
     info.policy_revision = info.policy_revision.saturating_add(1);
     let revision = info.policy_revision;
-    info.updated_at = now_millis_u64();
+    info.updated_at = now_ms;
 
     // Establish discovery topic when the group becomes publicly discoverable.
     if info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
@@ -7059,39 +7494,30 @@ async fn update_group_policy(
         ));
     }
 
+    let commit = match info.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     let metadata_topic = info.metadata_topic.clone();
+    let event_group_id = info.stable_group_id().to_string();
     let policy_clone = info.policy.clone();
     drop(groups);
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::PolicyUpdated {
-        group_id: id.clone(),
+        group_id: event_group_id,
         revision,
         actor: caller_hex,
         policy: policy_clone.clone(),
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-
-    // P0-1: if the new policy is discoverable, (re)publish the card to the global
-    // discovery topic so other daemons see the change.
-    if policy_clone.discoverability != x0x::groups::GroupDiscoverability::Hidden {
-        let refreshed_card = {
-            let groups = state.named_groups.read().await;
-            groups.get(&id).and_then(|info| info.to_group_card())
-        };
-        if let Some(card) = refreshed_card {
-            state
-                .group_card_cache
-                .write()
-                .await
-                .insert(card.group_id.clone(), card);
-            publish_group_card_to_discovery(&state, &id).await;
-        }
-    } else {
-        // Hidden again — forget the card locally so `/groups/discover` stops
-        // returning it for the owner.
-        state.group_card_cache.write().await.remove(&id);
-    }
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -7106,6 +7532,8 @@ async fn update_member_role(
     Json(req): Json<UpdateMemberRoleRequest>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
     let Some(new_role) = x0x::groups::GroupRole::from_name(&req.role) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -7167,19 +7595,30 @@ async fn update_member_role(
     info.set_member_role(&agent_id_hex, new_role);
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
+    let commit = match info.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     let metadata_topic = info.metadata_topic.clone();
+    let event_group_id = info.stable_group_id().to_string();
     drop(groups);
     save_named_groups(&state).await;
 
-    // Phase D: trigger MLS rekey here when member privilege changes.
     let event = NamedGroupMetadataEvent::MemberRoleUpdated {
-        group_id: id.clone(),
+        group_id: event_group_id,
         revision,
         actor: caller_hex,
         agent_id: agent_id_hex,
         role: new_role,
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -7193,6 +7632,8 @@ async fn ban_group_member(
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -7213,6 +7654,7 @@ async fn ban_group_member(
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
     let metadata_topic = info.metadata_topic.clone();
+    let event_group_id = info.stable_group_id().to_string();
 
     // Phase D.2: rotate the group shared secret so banned peer's stale secret
     // cannot decrypt new-epoch content. Capture remaining active members with
@@ -7233,6 +7675,15 @@ async fn ban_group_member(
         (Some(sec), ep, remaining)
     } else {
         (None, 0, Vec::new())
+    };
+    let commit = match info.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
     };
 
     drop(groups);
@@ -7257,7 +7708,7 @@ async fn ban_group_member(
             publish_secure_share(
                 &state,
                 &metadata_topic,
-                &id,
+                &event_group_id,
                 recipient,
                 kem_b64,
                 &caller_hex,
@@ -7296,12 +7747,15 @@ async fn ban_group_member(
     save_mls_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberBanned {
-        group_id: id.clone(),
+        group_id: event_group_id,
         revision,
         actor: caller_hex,
         agent_id: agent_id_hex,
+        secret_epoch: if is_encrypted { Some(new_epoch) } else { None },
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -7315,6 +7769,8 @@ async fn unban_group_member(
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -7334,17 +7790,29 @@ async fn unban_group_member(
     info.unban_member(&agent_id_hex);
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
+    let commit = match info.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     let metadata_topic = info.metadata_topic.clone();
+    let event_group_id = info.stable_group_id().to_string();
     drop(groups);
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberUnbanned {
-        group_id: id.clone(),
+        group_id: event_group_id,
         revision,
         actor: caller_hex,
         agent_id: agent_id_hex,
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -7387,9 +7855,11 @@ async fn create_join_request(
     body: Option<Json<CreateJoinRequestBody>>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
     let req_body = body.map(|b| b.0).unwrap_or_default();
+    let now_ms = now_millis_u64();
 
-    let (metadata_topic, request, creator_hex) = {
+    let (metadata_topic, event_group_id, request, creator_hex, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return (
@@ -7432,12 +7902,27 @@ async fn create_join_request(
             info.mls_group_id.clone(),
             caller_hex.clone(),
             req_body.message.clone(),
-            now_millis_u64(),
+            now_ms,
         );
         info.join_requests
             .insert(request.request_id.clone(), request.clone());
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
         let creator_hex = hex::encode(info.creator.as_bytes());
-        (info.metadata_topic.clone(), request, creator_hex)
+        (
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            request,
+            creator_hex,
+            commit,
+        )
     };
 
     save_named_groups(&state).await;
@@ -7448,14 +7933,16 @@ async fn create_join_request(
     let requester_kem_b64 =
         base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
     let event = NamedGroupMetadataEvent::JoinRequestCreated {
-        group_id: id.clone(),
+        group_id: event_group_id,
         request_id: request.request_id.clone(),
         requester_agent_id: request.requester_agent_id.clone(),
         message: request.message.clone(),
         ts: request.created_at,
         requester_kem_public_key_b64: Some(requester_kem_b64),
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
     let _ = creator_hex; // reserved for direct-notification future enhancement
 
     (
@@ -7474,8 +7961,10 @@ async fn approve_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
 
-    let (metadata_topic, requester_hex, revision) = {
+    let (metadata_topic, event_group_id, requester_hex, revision, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return (
@@ -7500,7 +7989,7 @@ async fn approve_join_request(
         }
         req.status = x0x::groups::JoinRequestStatus::Approved;
         req.reviewed_by = Some(caller_hex.clone());
-        req.reviewed_at = Some(now_millis_u64());
+        req.reviewed_at = Some(now_ms);
         let requester_hex = req.requester_agent_id.clone();
         info.add_member(
             requester_hex.clone(),
@@ -7509,10 +7998,21 @@ async fn approve_join_request(
             None,
         );
         info.roster_revision = info.roster_revision.saturating_add(1);
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
         (
             info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
             requester_hex,
             info.roster_revision,
+            commit,
         )
     };
 
@@ -7548,7 +8048,7 @@ async fn approve_join_request(
                 publish_secure_share(
                     &state,
                     &metadata_topic,
-                    &id,
+                    &event_group_id,
                     &requester_hex,
                     kem_b64,
                     &caller_hex,
@@ -7606,13 +8106,15 @@ async fn approve_join_request(
     save_mls_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::JoinRequestApproved {
-        group_id: id,
+        group_id: event_group_id,
         request_id,
         revision,
         actor: caller_hex,
         requester_agent_id: requester_hex,
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -7626,8 +8128,10 @@ async fn reject_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
 
-    let (metadata_topic, requester_hex) = {
+    let (metadata_topic, event_group_id, requester_hex, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return (
@@ -7652,19 +8156,36 @@ async fn reject_join_request(
         }
         req.status = x0x::groups::JoinRequestStatus::Rejected;
         req.reviewed_by = Some(caller_hex.clone());
-        req.reviewed_at = Some(now_millis_u64());
-        (info.metadata_topic.clone(), req.requester_agent_id.clone())
+        req.reviewed_at = Some(now_ms);
+        let requester_hex = req.requester_agent_id.clone();
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
+        (
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            requester_hex,
+            commit,
+        )
     };
 
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::JoinRequestRejected {
-        group_id: id,
+        group_id: event_group_id,
         request_id,
         actor: caller_hex,
         requester_agent_id: requester_hex,
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
@@ -7675,8 +8196,10 @@ async fn cancel_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
 
-    let (metadata_topic, requester_hex) = {
+    let (metadata_topic, event_group_id, requester_hex, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return (
@@ -7703,17 +8226,34 @@ async fn cancel_join_request(
             );
         }
         req.status = x0x::groups::JoinRequestStatus::Cancelled;
-        (info.metadata_topic.clone(), req.requester_agent_id.clone())
+        let requester_hex = req.requester_agent_id.clone();
+        let commit = match info.seal_commit(signing_kp, now_ms) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                );
+            }
+        };
+        (
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            requester_hex,
+            commit,
+        )
     };
 
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::JoinRequestCancelled {
-        group_id: id,
+        group_id: event_group_id,
         request_id,
         requester_agent_id: requester_hex,
+        commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
@@ -7743,11 +8283,14 @@ async fn discover_groups(
             }
         }
     }
-    // Also synthesize cards for any local groups the caller owns that are discoverable.
+    // Also synthesize signed cards for any local groups the caller owns that are discoverable.
     let groups = state.named_groups.read().await;
+    let signing_kp = state.agent.identity().agent_keypair();
     for info in groups.values() {
-        if let Some(card) = info.to_group_card() {
-            cards.entry(info.mls_group_id.clone()).or_insert(card);
+        if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
+            cards
+                .entry(info.stable_group_id().to_string())
+                .or_insert(card);
         }
     }
     let mut list: Vec<x0x::groups::GroupCard> = cards.into_values().collect();
@@ -7776,44 +8319,28 @@ async fn discover_groups(
 /// - `Hidden` never appears.
 /// - `ListedToContacts` never appears on this endpoint (only on
 ///   contact-scoped surfaces).
-/// - `PublicDirectory` appears subject to local presence/cache.
+/// - `PublicDirectory` appears only if it has been observed on the
+///   shard discovery plane.
 ///
-/// In this v1 implementation we weight purely by "is there at least one
-/// cached card for this group"; tighter FOAF-based weighting is follow-up
-/// work. The important privacy guarantees (no-leak for Hidden /
-/// ListedToContacts) are enforced here.
+/// IMPORTANT: this endpoint is intentionally a **shard-cache-only
+/// witness**. It does not merge the legacy bridge cache or locally
+/// synthesised cards, so a hit here is attributable to C.2 discovery
+/// rather than local ownership or bridge dual-publish. Tighter
+/// FOAF-based weighting is follow-up work.
 async fn discover_groups_nearby(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut seen = std::collections::HashSet::<String>::new();
     let mut out: Vec<x0x::groups::GroupCard> = Vec::new();
-    // Shard cache first — these are cards we've seen via shard gossip.
-    {
-        let shard_cache = state.directory_cache.read().await;
-        for card in shard_cache.iter_all() {
-            if card.withdrawn {
-                continue;
-            }
-            if card.policy_summary.discoverability
-                != x0x::groups::GroupDiscoverability::PublicDirectory
-            {
-                continue;
-            }
-            if seen.insert(card.group_id.clone()) {
-                out.push(card.clone());
-            }
+    let shard_cache = state.directory_cache.read().await;
+    for card in shard_cache.iter_all() {
+        if card.withdrawn {
+            continue;
         }
-    }
-    // Local groups we own that are PublicDirectory — merge them in.
-    {
-        let groups = state.named_groups.read().await;
-        for info in groups.values() {
-            if info.policy.discoverability != x0x::groups::GroupDiscoverability::PublicDirectory {
-                continue;
-            }
-            if let Some(card) = info.to_group_card() {
-                if seen.insert(card.group_id.clone()) {
-                    out.push(card);
-                }
-            }
+        if card.policy_summary.discoverability != x0x::groups::GroupDiscoverability::PublicDirectory
+        {
+            continue;
+        }
+        if seen.insert(card.group_id.clone()) {
+            out.push(card.clone());
         }
     }
     (
@@ -7956,9 +8483,19 @@ async fn get_group_card(
     }
     let groups = state.named_groups.read().await;
     if let Some(info) = groups.get(&id) {
-        if let Some(card) = info.to_group_card() {
-            return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
-                .into_response();
+        match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
+            Ok(Some(card)) => {
+                return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("card sign failed: {e}") })),
+                )
+                    .into_response();
+            }
         }
     }
     (
@@ -7985,6 +8522,12 @@ async fn import_group_card(
             Json(serde_json::json!({ "ok": false, "error": "card is hidden" })),
         );
     }
+    if let Err(e) = card.verify_signature() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("invalid signed card: {e}") })),
+        );
+    }
     let group_id = card.group_id.clone();
 
     // Parse owner hex into an AgentId for the stub.
@@ -8007,7 +8550,8 @@ async fn import_group_card(
         .await
         .insert(group_id.clone(), card.clone());
 
-    // Create a local stub GroupInfo if none exists.
+    // Create or refresh a local stub GroupInfo keyed by the authority's
+    // stable group id from the card.
     let mut groups = state.named_groups.write().await;
     if !groups.contains_key(&group_id) {
         let mut stub = x0x::groups::GroupInfo::with_policy(
@@ -8015,8 +8559,29 @@ async fn import_group_card(
             card.description.clone(),
             creator,
             group_id.clone(),
-            policy,
+            policy.clone(),
         );
+        if let Some(metadata_topic) = card.metadata_topic.clone() {
+            stub.metadata_topic = metadata_topic;
+        }
+        // Imported stubs must preserve the authority's stable `group_id`
+        // from the card. Recomputing a fresh genesis here would mint a new
+        // local-only stable id, breaking public-topic alignment and any
+        // state-hash / revision metadata copied from the discovered card.
+        stub.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            group_id.clone(),
+            card.owner_agent_id.clone(),
+            card.created_at,
+            String::new(),
+        ));
+        stub.created_at = card.created_at;
+        stub.updated_at = card.updated_at;
+        stub.state_revision = card.revision;
+        if !card.state_hash.is_empty() {
+            stub.state_hash = card.state_hash.clone();
+        }
+        stub.prev_state_hash = card.prev_state_hash.clone();
+        stub.withdrawn = card.withdrawn;
         // The stub should not treat the caller as the owner — reset members_v2
         // and store the owner (from card) as the active Owner.
         stub.members_v2.clear();
@@ -8032,6 +8597,43 @@ async fn import_group_card(
         stub.shared_secret = None;
         stub.secret_epoch = 0;
         groups.insert(group_id.clone(), stub);
+    } else if let Some(existing) = groups.get_mut(&group_id) {
+        existing.name = card.name.clone();
+        existing.description = card.description.clone();
+        existing.policy = policy;
+        existing.created_at = card.created_at;
+        existing.updated_at = card.updated_at;
+        if let Some(metadata_topic) = card.metadata_topic.clone() {
+            existing.metadata_topic = metadata_topic;
+        }
+        existing.state_revision = card.revision;
+        if !card.state_hash.is_empty() {
+            existing.state_hash = card.state_hash.clone();
+        }
+        existing.prev_state_hash = card.prev_state_hash.clone();
+        existing.withdrawn = card.withdrawn;
+        if existing
+            .genesis
+            .as_ref()
+            .map_or(true, |genesis| genesis.group_id != group_id)
+        {
+            existing.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+                group_id.clone(),
+                card.owner_agent_id.clone(),
+                card.created_at,
+                String::new(),
+            ));
+        }
+        existing
+            .members_v2
+            .entry(card.owner_agent_id.clone())
+            .or_insert_with(|| {
+                x0x::groups::GroupMember::new_owner(
+                    card.owner_agent_id.clone(),
+                    None,
+                    card.created_at,
+                )
+            });
     }
     drop(groups);
     save_named_groups(&state).await;
@@ -8115,7 +8717,7 @@ async fn secure_group_encrypt(
         );
     };
     let epoch = info.secret_epoch;
-    let group_id_clone = info.mls_group_id.clone();
+    let group_id_clone = info.stable_group_id().to_string();
     drop(groups);
 
     use base64::Engine as _;
@@ -8211,7 +8813,7 @@ async fn secure_group_decrypt(
         );
     };
     let local_epoch = info.secret_epoch;
-    let group_id_clone = info.mls_group_id.clone();
+    let group_id_clone = info.stable_group_id().to_string();
     drop(groups);
 
     // Caller's local epoch must match the ciphertext epoch. A banned member
@@ -8373,7 +8975,7 @@ async fn secure_group_reseal(
         );
     };
     let epoch = info.secret_epoch;
-    let group_id_wire = info.mls_group_id.clone();
+    let group_id_wire = info.stable_group_id().to_string();
     drop(groups);
 
     if secret_vec.len() != 32 {

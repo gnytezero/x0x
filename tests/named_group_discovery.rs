@@ -52,6 +52,7 @@ fn make_card(
         created_at: 0,
         updated_at: 0,
         request_access_enabled: true,
+        metadata_topic: None,
         revision,
         state_hash: format!("h{revision}"),
         prev_state_hash: None,

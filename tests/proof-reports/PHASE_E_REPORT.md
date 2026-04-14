@@ -1,10 +1,11 @@
 # Phase E Proof Report — Public-Group Messaging
 
 > **Honesty clause.** Phase E delivers the signed public-message plane
-> and its write-access + banned-author enforcement truth-table. It does
-> **not** claim anything C.2 hasn't proven (discovery stays under C.2's
-> open proof-debt in `.planning/c2-proof-hardening.md`). Claims here
-> are bounded to what Phase E adds.
+> and its write-access + banned-author enforcement truth-table. C.2 is
+> now separately signoff-ready, so this report no longer inherits C.2
+> proof-debt language. Claims here remain bounded to what Phase E adds:
+> public-message signing, receive-side enforcement, and real cross-daemon
+> receive proof on the public plane.
 
 ## Scope of E
 
@@ -67,17 +68,18 @@ Per `docs/design/named-groups-full-model.md` §"Public groups":
   after their listener starts. History replication for late joiners
   is future scope.
 - No federation with external directory servers.
-- Anything C.2-related (shard convergence, LTC positive delivery,
-  restart persistence) remains C.2's open proof-debt and is unchanged
-  by Phase E.
+- This report does not claim anything beyond the public-message plane;
+  C.2, D.4, and broader final signoff are tracked separately.
 
 ## Evidence — unit + integration
 
-- `src/groups/public_message.rs`: **19 unit tests** covering sign/
+- `src/groups/public_message.rs`: **23 unit tests** covering sign/
   verify roundtrip, tamper detection on body / group_id / kind /
-  author, ingest truth-table for all three write_access values
-  against active/banned/missing/admin/owner authors, confidentiality
-  gate, oversize rejection, and preset shape assertions.
+  author / `state_hash_at_send` / `revision_at_send` / `timestamp` /
+  `author_user_id`, ingest truth-table for all three write_access
+  values against active/banned/missing/admin/owner authors,
+  confidentiality gate, oversize rejection, and preset shape
+  assertions.
 - `tests/named_group_public_messages.rs`: **14 integration tests**
   covering the same surface at the crate-public API plus a loop
   asserting banned authors are rejected in every `write_access`
@@ -91,39 +93,71 @@ Per `docs/design/named-groups-full-model.md` §"Public groups":
 
 ## Evidence — end-to-end
 
-`tests/e2e_named_groups.sh` new **Phase E section** (~100 assertions
-added over D.3/C.2 sections) exercises on three fresh daemons:
+`tests/e2e_named_groups.sh` Phase E section exercises on three fresh
+local daemons. Evidence comes in two layers:
+
+1. Archived baseline runs under
+   `tests/proof-reports/named-groups-e-run{1,2,3}.log` showing the
+   original E section stayed green while the rest of the suite still
+   had the same unrelated pre-existing failures.
+2. A strengthened shell rerun archived at
+   `tests/proof-reports/named-groups-phasef-clean.log`.
+3. A dedicated live daemon proof archived at:
+   - `tests/proof-reports/named-groups-e-live-run1.log`
+   - `tests/proof-reports/named-groups-e-live-run2.log`
+   - `tests/proof-reports/named-groups-e-live-run3.log`
+   - `tests/proof-reports/named-groups-e-live-nextest.log`
+
+What the strengthened rerun **does** prove:
 
 - Owner publishes to `public_open` (MembersOnly) — accepted.
-- Non-member bob retrieves `/messages` on Public read — allowed.
+- Non-member bob imports the card, primes his listener, and receives
+  the **exact** body via `GET /groups/:id/messages` under Public read.
 - Non-member bob tries to `/send` to MembersOnly — rejected.
 - Owner publishes announcement on `public_announce` (AdminOnly) —
   accepted.
 - Plain-member bob tries to publish an announcement — rejected.
 - `MlsEncrypted` group: `/send` rejects, `/messages` rejects.
-- `ModeratedPublic` group: non-member bob sends successfully; owner
-  bans bob; bob's subsequent send is rejected (live ingest-side
-  enforcement of the ban).
+- `ModeratedPublic` group: non-member bob can successfully hit the
+  send endpoint after importing the authority card.
+- Positive cross-daemon `ModeratedPublic` receive is now proven:
+  `bob sends` → `alice sees exact body`.
+- After alice bans bob, a post-ban message does **not** land in
+  alice's cache; receive-side ingest rejection is therefore proven.
 
-Three archived clean runs under
-`tests/proof-reports/named-groups-e-run{1,2,3}.log`.
+The dedicated live test `tests/named_group_e_live.rs` specifically proves the
+previous gap on a fresh two-daemon pair and now passes in three consecutive
+archived runs.
 
 ### Honest run-summary framing
 
-The overall suite still contains the same ~32 pre-existing
-environment-dependent failures in sections 2 / 5 / 7 (P0-1 discovery
-timing, P0-6 patch convergence, authz 404 checks). They are **not** E
-regressions. The Phase E section itself is clean (all checks pass on
-each run). The report documents this split explicitly — we are
-**not** calling the whole suite clean.
+The latest full shell rerun is now clean overall:
+- `tests/proof-reports/named-groups-phasef-clean.log`
+- **98 PASS / 0 FAIL**
+
+The earlier shell failures were not Phase E logic regressions; they traced to
+separate state/routing issues that have now been cleaned up:
+- local-route-id vs stable-group-id confusion in cross-daemon shell paths
+- stable-id binding gaps in GSS encrypt/decrypt/reseal
+- stale local group-card cache entries after owner-side state changes
+- over-coupled reject/cancel shell proof steps that depended on unrelated
+  prior cross-stub convergence
+
+So the E section is now clean both in isolation and inside a fully clean
+named-groups shell rerun.
 
 ## Live paths using Phase E
 
 - `POST /groups/:id/send` signs + publishes + caches for SignedPublic.
 - Public-chat listener validates + caches incoming messages.
 - `GET /groups/:id/messages` serves the ring buffer under read policy.
-- Ban enforcement: publish-time (endpoint-side) + ingest-time
-  (validator re-checks current members_v2 state).
+- Ban enforcement: authoritative receive-side ingest rejection is
+  proven. Publish-time rejection applies when the local daemon's roster
+  view is fresh; imported stubs may still briefly lag metadata updates,
+  so the receive-side rejection remains the strongest proof.
+- Reverse-direction public-message receive on a creator-owned local group
+  is now proven after fixing stable-id listener resolution and subscribing
+  the sender's public topic before first publish.
 
 ## Live paths NOT yet in E (deferred)
 
@@ -138,13 +172,21 @@ each run). The report documents this split explicitly — we are
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-features --all-targets -- -D warnings
-cargo nextest run --lib --test api_coverage \
-  --test named_group_public_messages --test named_group_state_commit \
-  --test named_group_discovery
-cargo build --release --bin x0xd --bin x0x
+cargo test --lib groups::public_message::tests --quiet
+cargo test --test named_group_public_messages --quiet
+cargo test --test named_group_discovery --quiet
+cargo build --release --bin x0xd --bin x0x-user-keygen
+cargo test --test named_group_e_live -- --ignored --nocapture \
+  > tests/proof-reports/named-groups-e-live-run1.log 2>&1
+cargo test --test named_group_e_live -- --ignored --nocapture \
+  > tests/proof-reports/named-groups-e-live-run2.log 2>&1
+cargo test --test named_group_e_live -- --ignored --nocapture \
+  > tests/proof-reports/named-groups-e-live-run3.log 2>&1
+cargo nextest run --test named_group_e_live --run-ignored ignored-only \
+  > tests/proof-reports/named-groups-e-live-nextest.log 2>&1
 bash tests/e2e_named_groups.sh > \
-  tests/proof-reports/named-groups-e-run{1,2,3}.log 2>&1
+  tests/proof-reports/named-groups-phasef-clean.log 2>&1
 ```
 
 Approved plan: D.3 → C.2 → **E (now landed)** → D.4 → F. C.2
-proof-debt tracker remains open per `.planning/c2-proof-hardening.md`.
+proof-hardening is now closed; broader final signoff remains under Phase F.

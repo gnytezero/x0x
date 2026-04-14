@@ -1052,6 +1052,150 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
 }
 
 // ===========================================================================
+// 22. Invite join preserves genesis creation nonce
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn invite_join_preserves_genesis_creation_nonce() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({
+                "name": "Invite Genesis Parity",
+                "description": "invite should preserve genesis creation nonce",
+                "display_name": "Alice"
+            }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+
+    let alice_state: Value = alice
+        .get(&format!("/groups/{group_id}/state"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alice_state["ok"], true, "alice state: {alice_state:?}");
+    let alice_nonce = alice_state["genesis"]["creation_nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let alice_stable = alice_state["genesis"]["group_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite["invite_link"].as_str().unwrap().to_string();
+
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_join["ok"], true, "bob join: {bob_join:?}");
+    let bob_group_id = bob_join["group_id"].as_str().unwrap().to_string();
+
+    let bob_state: Value = bob
+        .get(&format!("/groups/{bob_group_id}/state"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_state["ok"], true, "bob state: {bob_state:?}");
+    let bob_nonce = bob_state["genesis"]["creation_nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bob_stable = bob_state["genesis"]["group_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        bob_nonce, alice_nonce,
+        "invite join must preserve genesis nonce"
+    );
+    assert_eq!(
+        bob_stable, alice_stable,
+        "invite join must preserve stable group id"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+// ===========================================================================
+// 23. Imported card bootstrap hint is signature-bound
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn named_group_import_rejects_tampered_metadata_topic() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({
+                "name": "Tamper-Proof Import",
+                "description": "bootstrap hint must be signed",
+                "preset": "public_request_secure"
+            }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+
+    let card: Value = alice
+        .get(&format!("/groups/cards/{group_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(card["signature"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(card["metadata_topic"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+
+    let mut tampered = card.clone();
+    tampered["metadata_topic"] = serde_json::json!("x0x.group.evil.meta");
+
+    let resp = bob.post("/groups/cards/import", tampered).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false, "import body: {body:?}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("invalid signed card"));
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+// ===========================================================================
 // 21. Creator delete propagates to peers
 // ===========================================================================
 

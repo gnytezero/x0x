@@ -1,16 +1,15 @@
 # Phase C.2 Proof Report — Distributed Discovery Index
 
-> **Honesty clause.** C.2 landed the shard-based discovery code path and
-> is well-covered by unit + integration tests. **Live end-to-end proof
-> is incomplete**: positive cross-peer shard convergence was not
-> demonstrated in any of the three archived e2e runs, the current
-> `/groups/discover` endpoint is path-ambiguous due to dual-publish
-> coexistence with the legacy bridge topic, and several positive-path
-> claims (LTC delivery, AE repair, restart persistence) remain logic-
-> tested only. C.2 is **not** presented here as "fully proven" or as
-> "real discovery, proven in e2e." Proof-hardening tasks required for
-> final signoff are tracked in
-> [`.planning/c2-proof-hardening.md`](../../.planning/c2-proof-hardening.md).
+> **Honesty clause.** C.2 landed the shard-based discovery code path and is
+> well-covered by unit + integration tests. The dedicated live proof suite now
+> covers all four proof-hardening items: shard-attributed nearby discovery,
+> late-subscriber anti-entropy repair, `ListedToContacts` positive+negative
+> delivery, and restart-persisted shard resubscribe. A real privacy bug was
+> found during this hardening pass — `ListedToContacts` cards were still being
+> dual-published onto the legacy global discovery topic — and fixed. With that
+> fix plus the archived clean live runs below, **C.2 proof-hardening is now
+> closed**. This is a C.2 signoff statement only; it is **not** Phase-F-final
+> or overall named-group-suite signoff.
 
 ## Scope of C.2
 
@@ -55,8 +54,58 @@ Implement partition-tolerant, DHT-free group discovery per
 
 This covers correctness of the shard primitives, cache semantics,
 AE digest/pull logic, privacy-gate functions, subscription JSON
-round-trip, and signed-card verification. It does **not** cover live
-cross-daemon shard-plane convergence.
+round-trip, and signed-card verification.
+
+### Dedicated live proof suite (A/B/C/D now closed)
+
+A dedicated daemon test file now proves all four proof-hardening items:
+
+- `tests/named_group_c2_live.rs`
+- archived clean runs:
+  - `tests/proof-reports/named-groups-c2-hardening-run1.log`
+  - `tests/proof-reports/named-groups-c2-hardening-run2.log`
+  - `tests/proof-reports/named-groups-c2-hardening-run3.log`
+- shell hook visible in `tests/proof-reports/named-groups-c2cd-rerun.log`
+
+What it proves:
+
+#### A. Shard-only nearby witness
+1. Bob subscribes to a name shard before Alice creates the group.
+2. Alice creates a `PublicDirectory` / `public_request_secure` group.
+3. Bob never manually imports the card.
+4. Bob's `GET /groups/discover/nearby` — the shard-cache-only witness —
+   eventually shows Alice's stable `group_id`.
+5. The test reseals while polling, so the proof is of actual shard-plane
+   delivery, not local synthesis or bridge-topic merge.
+
+#### B. Late-subscriber anti-entropy repair
+1. Alice creates the group first, so Bob misses the initial publish.
+2. Periodic republish is disabled in the daemon config for this test.
+3. Alice subscribes to the shard and advertises from her local shard cache.
+4. Bob subscribes later and initially does **not** have the card.
+5. Within the shortened digest interval, Bob recovers the card via
+   digest/pull repair and `GET /groups/discover/nearby` shows it.
+
+#### C. ListedToContacts positive + negative delivery
+1. Alice marks Bob `Trusted` and Charlie `Blocked`.
+2. Alice creates a `ListedToContacts` group and seals it.
+3. Bob receives the signed card via the contact-scoped direct path and
+   `GET /groups/cards/<stable_group_id>` returns `200`.
+4. Bob still does **not** see the group on public `/groups/discover/nearby`.
+5. Charlie does **not** receive the card (`GET /groups/cards/<stable_group_id>`
+   remains `404`).
+6. Charlie also does **not** see it on public `/groups/discover/nearby`.
+
+#### D. Subscription persistence across restart
+1. Bob subscribes to tag + name + id shards.
+2. The persisted JSON file contains the expected 3 entries.
+3. Bob restarts on the same data dir.
+4. `GET /groups/discover/subscriptions` comes back with 3 again.
+5. After Alice reseals on one of those shards, Bob re-discovers the card via
+   shard-only `/groups/discover/nearby`.
+
+This closes proof-hardening items **A**, **B**, **C**, and **D** from
+`.planning/c2-proof-hardening.md`.
 
 ### Negative privacy proofs (e2e)
 
@@ -73,33 +122,17 @@ demonstrate:
 
 These are all **negative** proofs (absence of leakage).
 
-### What the archived runs did NOT demonstrate
+### What the older archived shell runs did NOT demonstrate
 
-- **Positive live shard convergence.** The "bob discovered
-  PublicDirectory group via shard gossip" check logged `INFO` (not
-  `PASS`) on all three runs — the 90s window elapsed without bob's
-  `/groups/discover` surfacing alice's card. Pre-existing gossip-mesh
-  timing on the local `--no-hard-coded-bootstrap` harness is the most
-  likely cause, but we did **not** positively prove shard delivery.
-- **Path attribution.** `GET /groups/discover` merges three sources:
-  legacy `group_card_cache` (bridge topic) + `directory_cache` (shard
-  cache) + locally synthesised cards. Even if bob had seen the card
-  via this endpoint, we could not distinguish shard delivery from
-  bridge-topic delivery. The daemon still dual-publishes on
-  `GLOBAL_GROUP_DISCOVERY_TOPIC = "x0x.discovery.groups"` for
-  back-compat.
-- **LTC positive delivery.** We proved LTC does not leak to
-  `/discover/nearby`. We did **not** prove that a Trusted/Known
-  contact actually receives and caches the card via the direct-msg
-  `X0X-LTC-CARD-V1` path, nor that an Unknown/Blocked peer fails to
-  receive it.
-- **Live anti-entropy repair.** The digest/pull logic is covered in
-  unit + integration. We did **not** demonstrate a late subscriber
-  missing the initial publish, then converging via digest/pull after
-  subscription.
-- **Subscription persistence across restart.** The JSON round-trip is
-  logic-tested. We did **not** demonstrate subscribe → restart daemon
-  → subscriptions restored → shard listener active after restart.
+The older archived shell runs `named-groups-c2-run{1,2,3}.log` still did not
+prove positive shard convergence in-place. Their positive-path check used
+bridge-ambiguous `GET /groups/discover`, and all three logged `INFO` instead of
+`PASS` for that step.
+
+That historical limitation is now addressed by the dedicated live test above,
+which uses shard-only `GET /groups/discover/nearby` as the witness.
+The older archived shell runs did not prove C or D. Those gaps are now closed
+by the dedicated live suite and the archived hardening runs above.
 
 ### Corrected run summary
 
@@ -134,38 +167,40 @@ checks above.
 - Shard listener processes `Card`/`Digest`/`Pull` and updates local
   cache.
 - ListedToContacts distribution via per-contact direct-message.
-- `/groups/discover`, `/groups/discover/nearby`,
-  `/groups/discover/subscriptions`, `/groups/discover/subscribe`.
+- `/groups/discover`, `/groups/discover/nearby` (now shard-cache-only
+  witness), `/groups/discover/subscriptions`,
+  `/groups/discover/subscribe`.
 - Daemon startup resubscribe from persisted set with staggered jitter.
 - Legacy `x0x.discovery.groups` bridge topic **still dual-published**
   for back-compat. Deprecation/removal is proof-hardening / D.4 scope.
 
-**Deferred / proof-debt** (see `.planning/c2-proof-hardening.md`):
+**Deferred / non-signoff follow-up**:
 - FOAF-weighted ranking in `/groups/discover/nearby`.
 - Incremental digest/pull over the LTC contact channel (current path
-  pushes full signed cards on each authority seal).
-- Deprecation of the legacy bridge topic.
-- A path-attributed discovery proof (e.g. debug endpoint tagging
-  source = shard | bridge | LTC | local, or a bridge-disabled run).
+  still pushes full signed cards on each authority seal).
+- Deprecation of the legacy bridge topic once old peers no longer rely on it.
 
 ## Honest label
 
-**Phase C.2 landed in code and is well-covered by unit / integration
-tests. Live end-to-end proof of shard-delivered public discovery and
-anti-entropy convergence is incomplete and tracked as proof-debt.**
-
-The code is strong enough that Phase E can proceed without building on
-fake discovery — shards are real code, privacy gates are real, and the
-C.2 primitives are exercised by the existing /discover/nearby path.
-C.2 signoff remains open until the proof-debt items close.
+**Phase C.2 landed in code and now has real live proof for shard-delivered
+PublicDirectory discovery, late-subscriber digest/pull repair,
+ListedToContacts positive+negative delivery, and restart-persisted shard
+resubscribe. C.2 proof-hardening is closed.**
 
 ## Commands run
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-features --all-targets -- -D warnings
-cargo nextest run --lib --test named_group_state_commit \
-  --test named_group_discovery --test api_coverage
-cargo build --release --bin x0xd --bin x0x
-bash tests/e2e_named_groups.sh > tests/proof-reports/named-groups-c2-run{1,2,3}.log 2>&1
+cargo fmt --all -- --check
+cargo clippy --all-features --all-targets -- -D warnings
+cargo nextest run --test named_group_discovery --test api_coverage
+cargo build --release --bin x0xd
+cargo test --test named_group_c2_live -- --ignored --nocapture \
+  > tests/proof-reports/named-groups-c2-hardening-run1.log 2>&1
+cargo test --test named_group_c2_live -- --ignored --nocapture \
+  > tests/proof-reports/named-groups-c2-hardening-run2.log 2>&1
+cargo test --test named_group_c2_live -- --ignored --nocapture \
+  > tests/proof-reports/named-groups-c2-hardening-run3.log 2>&1
+bash tests/e2e_named_groups.sh > tests/proof-reports/named-groups-c2cd-rerun.log 2>&1
 ```

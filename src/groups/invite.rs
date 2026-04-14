@@ -1,9 +1,11 @@
 //! Signed invite tokens for group membership.
 //!
 //! Invite tokens are shareable links that allow agents to join a group.
-//! Each token is ML-DSA-65 signed by the inviter, contains the group
-//! metadata needed to join, and optionally expires.
+//! Today admission is authenticated by the invite secret + join handshake;
+//! the `signature` field is retained as future-facing/vestigial metadata and
+//! is not currently enforced on the wire.
 
+use crate::groups::policy::GroupPolicy;
 use crate::identity::AgentId;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,8 +21,24 @@ pub const DEFAULT_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 pub struct SignedInvite {
     /// MLS group ID (hex-encoded).
     pub group_id: String,
+    /// Stable D.3 group_id, if known.
+    #[serde(default)]
+    pub stable_group_id: Option<String>,
+    /// Authority-created timestamp for the group.
+    #[serde(default)]
+    pub group_created_at: Option<u64>,
     /// Human-readable group name.
     pub group_name: String,
+    /// Human-readable group description.
+    #[serde(default)]
+    pub group_description: Option<String>,
+    /// Full policy snapshot used to seed the joiner's local GroupInfo.
+    #[serde(default)]
+    pub policy: Option<GroupPolicy>,
+    /// Authority genesis nonce so invite-joined peers reconstruct the same
+    /// `GroupGenesis` payload, not just the same stable group id.
+    #[serde(default)]
+    pub genesis_creation_nonce: Option<String>,
     /// Agent ID of the inviter (hex-encoded).
     pub inviter: String,
     /// One-time invite secret (32 bytes, hex-encoded).
@@ -30,8 +48,8 @@ pub struct SignedInvite {
     pub created_at: u64,
     /// Unix seconds when this invite expires (0 = never).
     pub expires_at: u64,
-    /// ML-DSA-65 signature over the invite fields (hex-encoded).
-    /// Signs: group_id || group_name || inviter || invite_secret || created_at || expires_at
+    /// Optional future-facing ML-DSA-65 signature over the invite fields
+    /// (hex-encoded). Currently not validated by the join flow.
     pub signature: String,
 }
 
@@ -64,7 +82,12 @@ impl SignedInvite {
 
         Self {
             group_id,
+            stable_group_id: None,
+            group_created_at: None,
             group_name,
+            group_description: None,
+            policy: None,
+            genesis_creation_nonce: None,
             inviter: hex::encode(inviter.as_bytes()),
             invite_secret: hex::encode(secret_bytes),
             created_at: now,
@@ -73,12 +96,25 @@ impl SignedInvite {
         }
     }
 
-    /// Get the bytes that should be signed.
+    /// Get the canonical bytes that would be signed if invite signatures are
+    /// enforced in the future.
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let mut data = Vec::new();
+        data.extend_from_slice(b"x0x.invite.v2|");
         data.extend_from_slice(self.group_id.as_bytes());
+        data.extend_from_slice(self.stable_group_id.as_deref().unwrap_or("").as_bytes());
+        data.extend_from_slice(&self.group_created_at.unwrap_or_default().to_le_bytes());
         data.extend_from_slice(self.group_name.as_bytes());
+        data.extend_from_slice(self.group_description.as_deref().unwrap_or("").as_bytes());
+        let policy_json = serde_json::to_vec(&self.policy).unwrap_or_default();
+        data.extend_from_slice(&policy_json);
+        data.extend_from_slice(
+            self.genesis_creation_nonce
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         data.extend_from_slice(self.inviter.as_bytes());
         data.extend_from_slice(self.invite_secret.as_bytes());
         data.extend_from_slice(&self.created_at.to_le_bytes());
@@ -236,5 +272,27 @@ mod tests {
         let json = serde_json::to_string(&invite).expect("serialize");
         let restored: SignedInvite = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(invite.group_id, restored.group_id);
+    }
+
+    #[test]
+    fn test_optional_metadata_roundtrip() {
+        let mut invite = SignedInvite::new("aabb".repeat(8), "Test".to_string(), &agent(1), 3600);
+        invite.stable_group_id = Some("bb".repeat(32));
+        invite.group_created_at = Some(1_234_567);
+        invite.group_description = Some("desc".to_string());
+        invite.policy = Some(GroupPolicy::default());
+        invite.genesis_creation_nonce = Some("cc".repeat(32));
+
+        let json = serde_json::to_string(&invite).expect("serialize metadata invite");
+        let restored: SignedInvite =
+            serde_json::from_str(&json).expect("deserialize metadata invite");
+        assert_eq!(invite.stable_group_id, restored.stable_group_id);
+        assert_eq!(invite.group_created_at, restored.group_created_at);
+        assert_eq!(invite.group_description, restored.group_description);
+        assert_eq!(invite.policy, restored.policy);
+        assert_eq!(
+            invite.genesis_creation_nonce,
+            restored.genesis_creation_nonce
+        );
     }
 }
