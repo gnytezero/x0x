@@ -213,6 +213,50 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .modal h2{font-size:15px;margin-bottom:var(--sp4)}
 .modal .actions{display:flex;gap:var(--sp2);justify-content:flex-end;margin-top:var(--sp5)}
 
+/* Named-group preset tiles (Create Space modal) */
+.preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp2)}
+.preset-tile{display:block;padding:var(--sp3);border:1px solid var(--bd);border-radius:var(--r-md);cursor:pointer;transition:border-color 150ms,background-color 150ms}
+.preset-tile:hover{background:var(--bg3)}
+.preset-tile.sel{border-color:var(--cy);background:var(--bg3)}
+.preset-tile .preset-label{font-size:13px;font-weight:600;color:var(--tx1);margin-bottom:2px}
+.preset-tile.sel .preset-label{color:var(--cy)}
+.preset-tile .preset-desc{font-size:11px;color:var(--tx3);line-height:1.4}
+
+/* Named-group admin panels (Discover view, space detail) */
+.nag-panel{border:1px solid var(--bd);border-radius:var(--r-md);padding:var(--sp4);margin-bottom:var(--sp3);background:var(--bg2)}
+.nag-panel h3{font-size:13px;margin-bottom:var(--sp1);color:var(--tx1)}
+.nag-panel .sub{font-size:11px;color:var(--tx3);margin-bottom:var(--sp3)}
+.nag-card{border:1px solid var(--bd);border-radius:var(--r-md);padding:var(--sp3);margin-bottom:var(--sp2);background:var(--bg2)}
+.nag-card .name{font-size:13px;font-weight:600;color:var(--tx1)}
+.nag-card .meta{font-size:11px;color:var(--tx3);margin-top:2px}
+.nag-card .desc{font-size:12px;color:var(--tx2);margin-top:var(--sp2);line-height:1.4}
+.nag-card .tags{display:flex;flex-wrap:wrap;gap:var(--sp1);margin-top:var(--sp2)}
+.nag-card .tag{font-size:10px;padding:2px var(--sp2);background:var(--bg3);color:var(--tx2);border-radius:var(--r-sm)}
+.nag-card .footer{display:flex;justify-content:space-between;align-items:center;margin-top:var(--sp2);gap:var(--sp2)}
+.nag-badges{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-end}
+.nag-badge{font-size:10px;padding:2px 6px;border:1px solid var(--bd);border-radius:var(--r-sm);color:var(--tx3);white-space:nowrap}
+.nag-badge.info{color:var(--cy)}
+.nag-badge.ok{color:var(--gn)}
+.nag-badge.warn{color:var(--am)}
+.nag-policy-grid{display:grid;grid-template-columns:max-content 1fr;row-gap:6px;column-gap:var(--sp3);align-items:center}
+.nag-policy-grid label{font-size:11px;color:var(--tx3)}
+.nag-policy-grid select{padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px}
+.nag-policy-grid select:disabled{opacity:.5;cursor:not-allowed}
+.nag-state-readout{display:grid;grid-template-columns:max-content 1fr;row-gap:4px;column-gap:var(--sp3);font-family:ui-monospace,monospace;font-size:11px;color:var(--tx2)}
+.nag-state-readout .k{color:var(--tx3)}
+.nag-state-readout .v{word-break:break-all;overflow-wrap:anywhere}
+.nag-row{display:flex;align-items:center;gap:var(--sp2);padding:var(--sp2) var(--sp3);border:1px solid var(--bd);border-radius:var(--r-sm);margin-bottom:var(--sp1);background:var(--bg2);font-size:12px}
+.nag-row .info{flex:1;min-width:0}
+.nag-row .actions{display:flex;gap:4px}
+.nag-row .feedback{font-size:10px;color:var(--tx3);margin-top:2px}
+.nag-toolbar{display:flex;gap:var(--sp2);flex-wrap:wrap;align-items:center;margin-bottom:var(--sp3)}
+.nag-toolbar input[type=search]{flex:1;min-width:220px;padding:6px 10px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px}
+.nag-toolbar .tabs{display:inline-flex;gap:2px;border:1px solid var(--bd);border-radius:var(--r-sm);padding:2px}
+.nag-toolbar .tabs button{padding:4px 10px;border:0;background:transparent;color:var(--tx3);font-size:11px;border-radius:var(--r-sm);cursor:pointer}
+.nag-toolbar .tabs button.sel{background:var(--bg3);color:var(--cy);font-weight:600}
+.nag-empty{padding:var(--sp5) var(--sp3);border:1px dashed var(--bd);border-radius:var(--r-md);text-align:center;color:var(--tx3);font-size:12px}
+.nag-err{padding:var(--sp2) var(--sp3);border:1px solid var(--rd);background:rgba(255,0,80,.08);color:var(--rd);font-size:12px;border-radius:var(--r-sm);margin-bottom:var(--sp2)}
+
 /* Machine record */
 .machine-row{display:flex;align-items:center;gap:var(--sp3);padding:var(--sp3);border:1px solid var(--bd);border-radius:var(--r-sm);margin-bottom:var(--sp2);font-size:12px}
 .machine-row.pinned{border-color:var(--gn);background:var(--gn-dim)}
@@ -533,6 +577,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
     <div class="sb-section-title" onclick="toggleSection('dms')" style="cursor:pointer"><span>Direct Messages</span></div>
     <div id="sb-dms" class="sb-collapsible"></div>
     <div class="sb-section-title"><span>System</span></div>
+    <div class="sb-item" onclick="navigate('discover')"><span class="icon">&#128270;</span><span>Discover</span></div>
     <div class="sb-item" onclick="navigate('people')"><span class="icon">&#128101;</span><span>People</span></div>
     <div class="sb-item" onclick="navigate('network')"><span class="icon">&#127760;</span><span>Network</span></div>
     <div class="sb-item" onclick="navigate('constitution')"><span class="icon">&#128220;</span><span>Constitution</span></div>
@@ -1434,6 +1479,7 @@ function renderView(){
     case 'home':el.innerHTML=renderHome();mountHome();break;
     case 'space':el.innerHTML=renderSpace();mountSpace();break;
     case 'dm':el.innerHTML=renderDm();mountDm();break;
+    case 'discover':el.innerHTML=renderDiscover();mountDiscover();break;
     case 'people':el.innerHTML=renderPeople();mountPeople();break;
     case 'network':el.innerHTML=renderNetwork();mountNetwork();break;
     case 'settings':el.innerHTML=renderSettings();mountSettings();break;
@@ -2868,6 +2914,390 @@ function showSpaceInfo(groupId){
   showDetail('space',{groupId});
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 13b: NAMED GROUPS — DISCOVER / ADMIN
+   Surfaces the Phase B / C / C.2 / D.2 / D.3 / E named-group API.
+   Mirrors the Dioxus DiscoverView + SpaceAdminPanel so the embedded
+   GUI reaches parity with the desktop apps.
+   ═══════════════════════════════════════════════════════════════════ */
+
+// Persistent state for the Discover view.
+const nagDiscover={mode:'all',query:'',cards:[],err:null,reqStatus:{},seq:0,pollTimer:null};
+
+function nagLabelDiscoverability(v){return {hidden:'hidden',listed_to_contacts:'contacts',public_directory:'public'}[v]||v||'?'}
+function nagLabelAdmission(v){return {invite_only:'invite only',request_access:'request access',open_join:'open join'}[v]||v||'?'}
+function nagLabelConfidentiality(v){return {mls_encrypted:'encrypted',signed_public:'signed public'}[v]||v||'?'}
+function nagLabelRead(v){return {members_only:'members read',public:'public read'}[v]||v||'?'}
+function nagLabelWrite(v){return {members_only:'members post',moderated_public:'moderated post',admin_only:'admin post'}[v]||v||'?'}
+function nagToneAdmission(v){return v==='request_access'?'info':v==='open_join'?'ok':''}
+function nagToneConfidentiality(v){return v==='mls_encrypted'?'ok':v==='signed_public'?'warn':''}
+function nagShort(id){if(!id||id.length<=16)return id||'';return id.slice(0,8)+'…'+id.slice(-6)}
+
+function renderDiscover(){
+  return `<div style="padding:16px 22px;max-width:880px;margin:0 auto">
+    <h2 style="margin-bottom:12px">Discover groups</h2>
+    <div class="nag-toolbar">
+      <input type="search" id="nag-discover-q" placeholder="Search by tag, name, or ID…" value="${esc(nagDiscover.query)}"${nagDiscover.mode==='nearby'?' disabled':''}>
+      <div class="tabs" role="tablist">
+        <button id="nag-tab-all" class="${nagDiscover.mode==='all'?'sel':''}" role="tab">All</button>
+        <button id="nag-tab-nearby" class="${nagDiscover.mode==='nearby'?'sel':''}" role="tab">Nearby</button>
+      </div>
+    </div>
+    <div id="nag-discover-err"></div>
+    <div id="nag-discover-list"></div>
+  </div>`;
+}
+
+function mountDiscover(){
+  const q=document.getElementById('nag-discover-q');
+  if(q){
+    q.addEventListener('input',e=>{
+      nagDiscover.query=e.target.value;
+      nagRenderDiscoverList();
+      nagFetchDiscover();
+    });
+  }
+  document.getElementById('nag-tab-all').addEventListener('click',()=>{
+    if(nagDiscover.mode==='all')return;
+    nagDiscover.mode='all';
+    navigate('discover');
+  });
+  document.getElementById('nag-tab-nearby').addEventListener('click',()=>{
+    if(nagDiscover.mode==='nearby')return;
+    nagDiscover.mode='nearby';
+    navigate('discover');
+  });
+  if(nagDiscover.pollTimer){clearInterval(nagDiscover.pollTimer);nagDiscover.pollTimer=null}
+  nagFetchDiscover();
+  nagDiscover.pollTimer=setInterval(()=>{if(S.get('view')==='discover')nagFetchDiscover()},10000);
+}
+
+async function nagFetchDiscover(){
+  const seq=++nagDiscover.seq;
+  try{
+    let path;
+    if(nagDiscover.mode==='nearby'){path='/groups/discover/nearby'}
+    else{
+      const q=nagDiscover.query.trim();
+      path=q?('/groups/discover?q='+encodeURIComponent(q)):'/groups/discover';
+    }
+    const r=await api(path);
+    if(seq!==nagDiscover.seq)return; // discard stale response
+    if(!r||!r.ok){nagDiscover.err='Discovery failed: '+((r&&r.error)||'unknown');nagDiscover.cards=[]}
+    else{
+      nagDiscover.err=null;
+      nagDiscover.cards=(r.groups||[]).slice().sort((a,b)=>{
+        if((b.revision||0)!==(a.revision||0))return (b.revision||0)-(a.revision||0);
+        return (a.name||'').localeCompare(b.name||'');
+      });
+    }
+  }catch(e){
+    if(seq!==nagDiscover.seq)return;
+    nagDiscover.err='Discovery failed: '+e.message;
+    nagDiscover.cards=[];
+  }
+  nagRenderDiscoverList();
+}
+
+function nagRenderDiscoverList(){
+  const errEl=document.getElementById('nag-discover-err');
+  const listEl=document.getElementById('nag-discover-list');
+  if(!errEl||!listEl)return;
+  errEl.innerHTML=nagDiscover.err?`<div class="nag-err">${esc(nagDiscover.err)}</div>`:'';
+  if(!nagDiscover.cards.length){
+    const msg=nagDiscover.mode==='nearby'
+      ?'No PublicDirectory groups have arrived on the shard plane yet.'
+      :nagDiscover.query.trim()?'No matches — try a different tag, name, or ID.':'No discoverable groups observed yet.';
+    listEl.innerHTML=`<div class="nag-empty">${esc(msg)}</div>`;
+    return;
+  }
+  listEl.innerHTML=nagDiscover.cards.map(nagDiscoverCardHtml).join('');
+  listEl.querySelectorAll('[data-nag-req]').forEach(btn=>{
+    btn.addEventListener('click',()=>nagRequestAccess(btn.getAttribute('data-nag-req')));
+  });
+}
+
+function nagDiscoverCardHtml(card){
+  const policy=card.policy_summary||{};
+  const canRequest=card.request_access_enabled && policy.admission==='request_access' && !card.withdrawn;
+  const status=nagDiscover.reqStatus[card.group_id]||{kind:'idle'};
+  const badges=[
+    {label:nagLabelDiscoverability(policy.discoverability),tone:''},
+    {label:nagLabelAdmission(policy.admission),tone:nagToneAdmission(policy.admission)},
+    {label:nagLabelConfidentiality(policy.confidentiality),tone:nagToneConfidentiality(policy.confidentiality)},
+    {label:nagLabelRead(policy.read_access),tone:''},
+    {label:nagLabelWrite(policy.write_access),tone:''},
+  ].map(b=>`<span class="nag-badge ${b.tone}">${esc(b.label)}</span>`).join('');
+  const tags=(card.tags||[]).map(t=>`<span class="tag">#${esc(t)}</span>`).join('');
+  let footer='';
+  if(status.kind==='submitted')footer=`<span style="font-size:11px;color:var(--gn)">Request submitted — awaiting admin review.</span>`;
+  else if(status.kind==='failed')footer=`<span style="font-size:11px;color:var(--rd)">Request failed: ${esc(status.msg||'')}</span>`;
+  let action='';
+  if(canRequest){
+    const disabled=status.kind==='pending'||status.kind==='submitted';
+    const label=status.kind==='pending'?'Requesting…':status.kind==='submitted'?'Requested':'Request access';
+    action=`<button class="pri" data-nag-req="${esc(card.group_id)}"${disabled?' disabled':''}>${esc(label)}</button>`;
+  }
+  return `<div class="nag-card">
+    <div class="footer">
+      <div>
+        <div class="name">${esc(card.name)}</div>
+        <div class="meta">rev ${card.revision||0} · ${card.member_count||0} members</div>
+      </div>
+      <div class="nag-badges">${badges}</div>
+    </div>
+    ${card.description?`<div class="desc">${esc(card.description)}</div>`:''}
+    ${tags?`<div class="tags">${tags}</div>`:''}
+    ${(footer||action)?`<div class="footer">${footer}${action}</div>`:''}
+  </div>`;
+}
+
+async function nagRequestAccess(gid){
+  const existing=nagDiscover.reqStatus[gid];
+  if(existing && (existing.kind==='pending'||existing.kind==='submitted'))return;
+  nagDiscover.reqStatus[gid]={kind:'pending'};
+  nagRenderDiscoverList();
+  try{
+    const r=await api('/groups/'+gid+'/requests',{method:'POST',body:JSON.stringify({})});
+    if(r && r.ok){nagDiscover.reqStatus[gid]={kind:'submitted'}}
+    else{nagDiscover.reqStatus[gid]={kind:'failed',msg:(r&&r.error)||'unknown'}}
+  }catch(e){nagDiscover.reqStatus[gid]={kind:'failed',msg:e.message||'network error'}}
+  nagRenderDiscoverList();
+}
+
+/* ─ Admin: policy / state / roster / requests inside renderSpaceDetail ─ */
+
+async function nagRenderAdmin(gid){
+  const host=document.getElementById('nag-admin-'+gid);
+  if(!host)return;
+  const [g,stateResp,membersResp,requestsResp,meResp]=await Promise.all([
+    api('/groups/'+gid),
+    api('/groups/'+gid+'/state').catch(()=>null),
+    api('/groups/'+gid+'/members').catch(()=>null),
+    api('/groups/'+gid+'/requests').catch(()=>null),
+    api('/agent').catch(()=>null),
+  ]);
+  const members=(membersResp&&membersResp.ok&&membersResp.members)||[];
+  const requests=(requestsResp&&requestsResp.ok&&(requestsResp.requests||[]))||[];
+  const myAid=(meResp&&meResp.agent_id)||null;
+  const mine=members.find(m=>m.agent_id===myAid);
+  const myRole=mine?mine.role:null;
+  const isOwner=myRole==='owner';
+  const isAdminOrAbove=myRole==='owner'||myRole==='admin';
+  host.innerHTML=nagPolicyPanelHtml(gid,isOwner)
+    +nagStatePanelHtml(gid,stateResp&&stateResp.ok?stateResp:null,isOwner)
+    +nagRosterPanelHtml(gid,members,myAid,isAdminOrAbove,isOwner)
+    +(isAdminOrAbove?nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending')):'');
+  nagBindAdminHandlers(gid);
+}
+
+function nagPolicyPanelHtml(gid,isOwner){
+  const disabled=!isOwner?'disabled':'';
+  const axisOpts=(opts)=>['<option value="">(leave unchanged)</option>',...opts.map(o=>`<option value="${o}">${o}</option>`)].join('');
+  return `<div class="nag-panel" data-nag-policy="${esc(gid)}">
+    <h3>Policy</h3>
+    <div class="sub">Five-axis access control (owner only).</div>
+    ${!isOwner?'<div class="sub" style="color:var(--am)">Only the owner can change policy.</div>':''}
+    <div class="nag-policy-grid">
+      <label>Preset</label>
+      <select data-k="preset" ${disabled}>${axisOpts(['private_secure','public_request_secure','public_open','public_announce'])}</select>
+      <label>Discoverability</label>
+      <select data-k="discoverability" ${disabled}>${axisOpts(['hidden','listed_to_contacts','public_directory'])}</select>
+      <label>Admission</label>
+      <select data-k="admission" ${disabled}>${axisOpts(['invite_only','request_access','open_join'])}</select>
+      <label>Confidentiality</label>
+      <select data-k="confidentiality" ${disabled}>${axisOpts(['mls_encrypted','signed_public'])}</select>
+      <label>Read access</label>
+      <select data-k="read_access" ${disabled}>${axisOpts(['members_only','public'])}</select>
+      <label>Write access</label>
+      <select data-k="write_access" ${disabled}>${axisOpts(['members_only','moderated_public','admin_only'])}</select>
+    </div>
+    <div class="nag-feedback" data-k="policy-feedback" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    ${isOwner?'<div style="display:flex;justify-content:flex-end;margin-top:var(--sp2)"><button class="pri" data-nag-policy-apply>Apply policy change</button></div>':''}
+  </div>`;
+}
+
+function nagStatePanelHtml(gid,state,isOwner){
+  let readout='<div class="sub">Loading state chain…</div>';
+  if(state){
+    const prev=state.prev_state_hash||'(genesis — no parent)';
+    const bind=state.security_binding||'(none)';
+    const status=state.withdrawn?'<span style="color:var(--rd)">withdrawn</span>':'<span style="color:var(--gn)">active</span>';
+    readout=`<div class="nag-state-readout">
+      <span class="k">revision</span><span class="v">${state.state_revision}</span>
+      <span class="k">status</span><span class="v">${status}</span>
+      <span class="k">state_hash</span><span class="v">${esc(state.state_hash||'')}</span>
+      <span class="k">prev_hash</span><span class="v">${esc(prev)}</span>
+      <span class="k">roster_root</span><span class="v">${esc(state.roster_root||'')}</span>
+      <span class="k">policy_hash</span><span class="v">${esc(state.policy_hash||'')}</span>
+      <span class="k">public_meta</span><span class="v">${esc(state.public_meta_hash||'')}</span>
+      <span class="k">security_binding</span><span class="v">${esc(bind)}</span>
+    </div>`;
+  }
+  return `<div class="nag-panel" data-nag-state="${esc(gid)}">
+    <h3>State chain (Phase D.3)</h3>
+    <div class="sub">Signed state-commit chain binds roster, policy, public metadata, and MLS epoch.</div>
+    ${readout}
+    <div class="nag-feedback" data-k="state-feedback" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    ${isOwner?`<div style="display:flex;gap:var(--sp2);margin-top:var(--sp2)">
+      <button class="pri" data-nag-state-seal>Seal state</button>
+      <button class="danger" data-nag-state-withdraw>Withdraw (hide publicly)</button>
+    </div>`:'<div class="sub">Only the owner can seal or withdraw the state chain.</div>'}
+  </div>`;
+}
+
+function nagRosterPanelHtml(gid,members,myAid,canManage,isOwner){
+  const rows=members.map(m=>{
+    const dn=m.display_name&&m.display_name.trim()||nagShort(m.agent_id);
+    const isTargetOwner=m.role==='owner';
+    const manage=canManage && !isTargetOwner;
+    const isBanned=m.state==='banned';
+    let actions='';
+    if(manage){
+      const promote=isOwner && m.role!=='admin' ? `<button data-nag-role="${esc(m.agent_id)}">Promote to admin</button>`:'';
+      const ban=isBanned
+        ? `<button data-nag-unban="${esc(m.agent_id)}">Unban</button>`
+        : `<button class="danger" data-nag-ban="${esc(m.agent_id)}">Ban</button>`;
+      actions=`<div class="actions">${promote}${ban}</div>`;
+    }
+    return `<div class="nag-row" data-nag-member="${esc(m.agent_id)}">
+      <div class="info">
+        <div style="font-weight:600">${esc(dn)}</div>
+        <div style="font-size:10px;color:var(--tx3)">${esc(nagShort(m.agent_id))} · role ${esc(m.role)} · state ${esc(m.state)}</div>
+        <div class="feedback" data-k="feedback"></div>
+      </div>
+      ${actions}
+    </div>`;
+  }).join('');
+  return `<div class="nag-panel" data-nag-roster="${esc(gid)}">
+    <h3>Members (${members.length})</h3>
+    <div class="sub">Add, remove, ban, or change member roles.</div>
+    ${members.length?rows:'<div class="sub">No members yet.</div>'}
+  </div>`;
+}
+
+function nagRequestsPanelHtml(gid,pending){
+  const rows=pending.map(req=>{
+    const msg=req.message||'(no message)';
+    return `<div class="nag-row" data-nag-request="${esc(req.request_id)}">
+      <div class="info">
+        <div style="font-weight:600">${esc(nagShort(req.requester_agent_id))}</div>
+        <div style="font-size:11px;color:var(--tx2)">${esc(msg)}</div>
+        <div class="feedback" data-k="feedback"></div>
+      </div>
+      <div class="actions">
+        <button data-nag-req-approve="${esc(req.request_id)}">Approve</button>
+        <button class="danger" data-nag-req-reject="${esc(req.request_id)}">Reject</button>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="nag-panel" data-nag-requests="${esc(gid)}">
+    <h3>Join requests (${pending.length})</h3>
+    <div class="sub">Review pending access requests and approve or reject.</div>
+    ${pending.length?rows:'<div class="sub">No pending requests.</div>'}
+  </div>`;
+}
+
+function nagBindAdminHandlers(gid){
+  const host=document.getElementById('nag-admin-'+gid);
+  if(!host)return;
+  const apply=host.querySelector('[data-nag-policy-apply]');
+  if(apply)apply.addEventListener('click',()=>nagApplyPolicy(gid));
+  const seal=host.querySelector('[data-nag-state-seal]');
+  if(seal)seal.addEventListener('click',()=>nagSealState(gid));
+  const withdraw=host.querySelector('[data-nag-state-withdraw]');
+  if(withdraw)withdraw.addEventListener('click',()=>nagWithdrawState(gid));
+  host.querySelectorAll('[data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role'),'admin')));
+  host.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
+  host.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
+  host.querySelectorAll('[data-nag-req-approve]').forEach(btn=>btn.addEventListener('click',()=>nagApproveRequest(gid,btn.getAttribute('data-nag-req-approve'))));
+  host.querySelectorAll('[data-nag-req-reject]').forEach(btn=>btn.addEventListener('click',()=>nagRejectRequest(gid,btn.getAttribute('data-nag-req-reject'))));
+}
+
+function nagSetFeedback(sel,msg,tone){
+  const el=document.querySelector(sel);
+  if(!el)return;
+  const colors={ok:'var(--gn)',err:'var(--rd)'};
+  el.style.color=colors[tone]||'var(--tx3)';
+  el.textContent=msg||'';
+}
+
+async function nagApplyPolicy(gid){
+  const host=document.querySelector(`[data-nag-policy="${gid}"]`);
+  if(!host)return;
+  const body={};
+  host.querySelectorAll('select[data-k]').forEach(sel=>{
+    if(sel.value)body[sel.getAttribute('data-k')]=sel.value;
+  });
+  if(!Object.keys(body).length){
+    nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Pick at least one field to change.','err');
+    return;
+  }
+  nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Working…');
+  const r=await api('/groups/'+gid+'/policy',{method:'PATCH',body:JSON.stringify(body)});
+  if(r&&r.ok){
+    nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Policy updated.','ok');
+    nagRenderAdmin(gid);
+  }else{nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,(r&&r.error)||'Policy update failed.','err')}
+}
+
+async function nagSealState(gid){
+  nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Working…');
+  const r=await api('/groups/'+gid+'/state/seal',{method:'POST'});
+  if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'State sealed — new revision published.','ok');nagRenderAdmin(gid)}
+  else{nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,(r&&r.error)||'Seal failed.','err')}
+}
+
+async function nagWithdrawState(gid){
+  nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Working…');
+  const r=await api('/groups/'+gid+'/state/withdraw',{method:'POST'});
+  if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Withdrawal sealed — public card superseded.','ok');nagRenderAdmin(gid)}
+  else{nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,(r&&r.error)||'Withdraw failed.','err')}
+}
+
+function nagMemberFeedback(gid,aid,msg,tone){
+  nagSetFeedback(`[data-nag-roster="${gid}"] [data-nag-member="${aid}"] [data-k="feedback"]`,msg,tone);
+}
+
+async function nagSetRole(gid,aid,role){
+  nagMemberFeedback(gid,aid,'Working…');
+  const r=await api(`/groups/${gid}/members/${aid}/role`,{method:'PATCH',body:JSON.stringify({role})});
+  if(r&&r.ok){nagMemberFeedback(gid,aid,`Role → ${role}.`,'ok');nagRenderAdmin(gid)}
+  else{nagMemberFeedback(gid,aid,(r&&r.error)||'Role change failed.','err')}
+}
+
+async function nagBan(gid,aid){
+  nagMemberFeedback(gid,aid,'Working…');
+  const r=await api(`/groups/${gid}/ban/${aid}`,{method:'POST'});
+  if(r&&r.ok){nagMemberFeedback(gid,aid,'Banned.','ok');nagRenderAdmin(gid)}
+  else{nagMemberFeedback(gid,aid,(r&&r.error)||'Ban failed.','err')}
+}
+
+async function nagUnban(gid,aid){
+  nagMemberFeedback(gid,aid,'Working…');
+  const r=await api(`/groups/${gid}/ban/${aid}`,{method:'DELETE'});
+  if(r&&r.ok){nagMemberFeedback(gid,aid,'Unbanned.','ok');nagRenderAdmin(gid)}
+  else{nagMemberFeedback(gid,aid,(r&&r.error)||'Unban failed.','err')}
+}
+
+function nagRequestFeedback(gid,rid,msg,tone){
+  nagSetFeedback(`[data-nag-requests="${gid}"] [data-nag-request="${rid}"] [data-k="feedback"]`,msg,tone);
+}
+
+async function nagApproveRequest(gid,rid){
+  nagRequestFeedback(gid,rid,'Working…');
+  const r=await api(`/groups/${gid}/requests/${rid}/approve`,{method:'POST'});
+  if(r&&r.ok){nagRequestFeedback(gid,rid,'Approved.','ok');nagRenderAdmin(gid)}
+  else{nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err')}
+}
+
+async function nagRejectRequest(gid,rid){
+  nagRequestFeedback(gid,rid,'Working…');
+  const r=await api(`/groups/${gid}/requests/${rid}/reject`,{method:'POST'});
+  if(r&&r.ok){nagRequestFeedback(gid,rid,'Rejected.','ok');nagRenderAdmin(gid)}
+  else{nagRequestFeedback(gid,rid,(r&&r.error)||'Reject failed.','err')}
+}
+
 async function renderSpaceDetail(el,data){
   const g=await api('/groups/'+data.groupId);
   if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
@@ -2891,8 +3321,13 @@ async function renderSpaceDetail(el,data){
     <div class="card mb">
       <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(g.display_names&&g.display_names[S.get('agentId')]||'')}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
     </div>
+    <h3 style="margin-top:16px">Manage</h3>
+    <div id="nag-admin-${data.groupId}" class="mb">
+      <div class="sub" style="font-size:11px;color:var(--tx3)">Loading admin controls…</div>
+    </div>
     <div class="mt2"><button class="danger" onclick="if(confirm('Leave this space?'))leaveSpace('${data.groupId}')">Leave Space</button></div>
   </div>`;
+  nagRenderAdmin(data.groupId);
 }
 
 const savedInvites={};
@@ -2942,20 +3377,57 @@ function showModal(html){
   return overlay;
 }
 
+/* Named-group policy presets — wire names match
+   `x0x::groups::GroupPolicyPreset` serde rename_all = "snake_case". */
+const SPACE_PRESETS=[
+  {id:'private_secure',label:'Private',desc:'Hidden, invite-only, end-to-end encrypted.'},
+  {id:'public_request_secure',label:'Public · request access',desc:'Discoverable; content stays encrypted until admins approve.'},
+  {id:'public_open',label:'Public community',desc:'Open join, public read, members post.'},
+  {id:'public_announce',label:'Announcement',desc:'Open read; only admins may post.'},
+];
+
+function presetTilesHtml(selected){
+  return SPACE_PRESETS.map(p=>`
+    <label class="preset-tile${p.id===selected?' sel':''}" data-preset="${p.id}">
+      <input type="radio" name="modal-space-preset" value="${p.id}"${p.id===selected?' checked':''} style="position:absolute;opacity:0;pointer-events:none">
+      <div class="preset-label">${esc(p.label)}</div>
+      <div class="preset-desc">${esc(p.desc)}</div>
+    </label>`).join('');
+}
+
 function showCreateSpace(){
   const m=showModal(`<h2>Create Space</h2>
     <input id="modal-space-name" placeholder="Space name" style="width:100%;margin-bottom:12px">
-    <div class="actions">
+    <input id="modal-space-desc" placeholder="Description (optional)" style="width:100%;margin-bottom:12px">
+    <div style="font-size:12px;color:var(--tx3);margin-bottom:6px">Visibility</div>
+    <div id="modal-space-presets" class="preset-grid">${presetTilesHtml('private_secure')}</div>
+    <div class="actions" style="margin-top:14px">
       <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
       <button class="pri" onclick="createSpace()">Create</button>
     </div>`);
+  const grid=document.getElementById('modal-space-presets');
+  if(grid){
+    grid.addEventListener('click',e=>{
+      const tile=e.target.closest('.preset-tile');
+      if(!tile)return;
+      grid.querySelectorAll('.preset-tile').forEach(el=>el.classList.remove('sel'));
+      tile.classList.add('sel');
+      const input=tile.querySelector('input[type=radio]');
+      if(input)input.checked=true;
+    });
+  }
   setTimeout(()=>document.getElementById('modal-space-name').focus(),100);
 }
 
 async function createSpace(){
   const name=document.getElementById('modal-space-name').value.trim();
   if(!name)return;
-  const r=await api('/groups',{method:'POST',body:JSON.stringify({name})});
+  const desc=document.getElementById('modal-space-desc').value.trim();
+  const presetRadio=document.querySelector('input[name=modal-space-preset]:checked');
+  const preset=presetRadio?presetRadio.value:'private_secure';
+  const body={name,preset};
+  if(desc)body.description=desc;
+  const r=await api('/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
     document.querySelector('.modal-overlay').remove();
     toast('Space "'+name+'" created','success');
