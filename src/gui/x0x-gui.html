@@ -1748,16 +1748,35 @@ async function mountSpace(){
       (g.policy_summary && g.policy_summary.confidentiality) ||
       '';
   }
-  // Tear down any previous SignedPublic poll, then start a fresh one
-  // for this space if it is SignedPublic. Polling /messages is the
-  // same receive path used by Dioxus + SwiftUI.
+  // Tear down any previous SignedPublic receive state, then re-arm
+  // for this space if it is SignedPublic. Two receive paths run in
+  // parallel:
+  //   1. WebSocket push on `x0x.groups.public.{stable_group_id}` for
+  //      sub-second latency. The daemon publishes the signed envelope
+  //      on that topic.
+  //   2. 30 s poll of `GET /groups/:id/messages` as a backstop for WS
+  //      reconnects / drops. Same dedup key as the push path.
+  // All three surfaces (GUI, Dioxus, SwiftUI) use the same topic +
+  // dedup strategy.
   if(signedPublicPollTimer){clearInterval(signedPublicPollTimer);signedPublicPollTimer=null}
+  if(signedPublicTopic){wsSubs.delete(signedPublicTopic);signedPublicTopic=''}
   signedPublicSeen.clear();
   if(currentSpaceConfidentiality==='signed_public'){
+    // Fetch the stable group_id (Phase D.3) which is what the daemon
+    // uses for the public topic; it can differ from the mls_group_id
+    // we use for other REST calls.
+    const st=await api('/groups/'+sid+'/state');
+    if(st&&st.ok&&st.group_id){
+      signedPublicTopic='x0x.groups.public.'+st.group_id;
+      signedPublicSpaceId=sid;
+      wsSub(signedPublicTopic);
+    }
+    // Immediate poll so any messages cached before the WS connected
+    // appear straight away.
     signedPublicPoll(sid,true);
     signedPublicPollTimer=setInterval(()=>{
       if(S.get('view')==='space'&&S.get('spaceId')===sid)signedPublicPoll(sid,false);
-    },5000);
+    },30000);
   }
   const chan=S.get('channel')||'general';
   currentChannelTopic=getChannelTopic(sid,chan);
@@ -1896,6 +1915,8 @@ async function sendSpaceChatSignedPublic(sid,text,inp){
 /// render. Runs every 5 s while the user is viewing a SignedPublic
 /// space; torn down in `mountSpace` when leaving the space.
 let signedPublicPollTimer=null;
+let signedPublicTopic='';
+let signedPublicSpaceId='';
 const signedPublicSeen=new Set();
 async function signedPublicPoll(sid,force){
   if(!sid)return;
@@ -3685,6 +3706,29 @@ function onGossipMessage(topic,origin,data){
   if(!data)return;
   const sid=S.get('spaceId');
   const chan=S.get('channel')||'general';
+
+  // SignedPublic push path. The daemon publishes a `GroupPublicMessage`
+  // envelope on `x0x.groups.public.{stable_group_id}`; the same dedup
+  // key as the /messages poll keeps both paths consistent.
+  if(signedPublicTopic && topic===signedPublicTopic && data.signature){
+    const key=(data.author_agent_id||'')+':'+(data.timestamp||0)+':'+((data.signature||'').slice(0,12));
+    if(!signedPublicSeen.has(key)){
+      signedPublicSeen.add(key);
+      const myAid=S.get('agentId')||'';
+      const chatKey=(signedPublicSpaceId||sid)+'_'+(S.get('channel')||'general');
+      addChatMsg(chatKey,{
+        id:key,
+        text:data.body||'',
+        sender_name:short(data.author_agent_id)||'peer',
+        sender_id:data.author_agent_id||'',
+        timestamp:data.timestamp||Date.now(),
+        channel:S.get('channel')||'general',
+        signed_public:true,
+        own:data.author_agent_id===myAid,
+      });
+    }
+    return;
+  }
 
   // Thread replies (topic: x0x.group.{id}.thread/{msgId})
   if(topic.includes('.thread/')&&data.text){

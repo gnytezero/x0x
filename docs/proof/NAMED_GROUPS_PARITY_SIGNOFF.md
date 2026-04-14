@@ -65,19 +65,26 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 | POST | `/groups/secure/open-envelope` | adversarial test endpoint, not a user-facing action |
 
 **Phase 7 update:** SignedPublic chat now works end-to-end on all
-three surfaces. Each chat view fetches the group's
-`confidentiality` axis on mount and:
+three surfaces with sub-second latency. Each chat view fetches the
+group's `confidentiality` axis on mount and:
 
 - **Send** — SignedPublic posts go through `POST /groups/:id/send`
   so the daemon ML-DSA-signs the body and binds it to the current
   state-hash. MlsEncrypted keeps the gossip path.
-- **Receive** — SignedPublic views poll `GET /groups/:id/messages`
-  every 5 s and merge new signed envelopes into the chat display,
-  deduped by `(author, timestamp, signature-prefix)`. The daemon
-  has already validated signature + write-access + banned-author,
-  so the client just renders. This is the same receive path on
-  GUI, Dioxus, and SwiftUI — no legacy gossip rebroadcast
-  fallback remains.
+- **Receive — WebSocket push (primary)** — each chat view subscribes
+  to `x0x.groups.public.{stable_group_id}` (fetched via
+  `GET /groups/:id/state`; this is the Phase D.3 stable id, not
+  the mls_group_id used for other REST calls). Incoming
+  `GroupPublicMessage` envelopes are decoded and merged directly;
+  latency is bounded by the WS round-trip, not a poll interval.
+- **Receive — `/messages` poll (backstop)** — a 30 s poll of
+  `GET /groups/:id/messages` catches anything dropped across a WS
+  reconnect. Shares the `(author, timestamp, signature-prefix)`
+  dedup key with the push path, so neither can double-render.
+
+All three surfaces (GUI, Dioxus, SwiftUI) use the same topic,
+the same dedup key, and the same push-plus-backstop structure. No
+legacy gossip rebroadcast remains on any surface.
 
 ## Static-proof commands (one-line)
 
@@ -159,12 +166,14 @@ not yet proven on which surface. Each maps to either the GUI
    now branch on the group's `confidentiality` axis and route
    SignedPublic groups through `POST /groups/:id/send`.
 2. ~~**Public-message history / live receive** in chat views
-   (`GET /groups/:id/messages`)~~ — **Closed.** All three chat
-   views now poll the daemon's cached history every 5 s while the
-   group is SignedPublic and merge new entries, deduped by
-   `(author, timestamp, signature-prefix)`. Own messages appear via
-   the same poll (immediate tick fired after the REST send) rather
-   than any gossip rebroadcast.
+   (`GET /groups/:id/messages`)~~ — **Closed with sub-second push
+   latency.** Each chat view subscribes to
+   `x0x.groups.public.{stable_group_id}` via its WebSocket and
+   merges decoded `GroupPublicMessage` envelopes on arrival. A
+   30 s `GET /messages` poll runs behind the push path as a
+   reconnect backstop; both use the same
+   `(author, timestamp, signature-prefix)` dedup key so neither
+   double-renders. Own messages appear via the same channels.
 3. **Headless GUI / UI drivers**. Playwright for the embedded HTML
    GUI, `dioxus-testing` for Dioxus, and XCUITest for SwiftUI remain
    queued. Phase 7's CI parity gates close the static-coverage
@@ -210,15 +219,15 @@ not yet proven on which surface. Each maps to either the GUI
      Fails any PR that adds an endpoint without updating each surface.
    - `communitas.parity` — runs `parity_manifest`, `client_coverage`,
      `swift_parity`, plus a vendored-manifest schema sanity check.
-3. **SignedPublic chat — both send AND live receive — wired in all
-   three surfaces** (GUI, Dioxus, SwiftUI). Send branches on
-   `policy.confidentiality` and routes through `POST /groups/:id/send`
-   for SignedPublic; receive polls `GET /groups/:id/messages` every
-   5 s and merges the daemon-validated envelopes into the local
-   chat, deduped by `(author, timestamp, signature-prefix)`. The
-   earlier GUI-only legacy gossip rebroadcast has been removed so
-   all three surfaces behave identically. To enable the routing,
-   `GroupInfo` on both clients now exposes the full `policy` field.
+3. **SignedPublic chat — send + WebSocket-push receive — wired in
+   all three surfaces** (GUI, Dioxus, SwiftUI). Send branches on
+   `policy.confidentiality` and routes through `POST /groups/:id/send`.
+   Receive subscribes to `x0x.groups.public.{stable_group_id}` for
+   sub-second push latency, with a 30 s `/messages` poll as a
+   WS-reconnect backstop; both paths share the
+   `(author, timestamp, signature-prefix)` dedup key. No gossip
+   rebroadcast remains. To enable the routing, `GroupInfo` on both
+   clients now exposes the full `policy` field.
 
 ## Changes from the previous revision (2026-04-14, before this audit)
 
