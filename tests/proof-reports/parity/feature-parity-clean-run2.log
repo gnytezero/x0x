@@ -1,48 +1,49 @@
 
 [0;36m╔══════════════════════════════════════════════════════════════════╗[0m
 [0;36m║    x0x NAMED-GROUPS FEATURE PARITY — CLI E2E                  ║[0m
-[0;36m║    Run: 20260414_185550_7997                                       ║[0m
-[0;36m║    Report: tests/proof-reports/parity/feature-parity-20260414_185550_7997.log ║[0m
+[0;36m║    Run: 20260414_195849_31275                                      ║[0m
+[0;36m║    Report: tests/proof-reports/parity/feature-parity-20260414_195849_31275.log ║[0m
 [0;36m╚══════════════════════════════════════════════════════════════════╝[0m
   [0;33m[INFO][0m Starting 2 daemons (alice + bob)…
   [0;33m[INFO][0m alice agent: 229a56936842d911… · bob agent: 16d1a9417bd3df12…
 
 [0;36m━━ Preset 1 — private_secure (hidden, invite-only, MLS) ━━[0m
-  [0;32m✓[0m CLI created private_secure (3a584b235d5152c1c52f11f73c60611c1fdd1c98ccbe012910d066b2dbb49c03)
+  [0;32m✓[0m CLI created private_secure (c697fc4564879af7cbfaab7087fe500e9d828aea5ebacdefb3716afa16e60a0a)
   [0;32m✓[0m REST /groups/:id reflects created group
   [0;32m✓[0m private_secure is invisible on bob's /groups/discover (privacy invariant)
-  [0;32m✓[0m state chain initialised (revision=0, state_hash=ddfa839110f9…)
+  [0;32m✓[0m state chain initialised (revision=0, state_hash=531ce56250fe…)
 
 [0;36m━━ Preset 2 — public_request_secure (discoverable + request-access + MLS) ━━[0m
-  [0;32m✓[0m CLI created public_request_secure (653300ed00a3e9b3bbdcd2816e4cb58c1a98481016dc18d987598cd812e5f3bd)
+  [0;32m✓[0m CLI created public_request_secure (e7e9cbb91d0778b32235e554e1fcaadc53b3602d465c623e16a39ad6917588fb)
   [0;33m[INFO][0m discovery did not converge in 60s — imported card explicitly (test continues)
-  [0;32m✓[0m bob CLI submitted join request (request_id=8d3bc5c7…)
-  [0;33m[INFO][0m SKIP — alice did not see bob's request within 60s (2-daemon loopback gossip race, not a CLI-surface issue)
-  [0;32m✓[0m CLI approve-request surface reachable (HTTP 404 on synthetic id)
-  [0;32m✓[0m non-admin approve is rejected (HTTP 404)
+  [0;32m✓[0m bob CLI submitted join request (request_id=1a27c548…)
+  [0;33m[INFO][0m alice did not observe bob's join request within 60s
+  [0;33m[INFO][0m → CLI submission is proven; cross-daemon convergence belongs to e2e_named_groups.sh
+  [0;33m[INFO][0m → skipping the approve assertion in this run rather than faking it green
 
 [0;36m━━ Preset 3 — public_open (discoverable + open-join + SignedPublic) ━━[0m
-  [0;32m✓[0m CLI created public_open (3437f8d7e0a1286b5d2a7b0f96d20e53e95c2a9d5133fda2eba7954b463f3861)
+  [0;32m✓[0m CLI created public_open (397fc8499c08af4a5761009e27841d14d1d068548e9b85af6928433e57a6a4e9)
   [0;32m✓[0m alice CLI published SignedPublic message (daemon acknowledged)
   [0;32m✓[0m CLI /groups/:id/messages returned 1 message(s)
-  [0;32m✓[0m non-member send rejected (HTTP 404)
+  [0;32m✓[0m bob joined public_open via invite (bob's gid=397fc8499c08…)
 
 [0;36m━━ Preset 4 — public_announce (open-read + admin-only write) ━━[0m
-  [0;32m✓[0m CLI created public_announce (741008b78ac747fe5430b2dc831647b13e5e8ab3e78a52e89757f6c7f9e99777)
+  [0;32m✓[0m CLI created public_announce (feb04fb92fd057c61723bffdca9d231b030b925cf687f991d19bb8b39420c21b)
   [0;32m✓[0m owner CLI published announcement
   [0;32m✓[0m announcement appears in /messages with a signature
   [0;32m✓[0m policy round-trip: write_access=admin_only
 
-[0;36m━━ Cross-preset authorization negatives ━━[0m
-  [0;32m✓[0m non-admin PATCH /policy rejected (HTTP 404)
-  [0;32m✓[0m non-admin ban rejected (HTTP 404)
+[0;36m━━ Cross-preset authorization negatives (member-not-admin) ━━[0m
+  [0;32m✓[0m non-admin PATCH /policy rejected with 403 (real authz)
+  [0;32m✓[0m non-admin ban rejected with 403 (real authz)
+  [0;32m✓[0m non-admin GET /requests rejected with 403 (real authz)
 
 [0;36m━━ State-commit chain advancement via CLI ━━[0m
   [0;32m✓[0m state-seal bumped revision (1 → 2)
 
 [0;36m━━ Summary ━━[0m
-  [0;36mTotal:[0m 19 · [0;32mpassed:[0m 19 · [0;31mfailed:[0m 0
+  [0;36mTotal:[0m 18 · [0;32mpassed:[0m 18 · [0;31mfailed:[0m 0
 
-[0;32m✓ parity proof clean — 19 assertions, 0 failures[0m
-  archived at tests/proof-reports/parity/feature-parity-20260414_185550_7997.log
+[0;32m✓ parity proof clean — 18 assertions, 0 failures[0m
+  archived at tests/proof-reports/parity/feature-parity-20260414_195849_31275.log
 

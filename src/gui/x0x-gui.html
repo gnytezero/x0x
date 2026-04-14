@@ -572,7 +572,14 @@ tr:hover td{background:rgba(255,255,255,.01)}
     <div class="chain" id="sb-chain"></div>
   </div>
   <div class="sb-section" style="flex:1;overflow-y:auto">
-    <div class="sb-section-title" onclick="toggleSection('spaces')" style="cursor:pointer"><span>Spaces</span><button onclick="event.stopPropagation();showCreateSpace()" title="Create space">+</button></div>
+    <div class="sb-section-title" onclick="toggleSection('spaces')" style="cursor:pointer">
+      <span>Spaces</span>
+      <span style="display:flex;gap:2px">
+        <button onclick="event.stopPropagation();showJoinSpace()" title="Join space via invite link">&#9166;</button>
+        <button onclick="event.stopPropagation();showImportSpaceCard()" title="Import group card">&#128229;</button>
+        <button onclick="event.stopPropagation();showCreateSpace()" title="Create space">+</button>
+      </span>
+    </div>
     <div id="sb-spaces" class="sb-collapsible"></div>
     <div class="sb-section-title" onclick="toggleSection('dms')" style="cursor:pointer"><span>Direct Messages</span></div>
     <div id="sb-dms" class="sb-collapsible"></div>
@@ -2975,13 +2982,18 @@ function mountDiscover(){
 async function nagFetchDiscover(){
   const seq=++nagDiscover.seq;
   try{
-    let path;
-    if(nagDiscover.mode==='nearby'){path='/groups/discover/nearby'}
-    else{
+    // NOTE: api() calls are intentionally inlined per branch so the
+    // tests/gui_named_group_parity.rs scanner can verify each path
+    // is wired (it does not follow JS variable indirection).
+    let r;
+    if(nagDiscover.mode==='nearby'){
+      r=await api('/groups/discover/nearby');
+    }else{
       const q=nagDiscover.query.trim();
-      path=q?('/groups/discover?q='+encodeURIComponent(q)):'/groups/discover';
+      r=q
+        ?await api('/groups/discover?q='+encodeURIComponent(q))
+        :await api('/groups/discover');
     }
-    const r=await api(path);
     if(seq!==nagDiscover.seq)return; // discard stale response
     if(!r||!r.ok){nagDiscover.err='Discovery failed: '+((r&&r.error)||'unknown');nagDiscover.cards=[]}
     else{
@@ -3094,10 +3106,21 @@ async function nagRenderAdmin(gid){
 function nagPolicyPanelHtml(gid,isOwner){
   const disabled=!isOwner?'disabled':'';
   const axisOpts=(opts)=>['<option value="">(leave unchanged)</option>',...opts.map(o=>`<option value="${o}">${o}</option>`)].join('');
+  // Rename inputs are admin+ — daemon enforces; we surface for owners
+  // here for simplicity. Wraps PATCH /groups/:id.
+  const renameRow=isOwner?`<div class="nag-panel" style="margin:0 0 var(--sp2) 0;border:0;background:transparent;padding:0">
+    <div class="row" style="display:flex;gap:var(--sp2);flex-wrap:wrap;align-items:center">
+      <input id="nag-rename-name-${esc(gid)}" placeholder="New name (optional)" style="flex:1;min-width:160px;padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px">
+      <input id="nag-rename-desc-${esc(gid)}" placeholder="New description (optional)" style="flex:2;min-width:200px;padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px">
+      <button onclick="nagRenameGroup('${esc(gid)}')">Save name/description</button>
+    </div>
+    <div class="nag-feedback" data-k="rename-feedback" style="font-size:11px;color:var(--tx3);margin-top:4px"></div>
+  </div>`:'';
   return `<div class="nag-panel" data-nag-policy="${esc(gid)}">
     <h3>Policy</h3>
     <div class="sub">Five-axis access control (owner only).</div>
     ${!isOwner?'<div class="sub" style="color:var(--am)">Only the owner can change policy.</div>':''}
+    ${renameRow}
     <div class="nag-policy-grid">
       <label>Preset</label>
       <select data-k="preset" ${disabled}>${axisOpts(['private_secure','public_request_secure','public_open','public_announce'])}</select>
@@ -3220,6 +3243,27 @@ function nagSetFeedback(sel,msg,tone){
   const colors={ok:'var(--gn)',err:'var(--rd)'};
   el.style.color=colors[tone]||'var(--tx3)';
   el.textContent=msg||'';
+}
+
+async function nagRenameGroup(gid){
+  const nameInput=document.getElementById('nag-rename-name-'+gid);
+  const descInput=document.getElementById('nag-rename-desc-'+gid);
+  const name=nameInput?nameInput.value.trim():'';
+  const desc=descInput?descInput.value.trim():'';
+  if(!name && !desc){
+    nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Pick a name or description to update.','err');
+    return;
+  }
+  const body={};
+  if(name)body.name=name;
+  if(desc)body.description=desc;
+  nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Working…');
+  const r=await api('/groups/'+gid,{method:'PATCH',body:JSON.stringify(body)});
+  if(r&&r.ok){
+    nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Saved.','ok');
+    nagRenderAdmin(gid);
+    await pollGroups();
+  }else{nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,(r&&r.error)||'Update failed.','err')}
 }
 
 async function nagApplyPolicy(gid){
@@ -3434,6 +3478,59 @@ async function createSpace(){
     await pollGroups();
     if(r.group_id)navigateSpace(r.group_id,'chat');
   }else{toast('Failed: '+(r&&r.error||'unknown'),'error')}
+}
+
+/* Join an existing space via an invite link — wraps POST /groups/join. */
+function showJoinSpace(){
+  showModal(`<h2>Join Space</h2>
+    <p style="font-size:12px;color:var(--tx3);margin-bottom:8px">Paste an invite link to join an existing space.</p>
+    <input id="modal-join-invite" placeholder="x0x://invite/…" style="width:100%;margin-bottom:10px;font-family:ui-monospace,monospace;font-size:12px">
+    <input id="modal-join-name" placeholder="Your display name (optional)" style="width:100%;margin-bottom:12px">
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="joinSpace()">Join</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('modal-join-invite').focus(),100);
+}
+async function joinSpace(){
+  const invite=document.getElementById('modal-join-invite').value.trim();
+  if(!invite){toast('Invite link required','error');return}
+  const name=document.getElementById('modal-join-name').value.trim();
+  const body={invite};
+  if(name)body.display_name=name;
+  const r=await api('/groups/join',{method:'POST',body:JSON.stringify(body)});
+  if(r&&r.ok){
+    document.querySelector('.modal-overlay').remove();
+    toast('Joined "'+(r.group_name||'space')+'"','success');
+    await pollGroups();
+    if(r.group_id)navigateSpace(r.group_id,'chat');
+  }else{toast('Join failed: '+(r&&r.error||'unknown'),'error')}
+}
+
+/* Import a signed group card — wraps POST /groups/cards/import.
+   Useful for joining a public_request_secure flow when the card has
+   not yet propagated via gossip. */
+function showImportSpaceCard(){
+  showModal(`<h2>Import Group Card</h2>
+    <p style="font-size:12px;color:var(--tx3);margin-bottom:8px">Paste a signed group card (JSON) to add it to your local discovery cache.</p>
+    <textarea id="modal-import-card" placeholder='{"group_id":"…","name":"…","signature":"…",…}' rows="10" style="width:100%;margin-bottom:12px;font-family:ui-monospace,monospace;font-size:11px"></textarea>
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="importSpaceCard()">Import</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('modal-import-card').focus(),100);
+}
+async function importSpaceCard(){
+  const raw=document.getElementById('modal-import-card').value.trim();
+  if(!raw){toast('Card JSON required','error');return}
+  let card;
+  try{card=JSON.parse(raw)}catch(e){toast('Invalid JSON: '+e.message,'error');return}
+  const r=await api('/groups/cards/import',{method:'POST',body:JSON.stringify(card)});
+  if(r&&r.ok){
+    document.querySelector('.modal-overlay').remove();
+    toast('Card imported (group '+(r.group_id||'').slice(0,12)+'…)','success');
+    await pollGroups();
+  }else{toast('Import failed: '+(r&&r.error||'unknown'),'error')}
 }
 
 function showCardModal(){
