@@ -102,20 +102,6 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/requests/:request_id",
         "GUI gap: requester-side cancel-request UI not yet wired",
     ),
-    // GET /groups/:id/messages — message-history read-back from the
-    // daemon cache. The send path now routes SignedPublic groups
-    // through `POST /groups/:id/send`, and the daemon publishes the
-    // signed envelope so the existing gossip subscription receives
-    // own-messages just like before. Pulling history from the REST
-    // endpoint (so non-member-authored signed posts that arrived
-    // while we were offline appear in the chat history) is the
-    // remaining piece of work.
-    (
-        Method::Get,
-        "/groups/:id/messages",
-        "GUI gap: signed-message HISTORY read-back from /messages not \
-         yet wired (SignedPublic SEND now is)",
-    ),
     // Presence events are used globally by the GUI via WebSocket
     // rather than the named-groups discovery path.
     // (nothing here — kept for future additions)

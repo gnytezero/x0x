@@ -37,13 +37,13 @@ unrecorded gap (zero across all surfaces below).
 |---------|--------------|--------------|---------------|
 | **x0xd REST** | **36 / 36** | `tests/api_coverage.rs` — every route handler in `src/bin/x0xd.rs` is in `ENDPOINTS` and has a test entry. 12 tests. | `tests/e2e_named_groups.sh` — 98 REST-driven assertions over a 3-daemon mesh; 3× clean archived. |
 | **x0x CLI** | **36 / 36** | `tests/parity_cli.rs` — spawns `x0x <cli_name> --help` for every endpoint. | `tests/e2e_feature_parity.sh` — 18 assertions per run, 3× clean archived. |
-| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **24 / 36** wired, 12 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
+| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **25 / 36** wired, 11 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
 | **Communitas Rust client** | **36 / 36** named-groups | `parity_manifest.rs` (vendored manifest copy). The IMPLEMENTED list contains 36 entries; the test fails if any named-groups endpoint in the vendored manifest has no client method. 14 tests. | `live_mutation_contract.rs`. |
 | **Communitas Dioxus UI** | consumes the Rust client; UI surfaces `enum SpacePreset`, discover view, admin sheet, requests panel | preset round-trip unit test; 419/419 unit tests | UI driver queued for Phase 7. |
 | **Communitas Swift client** | **36 / 36** named-groups (every Rust method has a Swift counterpart) | `swift_parity.rs` — `parity_map_covers_all_rust_methods` walks `client.rs` for every public method and `swift_client_has_all_rust_methods` greps the Swift source for each one. | `swift test` — 42/42 pass. |
 | **Communitas SwiftUI** | preset picker, discover sheet, manage sheet (policy + state + roster + requests) | `swift build` clean | XCUITest queued for Phase 7. |
 
-## Embedded GUI — explicit DEFERRED list (13 endpoints)
+## Embedded GUI — explicit DEFERRED list (11 endpoints)
 
 The GUI parity test enumerates every named-groups endpoint and checks
 the GUI HTML for a matching `api(...)` call. The following endpoints
@@ -54,7 +54,6 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 |--------|------|--------|
 | POST | `/groups/:id/members` | admin flow; GUI uses invite links instead of direct add-by-agent |
 | DELETE | `/groups/:id/members/:agent_id` | admin flow; GUI uses ban rather than direct remove-by-agent |
-| GET | `/groups/:id/messages` | GUI gap: signed-message HISTORY read-back from `/messages` not yet wired (SignedPublic SEND now is — see `sendSpaceChatSignedPublic`) |
 | DELETE | `/groups/:id/requests/:request_id` | requester-side cancel-request UI not yet wired (admin approve/reject is) |
 | GET | `/groups/discover/subscriptions` | power-user surface; CLI covers it |
 | POST | `/groups/discover/subscribe` | power-user surface; CLI covers it |
@@ -65,15 +64,20 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 | POST | `/groups/:id/secure/reseal` | secure-plane primitive; server-side rekey on approve/ban |
 | POST | `/groups/secure/open-envelope` | adversarial test endpoint, not a user-facing action |
 
-**Phase 7 update:** The `POST /groups/:id/send` cross-surface gap is
-now closed across all three surfaces (GUI, Dioxus, SwiftUI). Each
-chat view fetches the group's `confidentiality` axis on mount and
-routes the send through `POST /groups/:id/send` for SignedPublic
-groups (so the daemon ML-DSA-signs the body and binds it to the
-current state-hash). MlsEncrypted groups keep the existing gossip
-path. The remaining piece — pulling **history** for non-member
-authored signed posts via `GET /groups/:id/messages` so they appear
-in the chat view alongside live-gossip messages — is still queued.
+**Phase 7 update:** SignedPublic chat now works end-to-end on all
+three surfaces. Each chat view fetches the group's
+`confidentiality` axis on mount and:
+
+- **Send** — SignedPublic posts go through `POST /groups/:id/send`
+  so the daemon ML-DSA-signs the body and binds it to the current
+  state-hash. MlsEncrypted keeps the gossip path.
+- **Receive** — SignedPublic views poll `GET /groups/:id/messages`
+  every 5 s and merge new signed envelopes into the chat display,
+  deduped by `(author, timestamp, signature-prefix)`. The daemon
+  has already validated signature + write-access + banned-author,
+  so the client just renders. This is the same receive path on
+  GUI, Dioxus, and SwiftUI — no legacy gossip rebroadcast
+  fallback remains.
 
 ## Static-proof commands (one-line)
 
@@ -150,21 +154,25 @@ not yet proven on which surface. Each maps to either the GUI
 `DEFERRED` entries above or a tracked follow-up.
 
 1. ~~**SignedPublic send-path routing inside chat views**~~ —
-   **Closed in Phase 7.** `sendSpaceChat` (GUI), `send_message`
-   (Dioxus `channel_chat.rs`), and `ChannelManager.sendMessage`
-   (SwiftUI) now branch on the group's `confidentiality` axis and
-   route SignedPublic groups through `POST /groups/:id/send`. The
-   `confidentiality` field is fetched once on mount via the
-   per-client `groupInfo`/`get_group` call, which now exposes the
-   full `policy` field on the `GroupInfo` shape.
-2. **Public-message history read-back** in chat views
-   (`GET /groups/:id/messages`). Sender-side path is closed; reading
-   non-member-authored signed posts from the daemon's history cache
-   is still queued.
+   **Closed.** `sendSpaceChat` (GUI), `send_message` (Dioxus
+   `channel_chat.rs`), and `ChannelManager.sendMessage` (SwiftUI)
+   now branch on the group's `confidentiality` axis and route
+   SignedPublic groups through `POST /groups/:id/send`.
+2. ~~**Public-message history / live receive** in chat views
+   (`GET /groups/:id/messages`)~~ — **Closed.** All three chat
+   views now poll the daemon's cached history every 5 s while the
+   group is SignedPublic and merge new entries, deduped by
+   `(author, timestamp, signature-prefix)`. Own messages appear via
+   the same poll (immediate tick fired after the REST send) rather
+   than any gossip rebroadcast.
 3. **Headless GUI / UI drivers**. Playwright for the embedded HTML
    GUI, `dioxus-testing` for Dioxus, and XCUITest for SwiftUI remain
    queued. Phase 7's CI parity gates close the static-coverage
    feedback loop; UI-level e2e remains future work.
+4. **Requester-side cancel-request UI** in the GUI
+   (`DELETE /groups/:id/requests/:request_id`) — admin
+   approve/reject is wired; requester cancel is the one remaining
+   admin-UX gap in the GUI DEFERRED list.
 4. **GUI-side card inspection by id** (`GET /groups/cards/:id`) — the
    import action is now wired; per-id inspection still queued.
 5. **GUI requester-side cancel-request UI**
@@ -202,11 +210,15 @@ not yet proven on which surface. Each maps to either the GUI
      Fails any PR that adds an endpoint without updating each surface.
    - `communitas.parity` — runs `parity_manifest`, `client_coverage`,
      `swift_parity`, plus a vendored-manifest schema sanity check.
-3. **SignedPublic chat-view send routing** wired in all three
-   surfaces (GUI, Dioxus, SwiftUI). See "Deferred / known gaps" #1
-   above. To enable the routing, `GroupInfo` on both clients now
-   exposes the full `policy` field from `GET /groups/:id`; the chat
-   views read `policy.confidentiality` on mount.
+3. **SignedPublic chat — both send AND live receive — wired in all
+   three surfaces** (GUI, Dioxus, SwiftUI). Send branches on
+   `policy.confidentiality` and routes through `POST /groups/:id/send`
+   for SignedPublic; receive polls `GET /groups/:id/messages` every
+   5 s and merges the daemon-validated envelopes into the local
+   chat, deduped by `(author, timestamp, signature-prefix)`. The
+   earlier GUI-only legacy gossip rebroadcast has been removed so
+   all three surfaces behave identically. To enable the routing,
+   `GroupInfo` on both clients now exposes the full `policy` field.
 
 ## Changes from the previous revision (2026-04-14, before this audit)
 

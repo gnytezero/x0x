@@ -6,7 +6,7 @@
   DEFERRED  POST /groups/:id/members  // admin flow; GUI currently uses invite links instead of direct add-by-agent
   DEFERRED  DELETE /groups/:id/members/:agent_id  // admin flow; GUI currently uses ban rather than direct remove-by-agent
   WIRED     POST /groups/:id/send
-  DEFERRED  GET /groups/:id/messages  // GUI gap: signed-message HISTORY read-back from /messages not yet wired (SignedPublic SEND now is)
+  WIRED     GET /groups/:id/messages
   WIRED     POST /groups/:id/invite
   WIRED     POST /groups/join
   WIRED     PUT /groups/:id/display-name
@@ -36,4 +36,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 24/36 wired; 12 deferred; 0 missing
+Coverage: 25/36 wired; 11 deferred; 0 missing

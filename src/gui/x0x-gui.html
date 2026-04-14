@@ -1748,6 +1748,17 @@ async function mountSpace(){
       (g.policy_summary && g.policy_summary.confidentiality) ||
       '';
   }
+  // Tear down any previous SignedPublic poll, then start a fresh one
+  // for this space if it is SignedPublic. Polling /messages is the
+  // same receive path used by Dioxus + SwiftUI.
+  if(signedPublicPollTimer){clearInterval(signedPublicPollTimer);signedPublicPollTimer=null}
+  signedPublicSeen.clear();
+  if(currentSpaceConfidentiality==='signed_public'){
+    signedPublicPoll(sid,true);
+    signedPublicPollTimer=setInterval(()=>{
+      if(S.get('view')==='space'&&S.get('spaceId')===sid)signedPublicPoll(sid,false);
+    },5000);
+  }
   const chan=S.get('channel')||'general';
   currentChannelTopic=getChannelTopic(sid,chan);
   wsSub(currentChannelTopic);
@@ -1854,39 +1865,70 @@ function sendSpaceChat(){
 
 /// SignedPublic send path (Phase E). Uses the REST endpoint so the
 /// daemon produces a real `GroupPublicMessage` (state-bound,
-/// ML-DSA-signed), publishes it to the public topic, and caches it
-/// locally. Receiving signed messages from non-members is a separate
-/// follow-up — the gossip-driven chat history this view renders does
-/// not yet pull from `GET /groups/:id/messages`.
+/// ML-DSA-signed), publishes it to the public topic
+/// (`x0x.groups.public.{group_id}`), and caches it locally.
+///
+/// Own-message rendering is driven by the poll loop in
+/// `signedPublicPoll()` rather than a legacy gossip rebroadcast — all
+/// three surfaces (GUI, Dioxus, SwiftUI) use the same REST-poll path
+/// for SignedPublic receive, so cross-peer visibility is consistent
+/// regardless of which client sent the message.
 async function sendSpaceChatSignedPublic(sid,text,inp){
-  const chan=S.get('channel')||'general';
-  const name=LS.get('display_name','')||short(S.get('agentId'));
   const r=await api('/groups/'+sid+'/send',{
     method:'POST',
     body:JSON.stringify({body:text,kind:'chat'})
   });
   if(r&&r.ok){
-    // Mirror the existing chat history so the user sees their own
-    // message immediately. Re-broadcast on the channel topic for
-    // legacy peers; the daemon also publishes a signed envelope on
-    // its own topic so verifying clients can pick that up.
-    const msg={
-      id:generateMsgId(),
-      text,
-      sender_name:name,
-      sender_id:S.get('agentId'),
-      timestamp:Date.now(),
-      channel:chan,
-      signed_public:true,
-    };
-    addChatMsg(sid+'_'+chan,{...msg,own:true});
-    if(currentChannelTopic)wsPub(currentChannelTopic,msg);
     inp.value='';inp.focus();
     clearQuote();
     if(isMentioned(text))toast('You mentioned yourself','info');
+    // Trigger an immediate poll so the user sees their own message
+    // without waiting for the background tick.
+    signedPublicPoll(sid,true);
   }else{
     toast('Send failed: '+(r&&r.error||'unknown'),'error');
   }
+}
+
+/// Poll `GET /groups/:id/messages` for SignedPublic groups and merge
+/// the result into the chat history. The daemon has already validated
+/// signatures, write-access, and banned-author constraints — we just
+/// render. Runs every 5 s while the user is viewing a SignedPublic
+/// space; torn down in `mountSpace` when leaving the space.
+let signedPublicPollTimer=null;
+const signedPublicSeen=new Set();
+async function signedPublicPoll(sid,force){
+  if(!sid)return;
+  if(currentSpaceConfidentiality!=='signed_public')return;
+  const r=await api('/groups/'+sid+'/messages');
+  if(!r||!r.ok||!Array.isArray(r.messages))return;
+  const chan=S.get('channel')||'general';
+  const chatKey=sid+'_'+chan;
+  const myAid=S.get('agentId')||'';
+  let appended=false;
+  for(const m of r.messages){
+    const key=(m.author_agent_id||'')+':'+(m.timestamp||0)+':'+((m.signature||'').slice(0,12));
+    if(signedPublicSeen.has(key))continue;
+    signedPublicSeen.add(key);
+    const msg={
+      id:key,
+      text:m.body||'',
+      sender_name:short(m.author_agent_id)||'peer',
+      sender_id:m.author_agent_id||'',
+      timestamp:m.timestamp||Date.now(),
+      channel:chan,
+      signed_public:true,
+      own:m.author_agent_id===myAid,
+    };
+    addChatMsg(chatKey,msg);
+    appended=true;
+  }
+  // Keep the seen set bounded on long-running views.
+  if(signedPublicSeen.size>5000){
+    const it=signedPublicSeen.values();
+    for(let i=0;i<1000;i++)signedPublicSeen.delete(it.next().value);
+  }
+  return appended;
 }
 
 const seenMsgHashes=new Set();
