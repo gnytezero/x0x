@@ -200,7 +200,7 @@ sec "━━ [1] UNAUTHENTICATED (3 endpoints / 7 checks) ━━"
 # GET /health
 R=$(curl -sf -m 5 "$AA/health" 2>/dev/null || echo '{}')
 chk "$R" "ok"  "GET /health"
-chkv "$(fld "$R" "version")" "0.16" "GET /health → version 0.16.x"
+chkv "$(fld "$R" "version")" "0.17" "GET /health → version 0.17.x"
 proof "version=$(fld "$R" "version") peers=$(fld "$R" "peers")"
 
 # GET /constitution

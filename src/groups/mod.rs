@@ -215,12 +215,18 @@ impl GroupInfo {
             None
         };
 
-        // Phase D.3: stable genesis. Derive the genesis record so the same
-        // creator+timestamp+nonce deterministically yields the same
-        // `group_id`. For backward compatibility with existing callers, we
-        // keep `mls_group_id` as the persisted topic-derivation key, but
-        // `genesis.group_id` is the stable authoritative identifier.
-        let genesis = state_commit::GroupGenesis::new(creator_hex.clone(), now);
+        // All groups are MLS groups — the MLS group id IS the stable group id.
+        // The genesis record is retained for audit (creator + creation timestamp),
+        // but its `group_id` is pinned to the MLS group id so every id surface
+        // (owner named_groups key, card.group_id, metadata_topic) converges on
+        // a single value. Prior to this, genesis.group_id was a separately
+        // derived BLAKE3 hash which caused cross-daemon lookup drift.
+        let genesis = state_commit::GroupGenesis::with_existing_id(
+            mls_group_id.clone(),
+            creator_hex.clone(),
+            now,
+            String::new(),
+        );
 
         let confidentiality = policy.confidentiality;
         let mut info = Self {

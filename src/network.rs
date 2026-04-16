@@ -557,7 +557,7 @@ impl NetworkNode {
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let peer_conn = node
-            .connect(peer_id)
+            .connect_peer(peer_id)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 

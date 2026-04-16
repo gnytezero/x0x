@@ -888,6 +888,75 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
+# 18b. LARGE FILE TRANSFER — 1 MiB and 16 MiB NYC→SFO (cross-continent)
+# ═════════════════════════════════════════════════════════════════════════
+# Proves chunked transfer handles substantive payload sizes over MASQUE relay
+# / direct path, not just proof-token sized offers. Sha256 roundtrip verifies
+# byte-accurate delivery.
+echo -e "\n${CYAN}[18b/20] Large File Transfer (NYC→SFO)${NC}"
+NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
+SFO_IP="${NODE_IPS[sfo]}"; SFO_TK="${NODE_TOKENS[sfo]:-}"
+if a_is_live nyc && a_is_live sfo && [ -n "$NYC_TK" ] && [ -n "$SFO_TK" ] && [ -n "${NODE_AIDS[sfo]:-}" ] && [ -n "${PAIR_CONNECTED[nyc_sfo]:-}" ]; then
+    SFO_AID="${NODE_AIDS[sfo]}"
+    for SIZE_LABEL in 1M 16M; do
+        case "$SIZE_LABEL" in
+            1M)  SIZE_BYTES=1048576 ;;
+            16M) SIZE_BYTES=16777216 ;;
+        esac
+        LARGE_PATH="/tmp/x0x-vps-large-${SIZE_LABEL}-${PROOF_TOKEN}.bin"
+        vps_ssh "$NYC_IP" "head -c $SIZE_BYTES /dev/urandom > '$LARGE_PATH' && printf '%s\n' '${PROOF_TOKEN}-${SIZE_LABEL}-tail' >> '$LARGE_PATH'"
+        LG_SHA=$(vps_ssh "$NYC_IP" "shasum -a 256 '$LARGE_PATH' | awk '{print \$1}'")
+        LG_SIZE=$(vps_ssh "$NYC_IP" "wc -c < '$LARGE_PATH' | tr -d ' '")
+        R=$(vps_post "$NYC_IP" "$NYC_TK" /files/send "{\"agent_id\":\"$SFO_AID\",\"filename\":\"large-${SIZE_LABEL}-${PROOF_TOKEN}.bin\",\"size\":$LG_SIZE,\"sha256\":\"$LG_SHA\",\"path\":\"$LARGE_PATH\"}")
+        check_not_error "NYC→SFO offer ($SIZE_LABEL)" "$R"
+        LG_ID=$(jq_field "$R" "transfer_id")
+        [ -z "$LG_ID" ] && { skip "large-$SIZE_LABEL completion" "no transfer_id"; continue; }
+        # Wait up to 30s for recipient to see offer
+        LG_SEEN=""
+        for _ in $(seq 1 30); do
+            TR=$(vps_get "$SFO_IP" "$SFO_TK" /files/transfers)
+            LG_SEEN=$(json_has_transfer "$TR" "$LG_ID")
+            [ -n "$LG_SEEN" ] && break
+            sleep 1
+        done
+        TOTAL=$((TOTAL+1))
+        if [ -n "$LG_SEEN" ]; then
+            PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} SFO sees large-$SIZE_LABEL offer"
+        else
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} SFO sees large-$SIZE_LABEL offer"; continue
+        fi
+        R=$(vps_post "$SFO_IP" "$SFO_TK" "/files/accept/$LG_ID" '{}')
+        check_not_error "SFO accepts large-$SIZE_LABEL" "$R"
+        # Larger files need longer completion window (up to 120s for 16 MiB)
+        MAX_WAIT=60; [ "$SIZE_LABEL" = "16M" ] && MAX_WAIT=180
+        S_STATUS=""; T_STATUS=""
+        for _ in $(seq 1 $MAX_WAIT); do
+            SR=$(vps_get "$NYC_IP" "$NYC_TK" "/files/transfers/$LG_ID")
+            TR=$(vps_get "$SFO_IP" "$SFO_TK" "/files/transfers/$LG_ID")
+            S_STATUS=$(json_transfer_status "$SR")
+            T_STATUS=$(json_transfer_status "$TR")
+            [ "$S_STATUS" = "Complete" ] && [ "$T_STATUS" = "Complete" ] && break
+            sleep 1
+        done
+        TOTAL=$((TOTAL+1))
+        if [ "$S_STATUS" = "Complete" ] && [ "$T_STATUS" = "Complete" ]; then
+            PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} large-$SIZE_LABEL Complete both ends"
+        else
+            FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} large-$SIZE_LABEL (sender=$S_STATUS, receiver=$T_STATUS)"
+            continue
+        fi
+        OUT_PATH=$(json_transfer_output_path "$TR")
+        RECV_SHA=$(vps_ssh "$SFO_IP" "shasum -a 256 '$OUT_PATH' | awk '{print \$1}'" 2>/dev/null || echo "")
+        check_eq "large-$SIZE_LABEL sha256 matches" "$RECV_SHA" "$LG_SHA"
+        # Clean up per-size artefacts
+        vps_ssh "$NYC_IP" "rm -f '$LARGE_PATH'" 2>/dev/null || true
+        vps_ssh "$SFO_IP" "rm -f '$OUT_PATH'" 2>/dev/null || true
+    done
+else
+    skip "Large file transfer proof" "NYC/SFO not fully available or not connected"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
 # 19. PRESENCE — FOAF + online + find + status on all nodes
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[19/20] Presence (all nodes)${NC}"
