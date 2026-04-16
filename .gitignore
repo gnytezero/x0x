@@ -20,3 +20,10 @@ fuzz/artifacts/
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+
+# Proof-report raw capture artefacts (logs, shell scripts, matrix dumps).
+# Markdown reports under tests/proof-reports/ ARE committed.
+tests/proof-reports/*.log
+tests/proof-reports/matrix_*
+tests/proof-reports/deploy_instrumented.sh
+tests/proptest_presence.proptest-regressions
