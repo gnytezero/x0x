@@ -1061,7 +1061,8 @@ async fn main() -> Result<()> {
     if let Some(ref id_dir) = identity_dir {
         builder = builder
             .with_machine_key(id_dir.join("machine.key"))
-            .with_agent_key_path(id_dir.join("agent.key"));
+            .with_agent_key_path(id_dir.join("agent.key"))
+            .with_agent_cert_path(id_dir.join("agent.cert"));
     }
 
     if let Some(ref user_key_path) = config.user_key_path {

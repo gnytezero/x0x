@@ -588,6 +588,13 @@ pub struct AgentBuilder {
     machine_key_path: Option<std::path::PathBuf>,
     agent_keypair: Option<identity::AgentKeypair>,
     agent_key_path: Option<std::path::PathBuf>,
+    /// Custom path for `agent.cert`. When set, the cert is loaded/saved from
+    /// this path instead of `~/.x0x/agent.cert`. Required for multi-daemon
+    /// setups on the same host — with a shared cert file, last-writer-wins
+    /// trampling would cause the victim daemon to announce its own agent_id
+    /// paired with another daemon's cert, and peers would reject as
+    /// "agent certificate agent_id mismatch".
+    agent_cert_path: Option<std::path::PathBuf>,
     user_keypair: Option<identity::UserKeypair>,
     user_key_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
@@ -822,6 +829,7 @@ impl Agent {
             machine_key_path: None,
             agent_keypair: None,
             agent_key_path: None,
+            agent_cert_path: None,
             user_keypair: None,
             user_key_path: None,
             network_config: None,
@@ -3749,6 +3757,26 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a custom path for the agent certificate (`agent.cert`).
+    ///
+    /// Required for multi-daemon setups that share a host — the default
+    /// path (`~/.x0x/agent.cert`) is shared across daemons, causing
+    /// last-writer-wins trampling that makes peers reject identity
+    /// announcements as `agent certificate agent_id mismatch`.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to use for the agent certificate file.
+    ///
+    /// # Returns
+    ///
+    /// Self for chaining.
+    #[must_use]
+    pub fn with_agent_cert_path<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.agent_cert_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Set network configuration for P2P communication.
     ///
     /// If not set, default network configuration is used.
@@ -3969,38 +3997,59 @@ impl AgentBuilder {
             None
         };
 
-        // Build identity with optional user layer
+        // Build identity with optional user layer.
+        //
+        // The agent certificate binds (user_id, agent_id). On load we must
+        // verify BOTH halves of the binding match the current identity —
+        // user_id AND agent_id — and re-issue if either diverges. A mismatch
+        // happens in two practical scenarios:
+        //   1. The user key was replaced (cert's user_id no longer ours).
+        //   2. Multi-daemon-per-host setups where the cert path is shared
+        //      and a peer daemon overwrote it with their own cert (cert's
+        //      agent_id no longer ours).
+        // Without the agent_id half of the check, scenario (2) produces an
+        // announcement whose cert binds another daemon's agent_id, and peers
+        // reject it as "agent certificate agent_id mismatch".
+        //
+        // The per-daemon `agent_cert_path` (set by `with_agent_cert_path()`)
+        // is the structural fix for scenario (2); the agent_id check is the
+        // defensive net in case two processes still land on the same path.
         let identity = if let Some(user_kp) = user_keypair {
-            // Try to load existing certificate, or issue a new one
-            // IMPORTANT: Verify the cert matches the current user key
-            let cert = if storage::agent_certificate_exists().await {
-                match storage::load_agent_certificate().await {
-                    Ok(c) => {
-                        // Verify cert is for the current user - if not, re-issue
-                        let cert_matches_user = c
-                            .user_id()
-                            .map(|uid| uid == user_kp.user_id())
-                            .unwrap_or(false);
-                        if cert_matches_user {
-                            c
-                        } else {
-                            // Cert was for a different user, issue new one
-                            let new_cert =
-                                identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
-                            storage::save_agent_certificate(&new_cert).await?;
-                            new_cert
-                        }
-                    }
-                    Err(_) => {
-                        let c = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
-                        storage::save_agent_certificate(&c).await?;
-                        c
-                    }
+            let cert_path = self.agent_cert_path.clone();
+            let existing_cert = if let Some(ref p) = cert_path {
+                if tokio::fs::try_exists(p).await.unwrap_or(false) {
+                    storage::load_agent_certificate_from(p).await.ok()
+                } else {
+                    None
                 }
+            } else if storage::agent_certificate_exists().await {
+                storage::load_agent_certificate().await.ok()
             } else {
-                let c = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
-                storage::save_agent_certificate(&c).await?;
-                c
+                None
+            };
+
+            let cert_still_valid = existing_cert.as_ref().is_some_and(|c| {
+                let user_match = c
+                    .user_id()
+                    .map(|uid| uid == user_kp.user_id())
+                    .unwrap_or(false);
+                let agent_match = c
+                    .agent_id()
+                    .map(|aid| aid == agent_keypair.agent_id())
+                    .unwrap_or(false);
+                user_match && agent_match
+            });
+
+            let cert = if cert_still_valid {
+                existing_cert.expect("cert_still_valid implies Some")
+            } else {
+                let new_cert = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
+                if let Some(ref p) = cert_path {
+                    storage::save_agent_certificate_to(&new_cert, p).await?;
+                } else {
+                    storage::save_agent_certificate(&new_cert).await?;
+                }
+                new_cert
             };
             identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
         } else {
