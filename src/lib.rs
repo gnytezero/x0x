@@ -110,6 +110,11 @@ pub mod mls;
 /// efficient, reliable delivery between connected agents.
 pub mod direct;
 
+/// Direct messaging over gossip — the v1 C path per
+/// `docs/design/dm-over-gossip.md`. Provides signed+encrypted envelopes,
+/// recipient-specific inbox topics, dedupe, and application-layer ACKs.
+pub mod dm;
+
 /// Presence system — beacons, FOAF discovery, and online/offline events.
 pub mod presence;
 
