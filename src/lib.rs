@@ -115,6 +115,11 @@ pub mod direct;
 /// recipient-specific inbox topics, dedupe, and application-layer ACKs.
 pub mod dm;
 
+/// Mesh-wide DM capability advertisement + cache. Senders consult this
+/// store to decide whether to use the gossip DM path or fall back to
+/// raw-QUIC for a given recipient.
+pub mod dm_capability;
+
 /// Presence system — beacons, FOAF discovery, and online/offline events.
 pub mod presence;
 

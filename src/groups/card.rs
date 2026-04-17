@@ -45,6 +45,12 @@ pub struct AgentCard {
 
     /// Unix seconds when this card was generated.
     pub created_at: u64,
+
+    /// Direct-messaging transport capabilities advertised by this agent.
+    /// Added in x0x 0.18 (C — DM over gossip). Cards predating 0.18 carry
+    /// `None`, interpreted by senders as "raw-QUIC / legacy only".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dm_capabilities: Option<crate::dm::DmCapabilities>,
 }
 
 /// A group reference inside an agent card.
@@ -83,6 +89,7 @@ impl AgentCard {
             groups: Vec::new(),
             stores: Vec::new(),
             created_at: now,
+            dm_capabilities: Some(crate::dm::DmCapabilities::v1_gossip_ready()),
         }
     }
 
