@@ -2396,6 +2396,16 @@ async fn run_gossip_update_listener(
             }
         };
 
+        // Stage 2: reject replayed manifests that have aged past the policy window.
+        // This prevents an attacker from replaying a legitimately signed but
+        // stale manifest onto the gossip network to trigger a long-expired
+        // upgrade path or to keep the fleet churning on yesterday's release.
+        if let Err(e) = x0x::upgrade::monitor::validate_manifest_timestamp(&manifest) {
+            tracing::warn!(error = %e, version = %manifest.version,
+                "Rejecting stale gossip manifest (timestamp too old)");
+            continue;
+        }
+
         // Rebroadcast with time-windowed dedup: allow re-rebroadcast every 5 minutes
         // so late-connecting peers (e.g., after a peer restarts) still receive the manifest.
         let should_rebroadcast = match rebroadcasted_versions.get(&manifest.version) {

@@ -13,7 +13,11 @@ use super::signature::verify_manifest_signature;
 use super::UpgradeError;
 
 /// Maximum age of a manifest timestamp before it is rejected (30 days).
-const MAX_MANIFEST_AGE_SECS: u64 = 30 * 24 * 3600;
+///
+/// Applied at every ingestion point — the GitHub-polling monitor here, plus
+/// the gossip listener in `x0xd` — so a stale manifest replayed into the
+/// network cannot downgrade or re-trigger long-expired upgrades.
+pub const MAX_MANIFEST_AGE_SECS: u64 = 30 * 24 * 3600;
 
 /// GitHub API release response.
 #[derive(Debug, Clone, Deserialize)]

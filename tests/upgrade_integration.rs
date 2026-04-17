@@ -332,6 +332,46 @@ fn max_binary_size_constant() {
 }
 
 // ---------------------------------------------------------------------------
+// Manifest timestamp validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_manifest_timestamp_accepts_fresh() {
+    use x0x::upgrade::monitor::validate_manifest_timestamp;
+    let mut m = make_manifest("1.0.0");
+    m.timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(validate_manifest_timestamp(&m).is_ok());
+}
+
+#[test]
+fn validate_manifest_timestamp_accepts_zero_legacy() {
+    use x0x::upgrade::monitor::validate_manifest_timestamp;
+    // Legacy manifests with timestamp == 0 must be allowed through for
+    // backward compatibility; otherwise old releases would fail the age
+    // check the moment a new node with the guard joined.
+    let mut m = make_manifest("1.0.0");
+    m.timestamp = 0;
+    assert!(validate_manifest_timestamp(&m).is_ok());
+}
+
+#[test]
+fn validate_manifest_timestamp_rejects_ancient() {
+    use x0x::upgrade::monitor::{validate_manifest_timestamp, MAX_MANIFEST_AGE_SECS};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut m = make_manifest("1.0.0");
+    m.timestamp = now - MAX_MANIFEST_AGE_SECS - 3600;
+    let err = validate_manifest_timestamp(&m).expect_err("must reject");
+    let msg = format!("{err}");
+    assert!(msg.contains("too old"), "unexpected message: {msg}");
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end: sign → write → verify from file
 // ---------------------------------------------------------------------------
 
