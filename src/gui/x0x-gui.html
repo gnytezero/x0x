@@ -587,6 +587,9 @@ tr:hover td{background:rgba(255,255,255,.01)}
     <div class="sb-item" onclick="navigate('discover')"><span class="icon">&#128270;</span><span>Discover</span></div>
     <div class="sb-item" onclick="navigate('people')"><span class="icon">&#128101;</span><span>People</span></div>
     <div class="sb-item" onclick="navigate('network')"><span class="icon">&#127760;</span><span>Network</span></div>
+    <div class="sb-item" onclick="navigate('presence')"><span class="icon">&#128336;</span><span>Presence</span></div>
+    <div class="sb-item" onclick="navigate('mls')"><span class="icon">&#128274;</span><span>Encrypted Groups</span></div>
+    <div class="sb-item" onclick="navigate('admin')"><span class="icon">&#128295;</span><span>Admin</span></div>
     <div class="sb-item" onclick="navigate('constitution')"><span class="icon">&#128220;</span><span>Constitution</span></div>
     <div class="sb-item" onclick="navigate('settings')"><span class="icon">&#9881;</span><span>Settings</span></div>
     <div class="sb-item" onclick="navigate('about')"><span class="icon">&#9432;</span><span>About</span></div>
@@ -1489,6 +1492,9 @@ function renderView(){
     case 'discover':el.innerHTML=renderDiscover();mountDiscover();break;
     case 'people':el.innerHTML=renderPeople();mountPeople();break;
     case 'network':el.innerHTML=renderNetwork();mountNetwork();break;
+    case 'presence':el.innerHTML=renderPresence();mountPresence();break;
+    case 'mls':el.innerHTML=renderMls();mountMls();break;
+    case 'admin':el.innerHTML=renderAdmin();mountAdmin();break;
     case 'settings':el.innerHTML=renderSettings();mountSettings();break;
     case 'constitution':el.innerHTML=renderConstitutionView();mountConstitution();break;
     case 'about':el.innerHTML=renderAbout();break;
@@ -2580,6 +2586,18 @@ function renderNetwork(){
     <div class="card stat-card"><div class="label">Relayed</div><div class="val" id="n-relayed">0</div></div>
     <div class="card stat-card"><div class="label">Avg RTT</div><div class="val" id="n-rtt">—</div></div>
   </div>
+  <h3>Connectivity Diagnostics</h3>
+  <div class="card mb2" id="n-diag" style="font-size:12px">
+    <div class="grid g2" style="gap:var(--sp3)">
+      <div><span class="k">NAT type</span>: <span id="n-diag-nat" class="v">—</span></div>
+      <div><span class="k">Direct inbound</span>: <span id="n-diag-direct" class="v">—</span></div>
+      <div><span class="k">Relay</span>: <span id="n-diag-relay" class="v">—</span></div>
+      <div><span class="k">Coordinator</span>: <span id="n-diag-coord" class="v">—</span></div>
+      <div><span class="k">LAN discovery</span>: <span id="n-diag-lan" class="v">—</span></div>
+      <div><span class="k">UPnP</span>: <span id="n-diag-upnp" class="v">—</span></div>
+    </div>
+    <div id="n-diag-notes" style="margin-top:var(--sp2);color:var(--tx2)"></div>
+  </div>
   <h3>External Addresses</h3>
   <div class="card mb" id="n-addrs" style="font-size:12px">—</div>
   <h3>Peers</h3>
@@ -2599,6 +2617,23 @@ async function pollNetworkView(){
     if(e('n-rtt'))e('n-rtt').textContent=s.avg_rtt_ms!=null?Math.round(s.avg_rtt_ms)+'ms':'—';
     if(e('n-addrs'))e('n-addrs').innerHTML=(s.external_addrs||[]).map(a=>'<div>'+esc(a)+'</div>').join('')||'None detected';
   }
+  const d=await api('/diagnostics/connectivity');
+  if(d&&d.ok){
+    const e=id=>document.getElementById(id);
+    const fmt=v=>v==null?'<span style="color:var(--tx3)">unknown</span>':(v===true?'<span class="trust trust-trusted" style="font-size:10px">yes</span>':(v===false?'<span class="trust trust-unknown" style="font-size:10px">no</span>':esc(String(v))));
+    if(e('n-diag-nat'))e('n-diag-nat').innerHTML=d.nat_type?esc(d.nat_type):fmt(null);
+    if(e('n-diag-direct'))e('n-diag-direct').innerHTML=fmt(d.can_receive_direct);
+    if(e('n-diag-relay'))e('n-diag-relay').innerHTML=fmt(d.is_relay);
+    if(e('n-diag-coord'))e('n-diag-coord').innerHTML=fmt(d.is_coordinator);
+    if(e('n-diag-lan'))e('n-diag-lan').innerHTML=fmt(d.lan_discovery_enabled);
+    if(e('n-diag-upnp'))e('n-diag-upnp').innerHTML=fmt(d.upnp_enabled);
+    const notes=document.getElementById('n-diag-notes');
+    if(notes&&Array.isArray(d.notes)&&d.notes.length){
+      notes.innerHTML=d.notes.map(n=>'<div>• '+esc(n)+'</div>').join('');
+    }else if(notes){
+      notes.innerHTML='';
+    }
+  }
   const p=await api('/peers');
   if(p&&p.peers){
     const tb=document.getElementById('n-peers');
@@ -2609,6 +2644,642 @@ async function pollNetworkView(){
     const el=document.getElementById('n-cache');
     if(el)el.textContent='Cached peers: '+(c.cached_peers||0);
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 10b: PRESENCE VIEW
+   Exposes /presence/online, /presence/foaf, /presence/find/:id,
+   /presence/status/:id and the /presence/events SSE stream.
+   ═══════════════════════════════════════════════════════════════════ */
+let presenceSse=null;
+function renderPresence(){
+  return `<h2>Presence</h2>
+  <div class="row mb" style="gap:var(--sp2)">
+    <input id="p-find" placeholder="Find agent by ID (paste 32-byte agent_id or prefix)" style="flex:1">
+    <button class="pri" onclick="findAgent()">Find</button>
+  </div>
+  <div class="row mb" style="gap:var(--sp2)">
+    <label style="color:var(--tx2);font-size:12px">FOAF TTL: <input id="p-foaf-ttl" type="number" min="1" max="4" value="2" style="width:52px"></label>
+    <button onclick="runFoafWalk()">Run FOAF walk</button>
+    <button onclick="pollPresence()">Refresh online</button>
+    <label style="margin-left:auto;color:var(--tx2);font-size:12px"><input type="checkbox" id="p-live" onchange="togglePresenceLive(this.checked)"> Live events</label>
+  </div>
+  <h3>Online Agents</h3>
+  <div class="card mb"><table><thead><tr><th>Agent</th><th>User</th><th>Reachable</th><th>Last Beacon</th><th></th></tr></thead><tbody id="p-online"></tbody></table></div>
+  <h3>FOAF Discoveries</h3>
+  <div class="card mb"><table><thead><tr><th>Agent</th><th>Via</th><th>Quality</th><th>Last Seen</th><th></th></tr></thead><tbody id="p-foaf"></tbody></table></div>
+  <h3>Lookup Result</h3>
+  <div class="card" id="p-result" style="font-size:12px;color:var(--tx2)">No lookup yet.</div>`;
+}
+
+function mountPresence(){
+  pollPresence();
+}
+
+function presenceRow(a){
+  const aid=esc(a.agent_id||'');
+  const short_=short(a.agent_id||'',12);
+  const uid=a.user_id?short(a.user_id,8):'—';
+  const reach=a.reachable===true?'<span class="trust trust-trusted" style="font-size:9px">yes</span>':
+              (a.reachable===false?'<span class="trust trust-unknown" style="font-size:9px">no</span>':'<span style="color:var(--tx3)">?</span>');
+  const seen=a.last_beacon_secs!=null?fmtUp(a.last_beacon_secs)+' ago':'—';
+  return `<tr>
+    <td class="aid-short" onclick="copyText('${escJs(a.agent_id||'')}')" title="${aid}">${short_}</td>
+    <td style="font-size:11px;color:var(--tx2)">${uid}</td>
+    <td>${reach}</td>
+    <td style="font-size:11px;color:var(--tx3)">${seen}</td>
+    <td><button class="ghost" onclick="showPresenceStatus('${escJs(a.agent_id||'')}')">Status</button></td>
+  </tr>`;
+}
+
+async function pollPresence(){
+  const r=await api('/presence/online');
+  const tb=document.getElementById('p-online');
+  if(tb){
+    const agents=(r&&r.agents)||[];
+    tb.innerHTML=agents.length?agents.map(presenceRow).join(''):
+      '<tr><td colspan="5" style="color:var(--tx3);text-align:center;padding:var(--sp3)">No agents currently online.</td></tr>';
+  }
+}
+
+async function runFoafWalk(){
+  const ttl=Math.max(1,Math.min(4,parseInt(document.getElementById('p-foaf-ttl').value,10)||2));
+  const r=await api('/presence/foaf?ttl='+ttl);
+  const tb=document.getElementById('p-foaf');
+  if(tb){
+    const agents=(r&&r.agents)||[];
+    tb.innerHTML=agents.length?agents.map(a=>{
+      const via=a.via_agent_id?short(a.via_agent_id,10):'—';
+      const q=a.quality!=null?(Math.round(a.quality*100)+'%'):'—';
+      const seen=a.last_seen_secs!=null?fmtUp(a.last_seen_secs)+' ago':'—';
+      return `<tr>
+        <td class="aid-short">${short(a.agent_id||'',12)}</td>
+        <td style="font-size:11px;color:var(--tx2)">${via}</td>
+        <td style="font-size:11px">${q}</td>
+        <td style="font-size:11px;color:var(--tx3)">${seen}</td>
+        <td><button class="ghost" onclick="showPresenceStatus('${escJs(a.agent_id||'')}')">Status</button></td>
+      </tr>`;
+    }).join(''):'<tr><td colspan="5" style="color:var(--tx3);text-align:center;padding:var(--sp3)">No FOAF discoveries.</td></tr>';
+  }
+}
+
+async function findAgent(){
+  const id=(document.getElementById('p-find').value||'').trim();
+  if(!id){toast('Enter an agent ID','warn');return}
+  const r=await api('/presence/find/'+encodeURIComponent(id));
+  const el=document.getElementById('p-result');
+  if(!el)return;
+  if(!r||r.error){el.innerHTML='<span style="color:var(--rd)">Not found: '+esc((r&&r.error)||id)+'</span>';return}
+  el.innerHTML=`<div><span class="k">Agent</span>: <span class="aid-short">${esc(r.agent_id||id)}</span></div>
+  <div><span class="k">Reachable</span>: ${r.reachable?'yes':'no'}</div>
+  <div><span class="k">Addresses</span>: ${(r.addresses||[]).map(esc).join(', ')||'—'}</div>
+  <div><span class="k">Via FOAF</span>: ${r.via?short(r.via,12):'—'}</div>`;
+}
+
+async function showPresenceStatus(agentId){
+  if(!agentId)return;
+  const r=await api('/presence/status/'+encodeURIComponent(agentId));
+  const el=document.getElementById('p-result');
+  if(!el)return;
+  if(!r||!r.ok){el.innerHTML='<span style="color:var(--rd)">No status: '+esc(agentId)+'</span>';return}
+  el.innerHTML=`<div><span class="k">Agent</span>: <span class="aid-short">${esc(agentId)}</span></div>
+  <div><span class="k">Online</span>: ${r.online?'yes':'no'}</div>
+  <div><span class="k">Reachable</span>: ${r.reachable===true?'yes':r.reachable===false?'no':'unknown'}</div>
+  <div><span class="k">Last beacon</span>: ${r.last_beacon_secs!=null?fmtUp(r.last_beacon_secs)+' ago':'—'}</div>
+  <div><span class="k">Trust</span>: ${esc(r.trust_level||'—')}</div>`;
+}
+
+function togglePresenceLive(on){
+  if(on){
+    if(presenceSse)return;
+    try{
+      const url=BASE+'/presence/events'+(API_TOKEN?'?token='+encodeURIComponent(API_TOKEN):'');
+      presenceSse=new EventSource(url);
+      presenceSse.onmessage=e=>{
+        try{
+          const ev=JSON.parse(e.data);
+          if(ev.type==='online'||ev.type==='offline'){
+            toast(ev.type==='online'?'Online: '+short(ev.agent_id||'',10):'Offline: '+short(ev.agent_id||'',10),'info');
+            pollPresence();
+          }
+        }catch(_){}
+      };
+      presenceSse.onerror=()=>{try{presenceSse.close()}catch(_){};presenceSse=null;
+        const cb=document.getElementById('p-live');if(cb)cb.checked=false;
+        toast('Presence event stream dropped','warn');
+      };
+    }catch(_){presenceSse=null}
+  }else if(presenceSse){
+    try{presenceSse.close()}catch(_){}
+    presenceSse=null;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 10c: ENCRYPTED (MLS) GROUPS VIEW
+   Exposes /mls/groups, /mls/groups/:id(/members)(/encrypt|decrypt|welcome).
+   Low-level encrypted-group management — for everyday use, named groups
+   in the Spaces sidebar are preferred.
+   ═══════════════════════════════════════════════════════════════════ */
+let selectedMlsGroup='';
+function renderMls(){
+  return `<h2>Encrypted Groups (MLS)</h2>
+  <p style="color:var(--tx2);font-size:12px;margin-bottom:var(--sp3)">
+    Post-quantum end-to-end encryption with key rotation per epoch. New members are added via signed welcome messages; removed members lose access on the next key rotation.
+  </p>
+  <div class="row mb" style="gap:var(--sp2)">
+    <input id="mls-new-id" placeholder="Group id (optional — auto if blank)" style="flex:1">
+    <button class="pri" onclick="createMlsGroup()">Create group</button>
+    <button onclick="pollMlsGroups()">Refresh</button>
+  </div>
+  <div class="grid g2" style="gap:var(--sp3)">
+    <div>
+      <h3>Groups</h3>
+      <div class="card" id="mls-list">Loading…</div>
+    </div>
+    <div>
+      <h3>Selected group</h3>
+      <div class="card" id="mls-detail" style="font-size:12px;color:var(--tx3)">Select a group on the left.</div>
+    </div>
+  </div>
+  <h3 style="margin-top:var(--sp4)">Encrypt / Decrypt</h3>
+  <div class="card">
+    <div class="row mb" style="gap:var(--sp2)">
+      <textarea id="mls-plain" placeholder="Plaintext payload (UTF-8)" rows="3" style="flex:1"></textarea>
+      <button class="pri" onclick="mlsEncryptSelected()">Encrypt</button>
+    </div>
+    <div class="row" style="gap:var(--sp2)">
+      <textarea id="mls-cipher" placeholder="Ciphertext (base64)" rows="3" style="flex:1"></textarea>
+      <input id="mls-epoch" placeholder="Epoch #" type="number" style="width:110px">
+      <button onclick="mlsDecryptSelected()">Decrypt</button>
+    </div>
+    <div id="mls-crypto-result" style="font-size:12px;color:var(--tx2);margin-top:var(--sp2)"></div>
+  </div>`;
+}
+
+function mountMls(){ pollMlsGroups(); }
+
+async function pollMlsGroups(){
+  const r=await api('/mls/groups');
+  const list=document.getElementById('mls-list');
+  if(!list)return;
+  const groups=(r&&r.groups)||[];
+  if(!groups.length){
+    list.innerHTML='<div style="color:var(--tx3);font-size:12px;padding:var(--sp2)">No MLS groups yet.</div>';
+  }else{
+    list.innerHTML=groups.map(g=>{
+      const sel=g.group_id===selectedMlsGroup?' style="background:var(--cy-dim)"':'';
+      return `<div class="sb-item" ${sel} onclick="selectMlsGroup('${escJs(g.group_id)}')">
+        <span class="icon">&#128274;</span>
+        <div style="flex:1">
+          <div style="font-weight:500">${esc(g.display_name||short(g.group_id))}</div>
+          <div style="font-size:11px;color:var(--tx3)">Members: ${g.members||0} · Epoch: ${g.epoch||0}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+  if(selectedMlsGroup) await refreshMlsDetail(selectedMlsGroup);
+}
+
+async function selectMlsGroup(id){
+  selectedMlsGroup=id;
+  await refreshMlsDetail(id);
+  pollMlsGroups();
+}
+
+async function refreshMlsDetail(id){
+  const el=document.getElementById('mls-detail');
+  if(!el)return;
+  const r=await api('/mls/groups/'+encodeURIComponent(id));
+  if(!r||!r.ok){el.innerHTML='<span style="color:var(--rd)">Failed to load group.</span>';return}
+  const members=r.members||[];
+  el.innerHTML=`<div><span class="k">Group</span>: <span class="aid-short">${esc(id)}</span></div>
+  <div><span class="k">Epoch</span>: ${r.epoch||0}</div>
+  <div><span class="k">Members</span>: ${members.length}</div>
+  <ul style="margin-top:var(--sp2)">${members.map(mid=>`<li>${short(mid,14)}
+    <button class="ghost" style="margin-left:6px" onclick="mlsRemoveMember('${escJs(id)}','${escJs(mid)}')">Remove</button></li>`).join('')}</ul>
+  <div class="row" style="gap:var(--sp2);margin-top:var(--sp2)">
+    <input id="mls-add-id" placeholder="Agent ID to add" style="flex:1;font-size:11px">
+    <button onclick="mlsAddMember('${escJs(id)}')">Add</button>
+    <button onclick="mlsSendWelcome('${escJs(id)}')">Welcome</button>
+  </div>`;
+}
+
+async function createMlsGroup(){
+  const idInput=document.getElementById('mls-new-id');
+  const body={};
+  const id=(idInput.value||'').trim();
+  if(id)body.group_id=id;
+  const r=await api('/mls/groups',{method:'POST',body:JSON.stringify(body)});
+  if(r&&r.group_id){
+    toast('MLS group created: '+short(r.group_id,12),'success');
+    idInput.value='';
+    selectedMlsGroup=r.group_id;
+    await pollMlsGroups();
+  }else{
+    toast('Failed: '+((r&&r.error)||'unknown'),'error');
+  }
+}
+
+async function mlsAddMember(gid){
+  const input=document.getElementById('mls-add-id');
+  const aid=(input.value||'').trim();
+  if(!aid){toast('Enter an agent ID','warn');return}
+  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/members',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  if(r&&r.ok){toast('Member added','success');input.value='';refreshMlsDetail(gid)}
+  else toast('Failed: '+((r&&r.error)||'unknown'),'error');
+}
+
+async function mlsRemoveMember(gid,aid){
+  if(!confirm('Remove '+short(aid,12)+' from the group?'))return;
+  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/members/'+encodeURIComponent(aid),{method:'DELETE'});
+  if(r&&r.ok){toast('Member removed','success');refreshMlsDetail(gid)}
+  else toast('Failed: '+((r&&r.error)||'unknown'),'error');
+}
+
+async function mlsSendWelcome(gid){
+  const aid=(document.getElementById('mls-add-id').value||'').trim();
+  if(!aid){toast('Enter the agent ID to welcome','warn');return}
+  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/welcome',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  if(r&&r.ok)toast('Welcome sent','success');
+  else toast('Failed: '+((r&&r.error)||'unknown'),'error');
+}
+
+async function mlsEncryptSelected(){
+  if(!selectedMlsGroup){toast('Select a group first','warn');return}
+  const plaintext=document.getElementById('mls-plain').value||'';
+  const r=await api('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
+  const result=document.getElementById('mls-crypto-result');
+  if(r&&r.ciphertext){
+    document.getElementById('mls-cipher').value=r.ciphertext;
+    if(r.epoch!=null)document.getElementById('mls-epoch').value=r.epoch;
+    result.innerHTML='<span style="color:var(--gn)">Encrypted at epoch '+esc(String(r.epoch||0))+'</span>';
+  }else{
+    result.innerHTML='<span style="color:var(--rd)">Failed: '+esc((r&&r.error)||'unknown')+'</span>';
+  }
+}
+
+async function mlsDecryptSelected(){
+  if(!selectedMlsGroup){toast('Select a group first','warn');return}
+  const ciphertext=document.getElementById('mls-cipher').value||'';
+  const epoch=parseInt(document.getElementById('mls-epoch').value||'0',10);
+  const r=await api('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
+  const result=document.getElementById('mls-crypto-result');
+  if(r&&r.plaintext){
+    document.getElementById('mls-plain').value=r.plaintext;
+    result.innerHTML='<span style="color:var(--gn)">Decrypted OK</span>';
+  }else{
+    result.innerHTML='<span style="color:var(--rd)">Failed: '+esc((r&&r.error)||'unknown')+'</span>';
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 10d: ADMIN VIEW
+   Collects the small, advanced endpoints under one roof: announce,
+   agent user-id lookup, introduction card, trust evaluation, raw
+   constitution, secure envelope open, agent directory, and shard
+   subscription management.
+   ═══════════════════════════════════════════════════════════════════ */
+function renderAdmin(){
+  return `<h2>Admin &amp; Advanced</h2>
+  <div class="grid g2" style="gap:var(--sp3)">
+    <div class="card">
+      <h3 style="margin-top:0">Identity &amp; Announcements</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminAnnounce(false)">Announce (anonymous)</button>
+        <button onclick="adminAnnounce(true)">Announce (with user ID)</button>
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminFetchUserId()">Fetch my user-id</button>
+        <button onclick="adminFetchIntroduction()">Fetch introduction card</button>
+      </div>
+      <div id="admin-identity-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Agent Directory</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-agent-id" placeholder="Agent ID" style="flex:1">
+        <button onclick="adminAgentDiscovered()">Details</button>
+        <button onclick="adminAgentReach()">Reachability</button>
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminAgentFind()">Find (network-wide)</button>
+        <button onclick="adminAgentConnect()">Connect</button>
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-user-id" placeholder="User ID for /users/:user_id/agents" style="flex:1">
+        <button onclick="adminUserAgents()">Agents for user</button>
+      </div>
+      <div id="admin-dir-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Trust Evaluation</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-te-agent" placeholder="Agent ID" style="flex:1">
+        <input id="admin-te-machine" placeholder="Machine ID" style="flex:1">
+        <button onclick="adminEvaluateTrust()">Evaluate</button>
+      </div>
+      <div id="admin-te-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Daemon Status</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminFetchStatus()">GET /status</button>
+        <button onclick="adminFetchConstitution()">GET /constitution (raw markdown)</button>
+      </div>
+      <div id="admin-status-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2);max-height:280px;overflow:auto;white-space:pre-wrap"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Secure Envelopes</h3>
+      <p style="font-size:11px;color:var(--tx2)">
+        Pairwise post-quantum encryption for a named group. Encrypt a payload for
+        all current members, decrypt what you received, or re-seal for a rotated
+        membership set.
+      </p>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-se-group" placeholder="Group ID" style="flex:1">
+      </div>
+      <textarea id="admin-se-plain" placeholder="Plaintext (UTF-8) for encrypt / reseal" rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminSecureEncrypt()">Encrypt</button>
+        <button onclick="adminSecureReseal()">Re-seal (new epoch)</button>
+      </div>
+      <textarea id="admin-se-cipher" placeholder='{"ciphertext":"...","epoch":0}' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <button onclick="adminSecureDecrypt()">Decrypt</button>
+      <p style="font-size:11px;color:var(--tx2);margin-top:var(--sp3)">Or open a raw envelope payload:</p>
+      <textarea id="admin-envelope" placeholder='{"envelope":"..."}' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <button onclick="adminOpenEnvelope()">Open envelope</button>
+      <div id="admin-env-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2);white-space:pre-wrap;max-height:200px;overflow:auto"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Named Group Members</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-gm-group" placeholder="Group ID" style="flex:1">
+        <input id="admin-gm-agent" placeholder="Agent ID" style="flex:1">
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminGroupAddMember()">Add member (POST)</button>
+        <button class="danger" onclick="adminGroupRemoveMember()">Remove member (DELETE)</button>
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-gm-request" placeholder="Request ID (for cancel)" style="flex:1">
+        <button onclick="adminGroupCancelRequest()">Cancel join request</button>
+      </div>
+      <div id="admin-gm-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Add Contact (raw)</h3>
+      <p style="font-size:11px;color:var(--tx2)">POST /contacts — register an agent directly without importing a card.</p>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-ac-agent" placeholder="Agent ID" style="flex:1">
+        <input id="admin-ac-label" placeholder="Label (optional)" style="flex:1">
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <select id="admin-ac-trust" style="width:auto">
+          <option value="unknown">Unknown</option>
+          <option value="known" selected>Known</option>
+          <option value="trusted">Trusted</option>
+          <option value="blocked">Blocked</option>
+        </select>
+        <button onclick="adminAddContact()">Add contact</button>
+      </div>
+      <div id="admin-ac-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Group Cards</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-card-id" placeholder="Group ID" style="flex:1">
+        <button onclick="adminFetchGroupCard()">Fetch card</button>
+      </div>
+      <div id="admin-card-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2);max-height:240px;overflow:auto;white-space:pre-wrap"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Directory Shard Subscriptions</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <select id="admin-shard-kind" style="width:auto">
+          <option value="tag">tag</option>
+          <option value="social">social</option>
+          <option value="presence">presence</option>
+        </select>
+        <input id="admin-shard-id" type="number" placeholder="Shard # (0-65535)" style="flex:1">
+        <button onclick="adminSubscribeShard()">Subscribe</button>
+        <button onclick="adminUnsubscribeShard()">Unsubscribe</button>
+      </div>
+      <button onclick="adminListShards()">Refresh subscriptions</button>
+      <div id="admin-shard-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Transfer Status</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-xfer-id" placeholder="Transfer ID" style="flex:1">
+        <button onclick="adminTransferStatus()">Status</button>
+      </div>
+      <div id="admin-xfer-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">KV Stores</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-store-id" placeholder="Store ID" style="flex:1">
+        <button onclick="adminJoinStore()">Join</button>
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-store-key" placeholder="Key to delete" style="flex:1">
+        <button class="danger" onclick="adminDeleteKey()">Delete key</button>
+      </div>
+      <div id="admin-kv-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+  </div>`;
+}
+
+function mountAdmin(){}
+
+function adminOut(id,obj,err){
+  const el=document.getElementById(id);if(!el)return;
+  if(err){el.innerHTML='<span style="color:var(--rd)">'+esc(err)+'</span>';return}
+  el.textContent=typeof obj==='string'?obj:JSON.stringify(obj,null,2);
+}
+
+async function adminAnnounce(withUser){
+  const r=await api('/announce',{method:'POST',body:JSON.stringify({include_user_identity:withUser,human_consent:withUser})});
+  adminOut('admin-identity-out',r&&r.ok?'Announcement sent.':r);
+}
+async function adminFetchUserId(){
+  const r=await api('/agent/user-id');
+  adminOut('admin-identity-out',r);
+}
+async function adminFetchIntroduction(){
+  const r=await api('/introduction');
+  adminOut('admin-identity-out',r);
+}
+
+async function adminAgentDiscovered(){
+  const id=(document.getElementById('admin-agent-id').value||'').trim();
+  if(!id){adminOut('admin-dir-out',null,'Enter an agent ID');return}
+  const r=await api('/agents/discovered/'+encodeURIComponent(id));
+  adminOut('admin-dir-out',r);
+}
+async function adminAgentReach(){
+  const id=(document.getElementById('admin-agent-id').value||'').trim();
+  if(!id){adminOut('admin-dir-out',null,'Enter an agent ID');return}
+  const r=await api('/agents/reachability/'+encodeURIComponent(id));
+  adminOut('admin-dir-out',r);
+}
+async function adminAgentFind(){
+  const id=(document.getElementById('admin-agent-id').value||'').trim();
+  if(!id){adminOut('admin-dir-out',null,'Enter an agent ID');return}
+  const r=await api('/agents/find/'+encodeURIComponent(id),{method:'POST',body:JSON.stringify({})});
+  adminOut('admin-dir-out',r);
+}
+async function adminAgentConnect(){
+  const id=(document.getElementById('admin-agent-id').value||'').trim();
+  if(!id){adminOut('admin-dir-out',null,'Enter an agent ID');return}
+  const r=await api('/agents/connect',{method:'POST',body:JSON.stringify({agent_id:id})});
+  adminOut('admin-dir-out',r);
+}
+async function adminUserAgents(){
+  const uid=(document.getElementById('admin-user-id').value||'').trim();
+  if(!uid){adminOut('admin-dir-out',null,'Enter a user ID');return}
+  const r=await api('/users/'+encodeURIComponent(uid)+'/agents');
+  adminOut('admin-dir-out',r);
+}
+
+async function adminEvaluateTrust(){
+  const agent_id=(document.getElementById('admin-te-agent').value||'').trim();
+  const machine_id=(document.getElementById('admin-te-machine').value||'').trim();
+  if(!agent_id||!machine_id){adminOut('admin-te-out',null,'Need agent_id and machine_id');return}
+  const r=await api('/trust/evaluate',{method:'POST',body:JSON.stringify({agent_id,machine_id})});
+  adminOut('admin-te-out',r);
+}
+
+async function adminFetchStatus(){
+  const r=await api('/status');
+  adminOut('admin-status-out',r);
+}
+async function adminFetchConstitution(){
+  try{
+    const r=await fetch(BASE+'/constitution',{headers:API_TOKEN?{'Authorization':'Bearer '+API_TOKEN}:{}});
+    const txt=await r.text();
+    adminOut('admin-status-out',txt);
+  }catch(e){adminOut('admin-status-out',null,String(e))}
+}
+
+async function adminOpenEnvelope(){
+  let body;
+  try{body=JSON.parse(document.getElementById('admin-envelope').value||'{}')}
+  catch(e){adminOut('admin-env-out',null,'Invalid JSON');return}
+  const r=await api('/groups/secure/open-envelope',{method:'POST',body:JSON.stringify(body)});
+  adminOut('admin-env-out',r);
+}
+
+async function adminSecureEncrypt(){
+  const gid=(document.getElementById('admin-se-group').value||'').trim();
+  const plaintext=document.getElementById('admin-se-plain').value||'';
+  if(!gid){adminOut('admin-env-out',null,'Enter a group ID');return}
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
+  if(r&&r.ciphertext){
+    document.getElementById('admin-se-cipher').value=JSON.stringify({ciphertext:r.ciphertext,epoch:r.epoch||0});
+  }
+  adminOut('admin-env-out',r);
+}
+async function adminSecureReseal(){
+  const gid=(document.getElementById('admin-se-group').value||'').trim();
+  const plaintext=document.getElementById('admin-se-plain').value||'';
+  if(!gid){adminOut('admin-env-out',null,'Enter a group ID');return}
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/reseal',{method:'POST',body:JSON.stringify({plaintext})});
+  adminOut('admin-env-out',r);
+}
+async function adminSecureDecrypt(){
+  const gid=(document.getElementById('admin-se-group').value||'').trim();
+  if(!gid){adminOut('admin-env-out',null,'Enter a group ID');return}
+  let body;
+  try{body=JSON.parse(document.getElementById('admin-se-cipher').value||'{}')}
+  catch(e){adminOut('admin-env-out',null,'Ciphertext JSON invalid');return}
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/decrypt',{method:'POST',body:JSON.stringify(body)});
+  if(r&&r.plaintext){
+    document.getElementById('admin-se-plain').value=r.plaintext;
+  }
+  adminOut('admin-env-out',r);
+}
+
+async function adminGroupAddMember(){
+  const gid=(document.getElementById('admin-gm-group').value||'').trim();
+  const aid=(document.getElementById('admin-gm-agent').value||'').trim();
+  if(!gid||!aid){adminOut('admin-gm-out',null,'Need group and agent IDs');return}
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/members',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  adminOut('admin-gm-out',r);
+}
+async function adminGroupRemoveMember(){
+  const gid=(document.getElementById('admin-gm-group').value||'').trim();
+  const aid=(document.getElementById('admin-gm-agent').value||'').trim();
+  if(!gid||!aid){adminOut('admin-gm-out',null,'Need group and agent IDs');return}
+  if(!confirm('Remove '+short(aid,12)+' from group '+short(gid,12)+'?'))return;
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/members/'+encodeURIComponent(aid),{method:'DELETE'});
+  adminOut('admin-gm-out',r);
+}
+async function adminGroupCancelRequest(){
+  const gid=(document.getElementById('admin-gm-group').value||'').trim();
+  const rid=(document.getElementById('admin-gm-request').value||'').trim();
+  if(!gid||!rid){adminOut('admin-gm-out',null,'Need group and request IDs');return}
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/requests/'+encodeURIComponent(rid),{method:'DELETE'});
+  adminOut('admin-gm-out',r);
+}
+
+async function adminAddContact(){
+  const agent_id=(document.getElementById('admin-ac-agent').value||'').trim();
+  const label=(document.getElementById('admin-ac-label').value||'').trim()||undefined;
+  const trust_level=document.getElementById('admin-ac-trust').value;
+  if(!agent_id){adminOut('admin-ac-out',null,'Enter an agent ID');return}
+  const body={agent_id,trust_level};
+  if(label)body.label=label;
+  const r=await api('/contacts',{method:'POST',body:JSON.stringify(body)});
+  adminOut('admin-ac-out',r);
+  if(r&&r.ok){pollContacts()}
+}
+
+async function adminFetchGroupCard(){
+  const id=(document.getElementById('admin-card-id').value||'').trim();
+  if(!id){adminOut('admin-card-out',null,'Enter a group ID');return}
+  const r=await api('/groups/cards/'+encodeURIComponent(id));
+  adminOut('admin-card-out',r);
+}
+
+async function adminSubscribeShard(){
+  const kind=document.getElementById('admin-shard-kind').value;
+  const shard=parseInt(document.getElementById('admin-shard-id').value||'0',10);
+  const r=await api('/groups/discover/subscribe',{method:'POST',body:JSON.stringify({kind,shard})});
+  adminOut('admin-shard-out',r);
+}
+async function adminUnsubscribeShard(){
+  const kind=document.getElementById('admin-shard-kind').value;
+  const shard=parseInt(document.getElementById('admin-shard-id').value||'0',10);
+  const r=await api('/groups/discover/subscribe/'+encodeURIComponent(kind)+'/'+shard,{method:'DELETE'});
+  adminOut('admin-shard-out',r);
+}
+async function adminListShards(){
+  const r=await api('/groups/discover/subscriptions');
+  adminOut('admin-shard-out',r);
+}
+
+async function adminTransferStatus(){
+  const id=(document.getElementById('admin-xfer-id').value||'').trim();
+  if(!id){adminOut('admin-xfer-out',null,'Enter a transfer ID');return}
+  const r=await api('/files/transfers/'+encodeURIComponent(id));
+  adminOut('admin-xfer-out',r);
+}
+
+async function adminJoinStore(){
+  const id=(document.getElementById('admin-store-id').value||'').trim();
+  if(!id){adminOut('admin-kv-out',null,'Enter a store ID');return}
+  const r=await api('/stores/'+encodeURIComponent(id)+'/join',{method:'POST'});
+  adminOut('admin-kv-out',r);
+}
+async function adminDeleteKey(){
+  const id=(document.getElementById('admin-store-id').value||'').trim();
+  const key=(document.getElementById('admin-store-key').value||'').trim();
+  if(!id||!key){adminOut('admin-kv-out',null,'Need store ID and key');return}
+  if(!confirm('Delete key "'+key+'" from store '+id+'?'))return;
+  const r=await api('/stores/'+encodeURIComponent(id)+'/'+encodeURIComponent(key),{method:'DELETE'});
+  adminOut('admin-kv-out',r);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2905,10 +3576,48 @@ async function showAgentDetail(agentId){
   const contact=(S.get('contacts')||[]).find(c=>c.agent_id===agentId);
   const disc=(S.get('discovered')||[]).find(d=>d.agent_id===agentId);
   showDetail('agent',{agentId,contact,disc});
-  // Fetch machines
   const m=await api('/contacts/'+agentId+'/machines');
   if(m&&m.machines){
     renderMachines(m.machines,agentId);
+  }
+  const rv=await api('/contacts/'+agentId+'/revocations');
+  renderRevocations((rv&&rv.revocations)||[]);
+}
+
+function renderRevocations(list){
+  const el=document.getElementById('detail-revocations');if(!el)return;
+  if(!list.length){el.innerHTML='<span style="color:var(--tx3)">No revocations recorded.</span>';return}
+  el.innerHTML=list.map(r=>{
+    const when=r.revoked_at?fmtDate(r.revoked_at):'—';
+    const reason=r.reason?esc(r.reason):'(no reason)';
+    return `<div style="margin-bottom:var(--sp1);padding:var(--sp1) var(--sp2);background:var(--rd-dim);border-left:2px solid var(--rd);border-radius:var(--r-sm)"><span style="color:var(--rd);font-weight:500">${when}</span> — ${reason}</div>`;
+  }).join('');
+}
+
+async function addMachineToContact(agentId){
+  const inp=document.getElementById('detail-add-machine');
+  const mid=(inp.value||'').trim();
+  if(!mid){toast('Enter a machine ID','warn');return}
+  const r=await api('/contacts/'+agentId+'/machines',{method:'POST',body:JSON.stringify({machine_id:mid})});
+  if(r&&r.ok){
+    toast('Machine added','success');
+    inp.value='';
+    const m=await api('/contacts/'+agentId+'/machines');
+    if(m&&m.machines)renderMachines(m.machines,agentId);
+  }else{
+    toast('Failed to add machine: '+((r&&r.error)||'unknown'),'error');
+  }
+}
+
+async function removeMachineFromContact(agentId,machineId){
+  if(!confirm('Remove this machine from contact?'))return;
+  const r=await api('/contacts/'+agentId+'/machines/'+encodeURIComponent(machineId),{method:'DELETE'});
+  if(r&&r.ok){
+    toast('Machine removed','success');
+    const m=await api('/contacts/'+agentId+'/machines');
+    if(m&&m.machines)renderMachines(m.machines,agentId);
+  }else{
+    toast('Failed to remove machine: '+((r&&r.error)||'unknown'),'error');
   }
 }
 
@@ -2960,6 +3669,12 @@ function renderAgentDetail(el,data){
     <div class="card mb" id="detail-chain"></div>
     <h3>Machines</h3>
     <div id="detail-machines"><div style="color:var(--tx3);font-size:12px">Loading...</div></div>
+    <div class="row mb" style="gap:var(--sp2);margin-top:var(--sp2)">
+      <input id="detail-add-machine" placeholder="Add machine ID" style="flex:1;font-size:11px">
+      <button onclick="addMachineToContact('${aid}')">Add</button>
+    </div>
+    <h3>Revocations</h3>
+    <div id="detail-revocations" style="font-size:11px;color:var(--tx3)">Loading...</div>
     <div class="mt2" style="display:flex;gap:8px">
       <button onclick="if(confirm('Remove this contact?'))removeContact('${aid}')">Remove Contact</button>
       <button class="danger" onclick="if(confirm('Revoke this contact? This permanently blocks their key.'))revokeContact('${aid}')">Revoke & Block</button>
@@ -2999,6 +3714,7 @@ function renderMachines(machines,agentId){
       </div>
       ${isNew?'<span class="trust trust-known" style="font-size:8px">NEW</span>':''}
       <span class="pin-toggle" onclick="togglePin('${agentId}','${m.machine_id}',${!m.pinned})" title="${m.pinned?'Unpin':'Pin'} this machine">${m.pinned?'&#128204;':'&#128203;'}</span>
+      <span class="pin-toggle danger" onclick="removeMachineFromContact('${agentId}','${m.machine_id}')" title="Remove machine" style="color:var(--rd);margin-left:6px">&#10005;</span>
     </div>`;
   }).join('');
 }

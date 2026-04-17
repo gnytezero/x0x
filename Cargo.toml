@@ -88,6 +88,10 @@ path = "src/bin/x0x-keygen.rs"
 name = "x0x"
 path = "src/bin/x0x.rs"
 
+[[bin]]
+name = "gui-coverage"
+path = "src/bin/gui_coverage.rs"
+
 [workspace]
 members = [
     ".",

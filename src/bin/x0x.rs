@@ -195,7 +195,11 @@ enum Commands {
     Gui,
     /// Print all API routes. [dev]
     #[command(hide = true)]
-    Routes,
+    Routes {
+        /// Emit the route table as JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show all commands in a tree view.
     Tree,
     /// Uninstall x0x binaries (keeps your data and keys).
@@ -935,7 +939,7 @@ async fn run(
 ) -> anyhow::Result<()> {
     // Commands that don't need a running daemon.
     match &command {
-        Commands::Routes => return commands::routes(),
+        Commands::Routes { json } => return commands::routes(*json),
         Commands::Tree => return print_command_tree(),
         Commands::Uninstall => return uninstall().await,
         Commands::Purge => return purge().await,
@@ -1396,7 +1400,7 @@ async fn run(
             transfer_id,
             reason,
         } => commands::files::reject_file(&client, &transfer_id, reason.as_deref()).await,
-        Commands::Routes
+        Commands::Routes { .. }
         | Commands::Tree
         | Commands::Uninstall
         | Commands::Purge

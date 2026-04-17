@@ -1,0 +1,40 @@
+# GUI endpoint coverage whitelist
+#
+# Each non-blank, non-comment line is an endpoint key (`METHOD /path`) that
+# `gui-coverage` excludes from the denominator. Reserve this file for
+# deliberate design choices — not "haven't got to it yet". Anything listed
+# here should have a short rationale inline.
+#
+# Format: `METHOD /path` where `:param` segments become `*`.
+# Example:  GET /contacts/*/revocations
+
+# ── REST pub/sub — GUI uses WebSocket /ws/direct instead ──
+POST /publish
+POST /subscribe
+DELETE /subscribe/*
+GET /events
+
+# ── Alias of /presence/online. GUI always calls the canonical path.
+GET /presence
+
+# ── SSE stream — consumed via EventSource, not the api() helper. ──
+GET /presence/events
+
+# ── Raw text response — admin panel calls fetch() directly because
+# api() always parses JSON. Same endpoint, different helper. ──
+GET /constitution
+
+# ── WebSocket endpoints — entered via /ws/direct, not via the api() helper ──
+GET /ws
+GET /ws/direct
+GET /ws/sessions
+
+# ── Direct messaging duplicates — GUI uses WebSocket for real-time ──
+GET /direct/connections
+GET /direct/events
+
+# ── Self-hosted — GUI does not call its own mounting endpoint ──
+GET /gui
+
+# ── Admin/daemon — intentionally absent from end-user GUI ──
+POST /shutdown
