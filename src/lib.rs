@@ -376,7 +376,16 @@ pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
 }
 
 /// Default interval between identity heartbeat re-announcements (seconds).
-pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
+/// Interval between identity-announcement heartbeats.
+///
+/// Previously 300 s — too slow when VPS bootstrap-node PlumTree trees
+/// only partially overlap: a missed announcement meant the receiver
+/// waited 5 minutes for the next chance. Lowered to 60 s so the mesh
+/// converges within a couple of cycles even when individual publishes
+/// are lost. Paired with the receiver-side re-broadcast in
+/// `start_identity_listener`, this gives epidemic-flood semantics
+/// equivalent to the release-manifest propagation path.
+pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
 /// Default TTL for discovered agent cache entries (seconds).
 ///
@@ -2074,11 +2083,24 @@ impl Agent {
         let direct_messaging = std::sync::Arc::clone(&self.direct_messaging);
         let network = self.network.as_ref().map(std::sync::Arc::clone);
         let own_agent_id = self.agent_id();
+        let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
 
         tokio::spawn(async move {
             // Track agents we've already initiated auto-connect to, preventing
             // duplicate connection attempts from concurrent announcements.
             let mut auto_connect_attempted = std::collections::HashSet::<identity::AgentId>::new();
+
+            // Time-windowed dedup for re-broadcast: (agent_id, announced_at)
+            // → last-rebroadcast Instant. Bounds how often we re-emit any
+            // given announcement so a busy mesh doesn't amplify gossip
+            // indefinitely. Mirrors the pattern used by the release-manifest
+            // re-broadcast loop in x0xd.
+            let mut rebroadcast_state: std::collections::HashMap<
+                (identity::AgentId, u64),
+                std::time::Instant,
+            > = std::collections::HashMap::new();
+            const REBROADCAST_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(20);
 
             loop {
                 // Drain whichever subscription fires next; deduplicate by AgentId in cache.
@@ -2095,6 +2117,7 @@ impl Agent {
                         .allow_trailing_bytes()
                         .deserialize::<IdentityAnnouncement>(&msg.payload)
                 };
+                let raw_payload = msg.payload.clone();
                 let announcement = match decoded {
                     Ok(a) => a,
                     Err(e) => {
@@ -2212,6 +2235,44 @@ impl Agent {
                 direct_messaging
                     .register_agent(announcement.agent_id, announcement.machine_id)
                     .await;
+
+                // Epidemic re-broadcast — mirrors the release-manifest
+                // re-broadcast pattern. Bootstrap-node meshes have patchy
+                // PlumTree overlap for the identity-announce topic: the
+                // origin's tree only reaches 1–2 hops reliably. Making
+                // every verified recipient re-publish guarantees flood
+                // convergence across the mesh. Dedup-window on
+                // (agent_id, announced_at) bounds amplification. Pub/Sub
+                // v2 re-signs each publish with a new message ID so
+                // PlumTree's own dedup cannot suppress our forward.
+                if announcement.agent_id != own_agent_id {
+                    let key = (announcement.agent_id, announcement.announced_at);
+                    let should_forward = match rebroadcast_state.get(&key) {
+                        None => true,
+                        Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
+                    };
+                    if should_forward {
+                        rebroadcast_state.insert(key, std::time::Instant::now());
+                        // Prune stale entries to cap memory.
+                        if rebroadcast_state.len() > 1024 {
+                            let cutoff = std::time::Instant::now()
+                                - std::time::Duration::from_secs(3600);
+                            rebroadcast_state.retain(|_, t| *t >= cutoff);
+                        }
+                        let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
+                        let payload = raw_payload.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = pubsub
+                                .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
+                                .await
+                            {
+                                tracing::debug!(
+                                    "identity announcement re-broadcast failed: {e}"
+                                );
+                            }
+                        });
+                    }
+                }
 
                 // Reconcile the agent-level direct-message registry if the transport peer
                 // is already connected (for example an inbound accept that happened before
