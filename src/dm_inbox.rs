@@ -21,6 +21,11 @@ use tokio::task::JoinHandle;
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
 
+/// Key = (sender agent_id, request_id) → last-seen instant.
+/// Used by `InboxPipeline` for per-(sender, request) epidemic-rebroadcast dedup.
+type RebroadcastDedupMap =
+    std::collections::HashMap<([u8; 32], [u8; 16]), std::time::Instant>;
+
 #[derive(Debug, Clone, Default)]
 pub struct DmInboxConfig {
     /// If true, trust-policy rejections do NOT emit an ACK.
@@ -119,8 +124,7 @@ struct InboxPipeline {
     silent_reject: bool,
     /// Per-(sender, request_id) dedup for epidemic re-broadcast on the
     /// shared DM bus. See comment in `handle_incoming`.
-    rebroadcast_state:
-        tokio::sync::Mutex<std::collections::HashMap<([u8; 32], [u8; 16]), std::time::Instant>>,
+    rebroadcast_state: tokio::sync::Mutex<RebroadcastDedupMap>,
 }
 
 impl InboxPipeline {
@@ -172,8 +176,7 @@ impl InboxPipeline {
             if should_forward {
                 guard.insert(key, std::time::Instant::now());
                 if guard.len() > 4096 {
-                    let cutoff =
-                        std::time::Instant::now() - std::time::Duration::from_secs(3600);
+                    let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(3600);
                     guard.retain(|_, t| *t >= cutoff);
                 }
                 drop(guard);

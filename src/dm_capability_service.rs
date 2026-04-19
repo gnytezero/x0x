@@ -101,8 +101,8 @@ impl CapabilityAdvertService {
                 if should_forward {
                     rebroadcast_state.insert(key, std::time::Instant::now());
                     if rebroadcast_state.len() > 1024 {
-                        let cutoff = std::time::Instant::now()
-                            - std::time::Duration::from_secs(3600);
+                        let cutoff =
+                            std::time::Instant::now() - std::time::Duration::from_secs(3600);
                         rebroadcast_state.retain(|_, t| *t >= cutoff);
                     }
                     let pubsub = Arc::clone(&rebroadcast_pubsub);
@@ -111,9 +111,7 @@ impl CapabilityAdvertService {
                             .publish(DM_CAPABILITY_TOPIC.to_string(), raw_payload)
                             .await
                         {
-                            tracing::debug!(
-                                "capability advert re-broadcast failed: {e}"
-                            );
+                            tracing::debug!("capability advert re-broadcast failed: {e}");
                         }
                     });
                 }
