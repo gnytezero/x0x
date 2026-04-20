@@ -81,15 +81,25 @@ for i in $(seq 1 "$NODES"); do
     PORTS+=("$PORT")
 done
 
-log "Waiting 10s for daemons to bind + discover each other..."
-sleep 10
+SETTLE_SECS="${SETTLE_SECS:-20}"
+log "Waiting ${SETTLE_SECS}s for daemons to bind + discover each other..."
+sleep "$SETTLE_SECS"
 
-# Read the auto-generated API tokens.
+# Read the auto-generated API tokens. With `--name <instance>`, x0xd writes
+# the token to `<dirs::data_dir()>/x0x-<instance>/api-token`. On macOS that
+# is `~/Library/Application Support/x0x-<instance>/api-token`; on Linux it
+# is `~/.local/share/x0x-<instance>/api-token`.
+if [ "$(uname)" = "Darwin" ]; then
+    DATA_BASE="$HOME/Library/Application Support"
+else
+    DATA_BASE="$HOME/.local/share"
+fi
 for i in $(seq 1 "$NODES"); do
-    ID_DIR="$PROOF_DIR/node-$i"
-    if [ -f "$ID_DIR/api-token" ]; then
-        TOKENS+=("$(cat "$ID_DIR/api-token")")
+    TOKEN_FILE="$DATA_BASE/x0x-stress-$i/api-token"
+    if [ -f "$TOKEN_FILE" ]; then
+        TOKENS+=("$(cat "$TOKEN_FILE")")
     else
+        log "warn: no api-token at $TOKEN_FILE — skipping token auth for node $i"
         TOKENS+=("")
     fi
 done
@@ -114,12 +124,20 @@ for i in $(seq 1 "$NODES"); do
     api "$i" GET /diagnostics/gossip > "$PROOF_DIR/logs/node-$i/gossip-pre.json" || true
 done
 
-# Publisher = node 1. Fire $MESSAGES messages.
-log "Publishing $MESSAGES messages from node 1 to topic $TOPIC"
+# Publisher = node 1. Fire $MESSAGES messages. Payload is base64-encoded
+# per the x0xd /publish contract. PUBLISH_DELAY_MS pauses between each
+# publish to let the mesh drain — default 0 for stress, 20ms for fair
+# delivery-ratio measurement.
+PUBLISH_DELAY_MS="${PUBLISH_DELAY_MS:-0}"
+log "Publishing $MESSAGES messages from node 1 to topic $TOPIC (delay ${PUBLISH_DELAY_MS}ms)"
 start_ts=$(date +%s)
 for n in $(seq 1 "$MESSAGES"); do
+    PAYLOAD=$(printf 'msg-%d' "$n" | base64 | tr -d '\n')
     api 1 POST /publish \
-        "{\"topic\":\"$TOPIC\",\"payload\":\"msg-$n\"}" >/dev/null 2>&1 || true
+        "{\"topic\":\"$TOPIC\",\"payload\":\"$PAYLOAD\"}" >/dev/null 2>&1 || true
+    if (( PUBLISH_DELAY_MS > 0 )); then
+        python3 -c "import time; time.sleep(${PUBLISH_DELAY_MS}/1000.0)" 2>/dev/null || sleep 0.02
+    fi
 done
 end_ts=$(date +%s)
 elapsed=$((end_ts - start_ts))
@@ -134,9 +152,9 @@ declare -a POST_DELIV=()
 declare -a POST_DROPS=()
 for i in $(seq 1 "$NODES"); do
     api "$i" GET /diagnostics/gossip > "$PROOF_DIR/logs/node-$i/gossip-post.json" || true
-    PUB=$(jq -r '.stats.publish_total' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
-    DEL=$(jq -r '.stats.delivered_to_subscriber' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
-    DROPS=$(jq -r '.stats.decode_to_delivery_drops' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
+    PUB=$(jq -r '.stats.publish_total // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
+    DEL=$(jq -r '.stats.delivered_to_subscriber // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
+    DROPS=$(jq -r '.stats.decode_to_delivery_drops // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
     POST_PUB+=("$PUB")
     POST_DELIV+=("$DEL")
     POST_DROPS+=("$DROPS")
