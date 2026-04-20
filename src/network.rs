@@ -369,6 +369,52 @@ impl NetworkNode {
         Some(node.status().await)
     }
 
+    /// Active liveness probe for a peer (ant-quic 0.27.2 #173).
+    ///
+    /// Sends a lightweight probe envelope, waits for the remote reader's
+    /// ACK-v1 reply, and returns measured RTT. Invisible to the recv pipeline.
+    /// Returns `None` when the network node is not yet initialised.
+    pub async fn probe_peer(
+        &self,
+        peer_id: AntPeerId,
+        timeout: std::time::Duration,
+    ) -> Option<Result<std::time::Duration, ant_quic::NodeError>> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.probe_peer(&peer_id, timeout).await)
+    }
+
+    /// Best-effort connection health snapshot for a peer (ant-quic 0.27.1 #170).
+    pub async fn connection_health(
+        &self,
+        peer_id: AntPeerId,
+    ) -> Option<ant_quic::ConnectionHealth> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.connection_health(&peer_id).await)
+    }
+
+    /// Send data and wait for the remote receive pipeline to acknowledge
+    /// (ant-quic 0.27.1 #172). Returns `None` when the network node is not
+    /// yet initialised.
+    pub async fn send_with_receive_ack(
+        &self,
+        peer_id: AntPeerId,
+        data: &[u8],
+        timeout: std::time::Duration,
+    ) -> Option<Result<(), ant_quic::NodeError>> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.send_with_receive_ack(&peer_id, data, timeout).await)
+    }
+
+    /// Subscribe to lifecycle events for all peers (ant-quic 0.27.1 #171).
+    pub async fn subscribe_all_peer_events(
+        &self,
+    ) -> Option<
+        tokio::sync::broadcast::Receiver<(ant_quic::PeerId, ant_quic::PeerLifecycleEvent)>,
+    > {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.subscribe_all_peer_events())
+    }
+
     /// Get current network statistics.
     ///
     /// # Returns

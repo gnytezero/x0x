@@ -291,6 +291,8 @@ enum NetworkSub {
 enum DiagnosticsSub {
     /// Print the ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS).
     Connectivity,
+    /// Print PubSub drop-detection counters (publish/deliver deltas).
+    Gossip,
 }
 
 /// Presence subcommands.
@@ -1043,6 +1045,7 @@ async fn run(
             DiagnosticsSub::Connectivity => {
                 commands::network::diagnostics_connectivity(&client).await
             }
+            DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,

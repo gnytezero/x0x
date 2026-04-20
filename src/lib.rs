@@ -153,7 +153,8 @@ pub mod cli;
 
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
-    GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,
+    GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
+    SigningContext, Subscription,
 };
 
 // Re-export direct messaging types
@@ -964,6 +965,19 @@ impl Agent {
     /// The adapter wraps the same `Arc<BootstrapCache>` as the network node.
     pub fn gossip_cache_adapter(&self) -> Option<&saorsa_gossip_coordinator::GossipCacheAdapter> {
         self.gossip_cache_adapter.as_ref()
+    }
+
+    /// Snapshot of pub/sub drop-detection counters.
+    ///
+    /// Returns `None` when the agent has no gossip runtime (e.g. offline
+    /// unit tests). Exposed through `GET /diagnostics/gossip` on x0xd so
+    /// that E2E harnesses can assert zero drops between publish and
+    /// subscriber delivery.
+    #[must_use]
+    pub fn gossip_stats(&self) -> Option<gossip::PubSubStatsSnapshot> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().stats())
     }
 
     /// Get the presence system wrapper, if configured.

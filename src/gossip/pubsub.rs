@@ -16,8 +16,82 @@ use bytes::Bytes;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
 use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+
+/// Drop-detection counters for the pub/sub pipeline.
+///
+/// Every stage of the publish → transport → receive → decode → deliver flow
+/// increments exactly one counter so that deltas surface where messages are
+/// lost. Exposed via `GET /diagnostics/gossip`.
+#[derive(Debug, Default)]
+pub struct PubSubStats {
+    /// Successful `publish()` calls (encoded + handed to PlumTree).
+    pub publish_total: AtomicU64,
+    /// `publish()` that failed at encoding/signing or PlumTree handoff.
+    pub publish_failed: AtomicU64,
+    /// Messages received from PlumTree (pre-decode, per topic).
+    pub incoming_total: AtomicU64,
+    /// Messages that decoded successfully + passed trust filter.
+    pub incoming_decoded: AtomicU64,
+    /// Messages that failed decode (malformed, unsupported version) OR were
+    /// dropped by trust filter (blocked sender).
+    pub incoming_decode_failed: AtomicU64,
+    /// Messages successfully handed to a local subscriber channel.
+    pub delivered_to_subscriber: AtomicU64,
+    /// Subscriber channel closed (dropped subscription) — message not delivered.
+    pub subscriber_channel_closed: AtomicU64,
+}
+
+/// Snapshot of [`PubSubStats`] for JSON serialization.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PubSubStatsSnapshot {
+    pub publish_total: u64,
+    pub publish_failed: u64,
+    pub incoming_total: u64,
+    pub incoming_decoded: u64,
+    pub incoming_decode_failed: u64,
+    pub delivered_to_subscriber: u64,
+    pub subscriber_channel_closed: u64,
+    /// `incoming_total - incoming_decoded - incoming_decode_failed` — messages
+    /// that entered the pipeline but did not reach a decision yet (usually 0,
+    /// non-zero means a worker panicked or the decode task is blocked).
+    pub in_flight_decode: i64,
+    /// `incoming_decoded - delivered_to_subscriber - subscriber_channel_closed`
+    /// — messages decoded but never handed off (drop signal).
+    pub decode_to_delivery_drops: i64,
+}
+
+impl PubSubStats {
+    /// Take an atomic snapshot of every counter.
+    pub fn snapshot(&self) -> PubSubStatsSnapshot {
+        let publish_total = self.publish_total.load(Ordering::Relaxed);
+        let publish_failed = self.publish_failed.load(Ordering::Relaxed);
+        let incoming_total = self.incoming_total.load(Ordering::Relaxed);
+        let incoming_decoded = self.incoming_decoded.load(Ordering::Relaxed);
+        let incoming_decode_failed = self.incoming_decode_failed.load(Ordering::Relaxed);
+        let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
+        let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
+        let in_flight_decode = incoming_total as i64
+            - incoming_decoded as i64
+            - incoming_decode_failed as i64;
+        let decode_to_delivery_drops = incoming_decoded as i64
+            - delivered_to_subscriber as i64
+            - subscriber_channel_closed as i64;
+        PubSubStatsSnapshot {
+            publish_total,
+            publish_failed,
+            incoming_total,
+            incoming_decoded,
+            incoming_decode_failed,
+            delivered_to_subscriber,
+            subscriber_channel_closed,
+            in_flight_decode,
+            decode_to_delivery_drops,
+        }
+    }
+}
 
 /// Domain separation prefix for signed message payloads.
 const MSG_V2_PREFIX: &[u8] = b"x0x-msg-v2";
@@ -173,6 +247,8 @@ pub struct PubSubManager {
     /// Contact store for trust-based message filtering.
     /// Set via `set_contacts()` after construction.
     contacts: std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>,
+    /// Drop-detection counters exposed at `GET /diagnostics/gossip`.
+    stats: Arc<PubSubStats>,
 }
 
 impl std::fmt::Debug for PubSubManager {
@@ -219,7 +295,16 @@ impl PubSubManager {
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
             signing,
             contacts: std::sync::OnceLock::new(),
+            stats: Arc::new(PubSubStats::default()),
         })
+    }
+
+    /// Snapshot of drop-detection counters for the gossip pipeline.
+    ///
+    /// Surfaced at `GET /diagnostics/gossip` — deltas between stages are the
+    /// drop signal the test harness uses to prove 100 % delivery under load.
+    pub fn stats(&self) -> PubSubStatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// Attach a contact store for trust-based message filtering.
@@ -256,8 +341,10 @@ impl PubSubManager {
         }
 
         let sub_topic = topic.clone();
+        let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
             while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
+                stats.incoming_total.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
                     topic = %sub_topic,
                     payload_len = encoded_payload.len(),
@@ -265,21 +352,27 @@ impl PubSubManager {
                 );
                 let Some(message) = decode_for_delivery(encoded_payload, contacts.as_ref()).await
                 else {
+                    stats.incoming_decode_failed.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         topic = %sub_topic,
                         "[4/6 pubsub] decode_for_delivery returned None, skipping"
                     );
                     continue;
                 };
+                stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
                     topic = %sub_topic,
                     msg_topic = %message.topic,
                     "[4/6 pubsub] decoded, forwarding to subscriber channel"
                 );
                 if tx.send(message).await.is_err() {
+                    stats
+                        .subscriber_channel_closed
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
                     break;
                 }
+                stats.delivered_to_subscriber.fetch_add(1, Ordering::Relaxed);
             }
         });
 
@@ -299,28 +392,45 @@ impl PubSubManager {
     ///
     /// Returns an error if encoding or signing fails.
     pub async fn publish(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
-        let encoded = if let Some(ref ctx) = self.signing {
+        let encoded_result = if let Some(ref ctx) = self.signing {
             let signing_payload =
                 build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
-            let signature = ctx.sign(&signing_payload)?;
-            encode_v2(
-                &ctx.agent_id,
-                &ctx.public_key_bytes,
-                &signature,
-                &topic,
-                &payload,
-            )?
+            ctx.sign(&signing_payload).and_then(|signature| {
+                encode_v2(
+                    &ctx.agent_id,
+                    &ctx.public_key_bytes,
+                    &signature,
+                    &topic,
+                    &payload,
+                )
+            })
         } else {
-            encode_v1(&topic, &payload)?
+            encode_v1(&topic, &payload)
+        };
+
+        let encoded = match encoded_result {
+            Ok(e) => e,
+            Err(err) => {
+                self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
         };
 
         let topic_id = TopicId::from_entity(topic.as_bytes());
         self.initialize_topic_peers(topic_id).await;
 
-        self.plumtree
-            .publish(topic_id, encoded)
-            .await
-            .map_err(|e| NetworkError::ConnectionFailed(format!("PlumTree publish failed: {e}")))
+        match self.plumtree.publish(topic_id, encoded).await {
+            Ok(()) => {
+                self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
+                Err(NetworkError::ConnectionFailed(format!(
+                    "PlumTree publish failed: {e}"
+                )))
+            }
+        }
     }
 
     /// Handle an incoming message from a peer.

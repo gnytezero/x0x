@@ -102,3 +102,16 @@ pub async fn diagnostics_connectivity(client: &DaemonClient) -> Result<()> {
     print_value(client.format(), &resp);
     Ok(())
 }
+
+/// `x0x diagnostics gossip` — GET /diagnostics/gossip
+///
+/// Prints PubSub drop-detection counters. Non-zero `decode_to_delivery_drops`
+/// means messages reached the local pipeline but failed to hand off to the
+/// subscriber channel (buffer full or dropped subscription). Primary tool
+/// for the 100%-delivery proof under stress.
+pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/diagnostics/gossip").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}

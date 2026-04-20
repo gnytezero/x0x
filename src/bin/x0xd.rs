@@ -1557,6 +1557,7 @@ async fn main() -> Result<()> {
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
+        .route("/diagnostics/gossip", get(gossip_diagnostics))
         // WebSocket endpoints
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
@@ -10625,6 +10626,27 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
     }
 }
 
+/// GET /diagnostics/gossip — PubSub drop-detection counters.
+///
+/// The delta between stages proves per-daemon 100% delivery (or surfaces
+/// where drops occur). Used by e2e_full_audit / e2e_stress to assert zero
+/// drops under load.
+async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.agent.gossip_stats() {
+        Some(snap) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "stats": snap,
+            })),
+        ),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "gossip runtime not initialized" })),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket handlers
 // ---------------------------------------------------------------------------
@@ -11098,7 +11120,60 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
         ),
     };
 
-    if format == "json" {
+    // `X0X_LOG_DIR` = opt-in per-daemon log file. When set and writable, the
+    // subscriber appends structured lines to `<dir>/x0xd-<pid>.log` in addition
+    // to stdout. Format (json vs pretty) follows the same `format` arg; this is
+    // the drop-detection substrate required by e2e_full_audit/e2e_stress.
+    let log_dir = std::env::var_os("X0X_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+
+    let file_writer = match log_dir.as_ref() {
+        Some(dir) => match std::fs::create_dir_all(dir) {
+            Ok(()) => {
+                let path = dir.join(format!("x0xd-{}.log", std::process::id()));
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    Ok(f) => Some((path, f)),
+                    Err(e) => {
+                        eprintln!(
+                            "x0xd: X0X_LOG_DIR set but could not open {}: {e}",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "x0xd: X0X_LOG_DIR set but mkdir -p {} failed: {e}",
+                    dir.display()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    let file_path_for_log = file_writer.as_ref().map(|(p, _)| p.display().to_string());
+
+    if let Some((_, f)) = file_writer {
+        if format == "json" {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::sync::Mutex::new(f))
+                .json()
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::sync::Mutex::new(f))
+                .init();
+        }
+    } else if format == "json" {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .json()
@@ -11107,7 +11182,20 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    tracing::info!(target: "x0x::startup", source = %source, "tracing subscriber initialised");
+    if let Some(path) = file_path_for_log.as_deref() {
+        tracing::info!(
+            target: "x0x::startup",
+            source = %source,
+            log_file = %path,
+            "tracing subscriber initialised (file sink active)"
+        );
+    } else {
+        tracing::info!(
+            target: "x0x::startup",
+            source = %source,
+            "tracing subscriber initialised"
+        );
+    }
 
     Ok(())
 }

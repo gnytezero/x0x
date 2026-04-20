@@ -184,6 +184,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS)",
         category: "network",
     },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/gossip",
+        cli_name: "diagnostics gossip",
+        description: "PubSub drop-detection counters (publish/deliver deltas)",
+        category: "network",
+    },
     // ── Messaging ───────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Post,
