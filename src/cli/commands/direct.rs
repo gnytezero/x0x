@@ -14,13 +14,28 @@ pub async fn connect(client: &DaemonClient, agent_id: &str) -> Result<()> {
 }
 
 /// `x0x direct send` — POST /direct/send
-pub async fn send(client: &DaemonClient, agent_id: &str, message: &str) -> Result<()> {
+///
+/// `require_ack_ms` opts into a post-send peer-liveness probe: after the
+/// envelope has been handed to the DM path, x0xd calls ant-quic
+/// `probe_peer` against the recipient's MachineId with the given timeout
+/// and includes the RTT (or the failure reason) in the response under
+/// `require_ack`. This does NOT prove the specific message was delivered;
+/// it proves the peer's receive pipeline is live when the call returned.
+pub async fn send(
+    client: &DaemonClient,
+    agent_id: &str,
+    message: &str,
+    require_ack_ms: Option<u64>,
+) -> Result<()> {
     client.ensure_running().await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(message.as_bytes());
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "agent_id": agent_id,
         "payload": encoded,
     });
+    if let Some(ms) = require_ack_ms {
+        body["require_ack_ms"] = serde_json::json!(ms);
+    }
     let resp = client.post("/direct/send", &body).await?;
     print_value(client.format(), &resp);
     Ok(())

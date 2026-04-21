@@ -50,9 +50,7 @@ async fn make_endpoint(known_peers: Vec<SocketAddr>) -> Arc<P2pEndpoint> {
 }
 
 fn spawn_accept_loop(ep: Arc<P2pEndpoint>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while ep.accept().await.is_some() {}
-    })
+    tokio::spawn(async move { while ep.accept().await.is_some() {} })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -138,17 +136,11 @@ async fn send_with_receive_ack_round_trips_on_localhost() {
     // Drain receiver recv() so the ACK isn't starved.
     let recv_task = {
         let r = Arc::clone(&receiver);
-        tokio::spawn(async move {
-            while r.recv().await.is_ok() {}
-        })
+        tokio::spawn(async move { while r.recv().await.is_ok() {} })
     };
 
     sender
-        .send_with_receive_ack(
-            &receiver_id,
-            b"x0x-ack-roundtrip",
-            Duration::from_secs(3),
-        )
+        .send_with_receive_ack(&receiver_id, b"x0x-ack-roundtrip", Duration::from_secs(3))
         .await
         .expect("send_with_receive_ack on healthy link");
 

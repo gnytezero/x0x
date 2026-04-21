@@ -975,9 +975,7 @@ impl Agent {
     /// subscriber delivery.
     #[must_use]
     pub fn gossip_stats(&self) -> Option<gossip::PubSubStatsSnapshot> {
-        self.gossip_runtime
-            .as_ref()
-            .map(|rt| rt.pubsub().stats())
+        self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
     }
 
     /// Get the presence system wrapper, if configured.

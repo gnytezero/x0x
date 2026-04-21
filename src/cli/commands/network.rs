@@ -115,3 +115,54 @@ pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
     print_value(client.format(), &resp);
     Ok(())
 }
+
+/// `x0x peers probe <peer_id>` — POST /peers/:peer_id/probe
+///
+/// Active liveness probe (ant-quic 0.27.2 #173). Sends a lightweight probe
+/// envelope and waits for the remote reader's ACK-v1 reply. Prints measured
+/// round-trip time.
+pub async fn peers_probe(
+    client: &DaemonClient,
+    peer_id: &str,
+    timeout_ms: Option<u64>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let path = if let Some(ms) = timeout_ms {
+        format!("/peers/{peer_id}/probe?timeout_ms={ms}")
+    } else {
+        format!("/peers/{peer_id}/probe")
+    };
+    let resp = client.post_empty(&path).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x peers health <peer_id>` — GET /peers/:peer_id/health
+///
+/// Connection health snapshot for a peer (ant-quic 0.27.1 #170). Returns
+/// lifecycle state, generation, directional activity timestamps, and the
+/// most-recent close reason.
+pub async fn peers_health(client: &DaemonClient, peer_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get(&format!("/peers/{peer_id}/health")).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x peers events` — GET /peers/events (SSE).
+///
+/// Streams peer lifecycle transitions (`Established`, `Replaced`, `Closing`,
+/// `Closed`, `ReaderExited`) as they occur. Prints each event as a JSON
+/// line to stdout. Press Ctrl-C to stop.
+pub async fn peers_events(client: &DaemonClient) -> Result<()> {
+    use futures::StreamExt as _;
+    client.ensure_running().await?;
+    let resp = client.get_stream("/peers/events").await?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| anyhow::anyhow!("stream error: {e}"))?;
+        let s = String::from_utf8_lossy(&bytes);
+        print!("{s}");
+    }
+    Ok(())
+}

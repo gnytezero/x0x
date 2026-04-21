@@ -191,6 +191,27 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "PubSub drop-detection counters (publish/deliver deltas)",
         category: "network",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/peers/:peer_id/probe",
+        cli_name: "peer probe",
+        description: "Active ant-quic probe_peer liveness + RTT (ant-quic 0.27.2 #173)",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/peers/:peer_id/health",
+        cli_name: "peer health",
+        description: "Connection health snapshot for a peer (ant-quic 0.27.1 #170)",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/peers/events",
+        cli_name: "peer events",
+        description: "SSE stream of peer lifecycle events (ant-quic 0.27.1 #171)",
+        category: "network",
+    },
     // ── Messaging ───────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Post,

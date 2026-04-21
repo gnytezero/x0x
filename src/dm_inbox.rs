@@ -23,8 +23,7 @@ const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
 
 /// Key = (sender agent_id, request_id) → last-seen instant.
 /// Used by `InboxPipeline` for per-(sender, request) epidemic-rebroadcast dedup.
-type RebroadcastDedupMap =
-    std::collections::HashMap<([u8; 32], [u8; 16]), std::time::Instant>;
+type RebroadcastDedupMap = std::collections::HashMap<([u8; 32], [u8; 16]), std::time::Instant>;
 
 #[derive(Debug, Clone, Default)]
 pub struct DmInboxConfig {

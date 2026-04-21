@@ -97,6 +97,11 @@ enum Commands {
         #[command(subcommand)]
         sub: NetworkSub,
     },
+    /// Peer-level observability (ant-quic 0.27 surface).
+    Peer {
+        #[command(subcommand)]
+        sub: PeerSub,
+    },
     /// Connectivity diagnostics (ant-quic NodeStatus snapshot).
     Diagnostics {
         #[command(subcommand)]
@@ -285,6 +290,26 @@ enum NetworkSub {
     Status,
     /// Bootstrap peer cache stats.
     Cache,
+}
+
+/// Peer subcommands (ant-quic 0.27 surface).
+#[derive(Subcommand)]
+enum PeerSub {
+    /// Active-liveness probe (ant-quic 0.27.2 #173). Returns measured RTT.
+    Probe {
+        /// Peer ID (hex, 32 bytes = 64 hex chars).
+        peer_id: String,
+        /// Optional probe timeout in milliseconds (default 2000, clamped 100..30000).
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
+    /// Connection health snapshot for a peer (ant-quic 0.27.1 #170).
+    Health {
+        /// Peer ID (hex, 32 bytes = 64 hex chars).
+        peer_id: String,
+    },
+    /// Stream peer lifecycle events via SSE (ant-quic 0.27.1 #171).
+    Events,
 }
 
 #[derive(Subcommand)]
@@ -479,6 +504,10 @@ enum DirectSub {
         agent_id: String,
         /// Message payload.
         message: String,
+        /// Opt-in: wait up to this many ms for a post-send liveness probe
+        /// (ant-quic 0.27.1 `probe_peer`). Response includes RTT or reason.
+        #[arg(long)]
+        require_ack_ms: Option<u64>,
     },
     /// List established direct connections.
     Connections,
@@ -1041,6 +1070,14 @@ async fn run(
             NetworkSub::Status => commands::network::network_status(&client).await,
             NetworkSub::Cache => commands::network::bootstrap_cache(&client).await,
         },
+        Commands::Peer { sub } => match sub {
+            PeerSub::Probe {
+                peer_id,
+                timeout_ms,
+            } => commands::network::peers_probe(&client, &peer_id, timeout_ms).await,
+            PeerSub::Health { peer_id } => commands::network::peers_health(&client, &peer_id).await,
+            PeerSub::Events => commands::network::peers_events(&client).await,
+        },
         Commands::Diagnostics { sub } => match sub {
             DiagnosticsSub::Connectivity => {
                 commands::network::diagnostics_connectivity(&client).await
@@ -1135,9 +1172,11 @@ async fn run(
         Commands::Events => commands::messaging::events(&client).await,
         Commands::Direct { sub } => match sub {
             DirectSub::Connect { agent_id } => commands::direct::connect(&client, &agent_id).await,
-            DirectSub::Send { agent_id, message } => {
-                commands::direct::send(&client, &agent_id, &message).await
-            }
+            DirectSub::Send {
+                agent_id,
+                message,
+                require_ack_ms,
+            } => commands::direct::send(&client, &agent_id, &message, require_ack_ms).await,
             DirectSub::Connections => commands::direct::connections(&client).await,
             DirectSub::Events => commands::direct::events(&client).await,
         },

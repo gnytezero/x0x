@@ -73,9 +73,8 @@ impl PubSubStats {
         let incoming_decode_failed = self.incoming_decode_failed.load(Ordering::Relaxed);
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
-        let in_flight_decode = incoming_total as i64
-            - incoming_decoded as i64
-            - incoming_decode_failed as i64;
+        let in_flight_decode =
+            incoming_total as i64 - incoming_decoded as i64 - incoming_decode_failed as i64;
         let decode_to_delivery_drops = incoming_decoded as i64
             - delivered_to_subscriber as i64
             - subscriber_channel_closed as i64;
@@ -372,7 +371,9 @@ impl PubSubManager {
                     tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
                     break;
                 }
-                stats.delivered_to_subscriber.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .delivered_to_subscriber
+                    .fetch_add(1, Ordering::Relaxed);
             }
         });
 

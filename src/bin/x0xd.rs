@@ -683,6 +683,11 @@ struct DirectSendRequest {
     agent_id: String,
     /// Base64-encoded payload.
     payload: String,
+    /// Optional opt-in: wait up to `require_ack_ms` ms for the remote
+    /// receive pipeline to ACK delivery (ant-quic 0.27.1 `send_with_receive_ack`).
+    /// Omit for fire-and-forget (default, unchanged behaviour).
+    #[serde(default)]
+    require_ack_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1563,10 @@ async fn main() -> Result<()> {
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
+        // Peer observability (ant-quic 0.27.1/0.27.2 surface)
+        .route("/peers/:peer_id/probe", post(probe_peer_handler))
+        .route("/peers/:peer_id/health", get(peer_health_handler))
+        .route("/peers/events", get(peer_events_handler))
         // WebSocket endpoints
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
@@ -9728,6 +9737,49 @@ async fn direct_send(
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
                 x0x::dm::DmPath::RawQuic => "raw_quic",
             };
+            // Optional post-send liveness confirmation via ant-quic's
+            // `probe_peer` primitive. Proves the peer's receive pipeline is
+            // alive; it does NOT prove this specific message was delivered
+            // (the DM envelope may have been re-broadcast through the caps
+            // topic even when raw_quic was the chosen path).
+            let ack_result = if let Some(ack_ms) = req.require_ack_ms {
+                let ack_timeout = std::time::Duration::from_millis(ack_ms.clamp(100, 30_000));
+                if let Some(network) = state.agent.network() {
+                    // Resolve AgentId → MachineId via discovery cache, then
+                    // reinterpret the 32 bytes as an ant_quic PeerId (they
+                    // are the same hash by construction — see CLAUDE.md).
+                    let discovered = state.agent.discovered_agent(agent_id).await.ok().flatten();
+                    if let Some(rec) = discovered {
+                        let peer_id = ant_quic::PeerId(rec.machine_id.0);
+                        match network.probe_peer(peer_id, ack_timeout).await {
+                            Some(Ok(rtt)) => Some(serde_json::json!({
+                                "ok": true,
+                                "rtt_ms": rtt.as_millis() as u64,
+                            })),
+                            Some(Err(e)) => Some(serde_json::json!({
+                                "ok": false,
+                                "error": format!("probe failed: {e}"),
+                            })),
+                            None => Some(serde_json::json!({
+                                "ok": false,
+                                "error": "network node not running",
+                            })),
+                        }
+                    } else {
+                        Some(serde_json::json!({
+                            "ok": false,
+                            "error": "agent not in discovery cache (peer_id unknown)",
+                        }))
+                    }
+                } else {
+                    Some(serde_json::json!({
+                        "ok": false,
+                        "error": "network not initialized",
+                    }))
+                }
+            } else {
+                None
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -9735,6 +9787,7 @@ async fn direct_send(
                     "path": path_str,
                     "retries_used": receipt.retries_used,
                     "request_id": hex::encode(receipt.request_id),
+                    "require_ack": ack_result,
                 })),
             )
         }
@@ -10645,6 +10698,180 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
             Json(serde_json::json!({ "ok": false, "error": "gossip runtime not initialized" })),
         ),
     }
+}
+
+/// Parse a hex `peer_id` path segment into an ant-quic `PeerId` (32 bytes).
+fn parse_peer_id(hex_str: &str) -> Result<ant_quic::PeerId, (StatusCode, Json<serde_json::Value>)> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("invalid hex peer_id: {e}")
+            })),
+        )
+    })?;
+    if bytes.len() != 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("peer_id must be 32 bytes, got {}", bytes.len())
+            })),
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(ant_quic::PeerId(arr))
+}
+
+/// Query for `POST /peers/:peer_id/probe` — optional timeout (default 2s).
+#[derive(Debug, serde::Deserialize, Default)]
+struct ProbeQuery {
+    /// Probe timeout in milliseconds; clamped to `[100, 30000]`.
+    timeout_ms: Option<u64>,
+}
+
+/// POST /peers/:peer_id/probe — ant-quic 0.27.2 `probe_peer` active liveness.
+///
+/// Sends a lightweight probe envelope to the peer and waits for the remote
+/// reader's ACK-v1 reply. Returns the measured round-trip time. Probe
+/// traffic is invisible to the application recv pipeline.
+async fn probe_peer_handler(
+    State(state): State<Arc<AppState>>,
+    Path(peer_hex): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ProbeQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer_id = match parse_peer_id(&peer_hex) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        )
+            .into_response();
+    };
+    let timeout_ms = q.timeout_ms.unwrap_or(2_000).clamp(100, 30_000);
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+
+    match network.probe_peer(peer_id, timeout).await {
+        Some(Ok(rtt)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "rtt_ms": rtt.as_millis() as u64,
+                "rtt_us": rtt.as_micros() as u64,
+                "timeout_ms": timeout_ms,
+            })),
+        )
+            .into_response(),
+        Some(Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("probe failed: {e}"),
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network node not running" })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /peers/:peer_id/health — ant-quic 0.27.1 `connection_health` snapshot.
+///
+/// Returns the lifecycle state, generation, directional activity timestamps,
+/// and most-recent close reason for a peer. `ConnectionHealth`'s `Debug`
+/// rendering is stable enough to use as the wire format for now.
+async fn peer_health_handler(
+    State(state): State<Arc<AppState>>,
+    Path(peer_hex): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer_id = match parse_peer_id(&peer_hex) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        )
+            .into_response();
+    };
+    match network.connection_health(peer_id).await {
+        Some(health) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "peer_id": peer_hex,
+                "health": format!("{health:?}"),
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network node not running" })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /peers/events — SSE stream of ant-quic 0.27.1 `PeerLifecycleEvent`s.
+///
+/// Emits `Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`
+/// transitions for every peer this node has a connection to. Useful for
+/// dashboards and the Chrome/Dioxus/Apple harness proof runs.
+async fn peer_events_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        )
+            .into_response();
+    };
+    let Some(mut rx) = network.subscribe_all_peer_events().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network node not running" })),
+        )
+            .into_response();
+    };
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                r = rx.recv() => {
+                    match r {
+                        Ok((peer, ev)) => {
+                            let payload = serde_json::json!({
+                                "peer_id": hex::encode(peer.0),
+                                "event": format!("{ev:?}"),
+                                "at_ms": std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0),
+                            });
+                            let data = serde_json::to_string(&payload).unwrap_or_default();
+                            yield Ok::<_, std::convert::Infallible>(
+                                Event::default().event("peer-lifecycle").data(data));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            }
+        }
+    };
+    Sse::new(stream).into_response()
 }
 
 // ---------------------------------------------------------------------------

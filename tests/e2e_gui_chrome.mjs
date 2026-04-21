@@ -162,6 +162,38 @@ async function main() {
         { id: "contacts-list", path: "/contacts" },
     ];
 
+    // Resolve self peer_id for the peer-observability probes.
+    let selfPeerId = null;
+    try {
+        const agent = await apiGet("/agent");
+        selfPeerId = agent.machine_id ?? agent.agent?.machine_id ?? null;
+    } catch (_) {}
+    const fakePeer = "f".repeat(64);
+
+    const peerProbes = [
+        {
+            id: "peer-health-self",
+            method: "GET",
+            path: `/peers/${selfPeerId || fakePeer}/health`,
+            // Self-health may 503 (no self-connection); we accept 200 or 503
+            // with a well-formed error body.
+            acceptStatuses: [200, 503],
+        },
+        {
+            id: "peer-probe-400-on-bad-hex",
+            method: "POST",
+            path: `/peers/not-hex/probe?timeout_ms=500`,
+            acceptStatuses: [400],
+        },
+        {
+            id: "peer-probe-503-on-unknown",
+            method: "POST",
+            path: `/peers/${fakePeer}/probe?timeout_ms=500`,
+            // No such peer — daemon returns 503 with "probe failed" message.
+            acceptStatuses: [503],
+        },
+    ];
+
     for (const p of probes) {
         try {
             const res = await page.evaluate(
@@ -178,6 +210,63 @@ async function main() {
         } catch (e) {
             record(p.id, "fail", { reason: e.message });
         }
+    }
+
+    // Peer observability probes (ant-quic 0.27.1/0.27.2 surface).
+    for (const p of peerProbes) {
+        try {
+            const res = await page.evaluate(
+                async ({ base, path, token, method }) => {
+                    const r = await fetch(`${base}${path}`, {
+                        method,
+                        headers: token ? { authorization: `Bearer ${token}` } : {},
+                    });
+                    return { status: r.status, body: await r.json().catch(() => null) };
+                },
+                { base: API_BASE, path: p.path, token: TOKEN, method: p.method },
+            );
+            expect(
+                p.acceptStatuses.includes(res.status),
+                `${p.method} ${p.path} returned ${res.status}, expected one of ${p.acceptStatuses}`,
+            );
+            record(p.id, "pass", { status: res.status });
+        } catch (e) {
+            record(p.id, "fail", { reason: e.message });
+        }
+    }
+
+    // /peers/events SSE — open, wait 500ms for connection, close. We don't
+    // drive a peer connection here (would require a second daemon), so we
+    // just prove the stream accepts and stays open.
+    try {
+        const eventOk = await page.evaluate(
+            async ({ base, token }) => {
+                return await new Promise(resolve => {
+                    const ctrl = new AbortController();
+                    const url = `${base}/peers/events${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+                    fetch(url, {
+                        signal: ctrl.signal,
+                        headers: token
+                            ? { authorization: `Bearer ${token}`, accept: "text/event-stream" }
+                            : { accept: "text/event-stream" },
+                    })
+                        .then(r => {
+                            setTimeout(() => ctrl.abort(), 500);
+                            resolve(r.status === 200);
+                        })
+                        .catch(() => resolve(false));
+                    setTimeout(() => {
+                        ctrl.abort();
+                        resolve(false);
+                    }, 1500);
+                });
+            },
+            { base: API_BASE, token: TOKEN },
+        );
+        expect(eventOk, "/peers/events did not return 200");
+        record("peers-events-sse", "pass");
+    } catch (e) {
+        record("peers-events-sse", "fail", { reason: e.message });
     }
 
     // Pub/sub round-trip: subscribe then publish then assert echo is visible

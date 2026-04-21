@@ -44,6 +44,9 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Get, "/network/bootstrap-cache"),
     (Method::Get, "/diagnostics/connectivity"),
     (Method::Get, "/diagnostics/gossip"),
+    (Method::Post, "/peers/:peer_id/probe"),
+    (Method::Get, "/peers/:peer_id/health"),
+    (Method::Get, "/peers/events"),
     // ── Messaging ───────────────────────────────────────────────────────
     (Method::Post, "/publish"),
     (Method::Post, "/subscribe"),

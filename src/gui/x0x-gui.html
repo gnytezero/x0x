@@ -2600,6 +2600,21 @@ function renderNetwork(){
   </div>
   <h3>External Addresses</h3>
   <div class="card mb" id="n-addrs" style="font-size:12px">—</div>
+  <h3>Gossip Pipeline <span style="font-weight:normal;color:var(--tx3);font-size:11px">/diagnostics/gossip</span></h3>
+  <div class="card mb2" id="n-gossip-card" style="font-size:12px">
+    <div class="grid g2" style="gap:var(--sp3)">
+      <div><span class="k">Publish total</span>: <span id="g-pub" class="v">—</span></div>
+      <div><span class="k">Publish failed</span>: <span id="g-pub-fail" class="v">—</span></div>
+      <div><span class="k">Incoming total</span>: <span id="g-in" class="v">—</span></div>
+      <div><span class="k">Incoming decoded</span>: <span id="g-decoded" class="v">—</span></div>
+      <div><span class="k">Decode failed</span>: <span id="g-decfail" class="v">—</span></div>
+      <div><span class="k">Delivered to sub</span>: <span id="g-deliv" class="v">—</span></div>
+      <div><span class="k">Subscriber channel closed</span>: <span id="g-closed" class="v">—</span></div>
+      <div><span class="k">In-flight decode</span>: <span id="g-inflight" class="v">—</span></div>
+      <div><span class="k">Decode→delivery drops</span>: <span id="g-drops" class="v">—</span></div>
+    </div>
+    <div id="g-note" style="margin-top:var(--sp2);color:var(--tx2);font-size:11px"></div>
+  </div>
   <h3>Peers</h3>
   <div class="card mb"><table><thead><tr><th>Peer ID</th><th>Address</th><th>RTT</th><th>State</th></tr></thead><tbody id="n-peers"></tbody></table></div>
   <h3>Bootstrap Cache</h3>
@@ -2643,6 +2658,29 @@ async function pollNetworkView(){
   if(c&&c.ok){
     const el=document.getElementById('n-cache');
     if(el)el.textContent='Cached peers: '+(c.cached_peers||0);
+  }
+  // Gossip pipeline drop-detection counters (release 0.18.0+).
+  const gg=await api('/diagnostics/gossip');
+  if(gg&&gg.ok&&gg.stats){
+    const s=gg.stats;
+    const g=id=>document.getElementById(id);
+    const warn=v=>v>0?'<span class="trust trust-blocked" style="font-size:10px">'+v+'</span>':esc(String(v));
+    if(g('g-pub'))g('g-pub').textContent=s.publish_total;
+    if(g('g-pub-fail'))g('g-pub-fail').innerHTML=warn(s.publish_failed);
+    if(g('g-in'))g('g-in').textContent=s.incoming_total;
+    if(g('g-decoded'))g('g-decoded').textContent=s.incoming_decoded;
+    if(g('g-decfail'))g('g-decfail').innerHTML=warn(s.incoming_decode_failed);
+    if(g('g-deliv'))g('g-deliv').textContent=s.delivered_to_subscriber;
+    if(g('g-closed'))g('g-closed').innerHTML=warn(s.subscriber_channel_closed);
+    if(g('g-inflight'))g('g-inflight').innerHTML=warn(s.in_flight_decode);
+    if(g('g-drops'))g('g-drops').innerHTML=warn(s.decode_to_delivery_drops);
+    const note=g('g-note');
+    if(note){
+      const drops=(s.decode_to_delivery_drops|0)+(s.publish_failed|0)+(s.incoming_decode_failed|0);
+      note.innerHTML=drops>0
+        ? '<span class="trust trust-blocked" style="font-size:10px">drops detected</span> investigate — any non-zero counter above means messages were lost'
+        : '<span class="trust trust-trusted" style="font-size:10px">clean</span> all gossip stages balanced, zero drops since startup';
+    }
   }
 }
 

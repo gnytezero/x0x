@@ -408,9 +408,8 @@ impl NetworkNode {
     /// Subscribe to lifecycle events for all peers (ant-quic 0.27.1 #171).
     pub async fn subscribe_all_peer_events(
         &self,
-    ) -> Option<
-        tokio::sync::broadcast::Receiver<(ant_quic::PeerId, ant_quic::PeerLifecycleEvent)>,
-    > {
+    ) -> Option<tokio::sync::broadcast::Receiver<(ant_quic::PeerId, ant_quic::PeerLifecycleEvent)>>
+    {
         let node = self.node.read().await.as_ref().cloned()?;
         Some(node.subscribe_all_peer_events())
     }

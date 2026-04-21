@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 114,
+  "endpoint_count": 117,
   "endpoints": [
     {
       "category": "status",
@@ -140,6 +140,27 @@
       "description": "PubSub drop-detection counters (publish/deliver deltas)",
       "method": "GET",
       "path": "/diagnostics/gossip"
+    },
+    {
+      "category": "network",
+      "cli_name": "peer probe",
+      "description": "Active ant-quic probe_peer liveness + RTT (ant-quic 0.27.2 #173)",
+      "method": "POST",
+      "path": "/peers/:peer_id/probe"
+    },
+    {
+      "category": "network",
+      "cli_name": "peer health",
+      "description": "Connection health snapshot for a peer (ant-quic 0.27.1 #170)",
+      "method": "GET",
+      "path": "/peers/:peer_id/health"
+    },
+    {
+      "category": "network",
+      "cli_name": "peer events",
+      "description": "SSE stream of peer lifecycle events (ant-quic 0.27.1 #171)",
+      "method": "GET",
+      "path": "/peers/events"
     },
     {
       "category": "messaging",
