@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.18.3] - 2026-04-21
+
+### Fixed
+
+- **Fan-out stall root cause: `NetworkNode::recv_tx` capacity bumped
+  `128 → 10_000`** (with matching `direct_tx` `256 → 10_000`). Every
+  inbound gossip / pubsub message across every topic and every peer
+  on this node funnels through this single mpsc to the
+  saorsa-gossip-transport consumer. At 128 capacity, a momentary
+  slowdown in the PlumTree layer (ML-DSA-65 verification on a burst,
+  a briefly-held subscriber lock, an EAGER fan-out to 8 peers) backs
+  up `spawn_receiver`'s `recv_tx.send().await` and stops draining
+  ant-quic's recv queue — freezing ALL inbound traffic for that node,
+  not just the slow topic. Observed in the `stress-20260421-v0181`
+  proof artefact: node-2 and node-3 got ~100 messages each in the
+  first 1.2 s then received nothing for the remaining 43 s of
+  publishing while nodes 4-5 kept flowing at 11 msg/s. Log diff
+  showed `recv: … bytes (PubSub)` continuing at the network layer
+  past the stall — proving the back-pressure was one layer up.
+
+- **Back-pressure visibility.** `spawn_receiver` now emits a
+  `WARN "[1/6 network] recv_tx >80% full — PubSub pipeline falling
+  behind"` when the buffer's available capacity drops below 20 % of
+  max. We still back-pressure rather than drop (delivery integrity
+  wins over liveness visibility when the two conflict) — the warn
+  makes the condition surface before it becomes a stall.
+
+### Validation
+
+- `cargo fmt --check`: clean
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+- `cargo nextest run --all-features --workspace`: **1006 / 1006** pass
+
 ## [v0.18.2] - 2026-04-21
 
 Reviewer-flagged blocker fixes on top of 0.18.1. 0.18.0 has been yanked

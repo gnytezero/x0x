@@ -281,8 +281,22 @@ impl NetworkNode {
 
         let peer_id = node.peer_id();
         let (event_sender, _event_receiver) = broadcast::channel(32);
-        let (recv_tx, recv_rx) = mpsc::channel(128);
-        let (direct_tx, direct_rx) = mpsc::channel(256);
+        // Gossip/PubSub inbound buffer. Every message arriving from every
+        // peer on any stream type funnels through this single mpsc to the
+        // saorsa-gossip-transport consumer. At 128 capacity, a momentary
+        // slowdown in the PlumTree layer (e.g. ML-DSA verification on a
+        // burst, a slow subscriber mpsc fill, briefly-held lock) backs up
+        // `spawn_receiver`'s `recv_tx.send().await` which stops draining
+        // ant-quic's recv queue — freezing ALL inbound traffic for this
+        // node, not just the slow topic. Observed in
+        // `proofs/stress-20260421-v0181/`: two subscribers stalled after
+        // ~1.2 s / ~100 messages while others kept flowing at 11 msg/s.
+        //
+        // 10 000 matches the per-subscription channel capacity in
+        // `PubSubManager::subscribe` so the network-layer buffer is no
+        // longer the smaller link in the chain.
+        let (recv_tx, recv_rx) = mpsc::channel(10_000);
+        let (direct_tx, direct_rx) = mpsc::channel(10_000);
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -1003,6 +1017,24 @@ impl NetworkNode {
                             peer_id
                         );
 
+                        // Back-pressure visibility: when the buffer is
+                        // >80% full, the downstream PlumTree/PubSub
+                        // pipeline is too slow for this node's inbound
+                        // rate. The send below still awaits (we prefer
+                        // back-pressure over drops), but logging makes
+                        // the condition surface immediately rather than
+                        // being invisible until a subscriber looks sad.
+                        let capacity = recv_tx.capacity();
+                        let max_capacity = recv_tx.max_capacity();
+                        if capacity.saturating_mul(5) < max_capacity {
+                            warn!(
+                                available = capacity,
+                                max = max_capacity,
+                                peer = ?peer_id,
+                                stream = ?stream_type,
+                                "[1/6 network] recv_tx >80% full — PubSub pipeline falling behind; back-pressure is about to stall network recv"
+                            );
+                        }
                         if let Err(e) = recv_tx.send((peer_id, stream_type, payload)).await {
                             error!("Failed to forward message: {}", e);
                             break;
