@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.18.1] - 2026-04-21
+
+### Changed
+
+- Bumped `ant-quic` `0.27.2 → 0.27.3` (closes supersede race — now
+  emits `Replaced` + `Closed{Superseded}` on connection replacement;
+  enriches NAT traversal outcome + expiry heuristics).
+- Bumped `saorsa-gossip-*` `0.5.18 → 0.5.19` (re-pins ant-quic 0.27.3
+  across all 11 crates + clippy 1.95 `sort_by_key(Reverse)`
+  fixes in coordinator/{cache, gossip_cache, peer_cache} and
+  runtime/rendezvous).
+- REST + CLI + GUI gap-closure for the new ant-quic 0.27 surface
+  (originally drafted as v0.18.1 work, rolling it into this bump):
+  - New endpoints: `POST /peers/:peer_id/probe`,
+    `GET /peers/:peer_id/health`, `GET /peers/events` (SSE).
+  - `POST /direct/send` accepts `require_ack_ms` for a post-send
+    peer-liveness probe via ant-quic `probe_peer`. Explicit
+    documentation that this confirms the peer is responsive, not
+    that the specific DM envelope was delivered.
+  - New CLI: `x0x peer probe / health / events`,
+    `x0x direct send --require-ack-ms <ms>`.
+  - New GUI "Gossip Pipeline" panel in the Network view — renders
+    all 9 `PubSubStats` counters and flags non-zero drops in red.
+  - `communitas-x0x-client`: `gossip_stats()`, `probe_peer()`,
+    `peer_health()`.
+  - `communitas-apple/Tests/CommunitasUITests/` — XCUITest target
+    with 5 golden-path UI tests.
+
+### Validation
+
+- `cargo fmt --check`: clean
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+- `cargo nextest run --all-features --workspace`: **1006 / 1006** pass
+
+### Proof runs (`proofs/`)
+
+- `stress-20260421-v0181/` — 5 daemons × 500 messages on 0.18.1 +
+  ant-quic 0.27.3, SETTLE_SECS=30, PUBLISH_DELAY_MS=30.
+  Pipeline drops `decode_to_delivery_drops: 0` across all 5 nodes.
+  Mesh delivery is now asymmetric on the 5-node localhost matrix
+  (nodes 4-5: 647 / node, nodes 2-3: 106 / node) — this is a mesh-
+  formation artefact, not a pipeline regression.
+- `chrome-20260421-v0181/` — 13 / 13 GUI capabilities pass including
+  the new peer observability endpoints.
+
 ## [v0.18.0] - 2026-04-20
 
 ### Added
