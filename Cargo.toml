@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["gossip", "ai-agents", "p2p", "decentralised", "post-quantum"]
 categories = ["network-programming", "asynchronous"]
 authors = ["David Irvine <david@saorsalabs.com>"]
+# Proof artefacts are committed to the git repo for reviewers + CI but are
+# not needed to compile the crate. Excluding them keeps the published
+# tarball under crates.io's 10 MB limit.
+exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
