@@ -122,6 +122,47 @@ load the GUI from the daemon's embedded `/gui` handler so the page
 shares origin with the REST surface. The harness accepts `--gui <path>`
 to override back to `file://` when a daemon is unavailable.
 
+## Gap-closure proof run (2026-04-21, post-v0.18.0)
+
+**Extended stress — 5 daemons × 500 messages** (`proofs/stress-20260421-133206/stress-report.json`):
+
+```
+publisher node-1: publish_total=544, delivered=711, drops=0
+subscribers 2-5: publish_total=44, delivered=711, drops=0  (each)
+```
+
+- 500 user publishes + 44 internal (presence, rendezvous, caps) = 544
+  publish counter ticks on the publisher.
+- Every one of the 4 subscriber nodes received 711 — every stress
+  message plus the replayed publisher internals.
+- `decode_to_delivery_drops: 0` on all 5 nodes → zero pipeline loss.
+- Settings: SETTLE_SECS=30, PUBLISH_DELAY_MS=30. Burst throughput
+  ≈ 11 msg/s → x0xd publish side, ~150 msg/s fan-out measured on the
+  subscriber pipelines.
+
+**Chrome GUI 13/13 pass** (`proofs/chrome-20260421/gui-parity-report.json`):
+
+```
+[PASS] daemon-health                    [PASS] peer-health-self
+[PASS] agent-card                       [PASS] peer-probe-400-on-bad-hex
+[PASS] presence-online                  [PASS] peer-probe-503-on-unknown
+[PASS] diagnostics-connectivity         [PASS] peers-events-sse
+[PASS] diagnostics-gossip
+[PASS] groups-discover
+[PASS] stores-list
+[PASS] contacts-list
+[PASS] pubsub-roundtrip
+```
+
+Four new capabilities added this run:
+- `peer-health-self` — `GET /peers/<self>/health` returns 200 or 503 with
+  a well-formed error body (503 when no self-connection exists).
+- `peer-probe-400-on-bad-hex` — `POST /peers/not-hex/probe` returns 400
+  with an "invalid hex peer_id" message.
+- `peer-probe-503-on-unknown` — probing a never-seen peer returns 503
+  with a "probe failed" message from ant-quic's `ProbeTimeout`.
+- `peers-events-sse` — the SSE stream accepts and holds the connection.
+
 ## Red cells (gaps tracked, not blockers for v0.18.0)
 
 See `docs/parity-matrix.md` "Red-cell ticket list". Summary:
