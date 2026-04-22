@@ -15,12 +15,12 @@
 //! unless overridden with `AgentBuilder::with_network_config`.
 //!
 //! Default bootstrap nodes:
-//! - `142.93.199.50:5483` - NYC, US
-//! - `147.182.234.192:5483` - SFO, US
-//! - `65.21.157.229:5483` - Helsinki, FI
-//! - `116.203.101.172:5483` - Nuremberg, DE
-//! - `149.28.156.231:5483` - Singapore, SG
-//! - `45.77.176.184:5483` - Tokyo, JP
+//! - `142.93.199.50:5483` - NYC, US (DigitalOcean)
+//! - `147.182.234.192:5483` - SFO, US (DigitalOcean)
+//! - `65.21.157.229:5483` - Helsinki, FI (Hetzner)
+//! - `116.203.101.172:5483` - Nuremberg, DE (Hetzner)
+//! - `152.42.210.67:5483` - Singapore, SG (DigitalOcean)
+//! - `170.64.176.102:5483` - Sydney, AU (DigitalOcean)
 
 use crate::error::{NetworkError, NetworkResult};
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
@@ -75,8 +75,8 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// - `147.182.234.192` / `2604:a880:4:1d0:0:1:6ba1:f000` — SFO, US (DigitalOcean)
 /// - `65.21.157.229` / `2a01:4f9:c012:684b::1` — Helsinki, FI (Hetzner)
 /// - `116.203.101.172` / `2a01:4f8:1c1a:31e6::1` — Nuremberg, DE (Hetzner)
-/// - `149.28.156.231` / `2001:19f0:4401:346:5400:5ff:fed9:9735` — Singapore, SG (Vultr)
-/// - `45.77.176.184` / `2401:c080:1000:4c32:5400:5ff:fed9:9737` — Tokyo, JP (Vultr)
+/// - `152.42.210.67` / `2400:6180:0:d2:0:2:d30b:d000` — Singapore, SG (DigitalOcean)
+/// - `170.64.176.102` / `2400:6180:10:200::ba69:b000` — Sydney, AU (DigitalOcean)
 ///
 /// Agents can override these by calling `AgentBuilder::with_network_config`
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
@@ -86,15 +86,15 @@ pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "147.182.234.192:5483", // SFO
     "65.21.157.229:5483",   // Helsinki
     "116.203.101.172:5483", // Nuremberg
-    "149.28.156.231:5483",  // Singapore
-    "45.77.176.184:5483",   // Tokyo
+    "152.42.210.67:5483",   // Singapore
+    "170.64.176.102:5483",  // Sydney
     // IPv6
-    "[2604:a880:400:d1:0:3:7db3:f001]:5483",         // NYC
-    "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",          // SFO
-    "[2a01:4f9:c012:684b::1]:5483",                  // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:5483",                  // Nuremberg
-    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:5483",  // Singapore
-    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483", // Tokyo
+    "[2604:a880:400:d1:0:3:7db3:f001]:5483",  // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",   // SFO
+    "[2a01:4f9:c012:684b::1]:5483",           // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:5483",           // Nuremberg
+    "[2400:6180:0:d2:0:2:d30b:d000]:5483",    // Singapore
+    "[2400:6180:10:200::ba69:b000]:5483",     // Sydney
 ];
 
 /// x0x network node configuration.

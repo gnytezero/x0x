@@ -23,14 +23,14 @@ check() {
 }
 
 # ── Node definitions ────────────────────────────────────────────────────
-declare -a NODE_NAMES=(nyc sfo helsinki nuremberg singapore tokyo)
+declare -a NODE_NAMES=(nyc sfo helsinki nuremberg singapore sydney)
 declare -A NODE_IPS=(
     [nyc]="142.93.199.50"
     [sfo]="147.182.234.192"
     [helsinki]="65.21.157.229"
     [nuremberg]="116.203.101.172"
-    [singapore]="149.28.156.231"
-    [tokyo]="45.77.176.184"
+    [singapore]="152.42.210.67"
+    [sydney]="170.64.176.102"
 )
 
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"

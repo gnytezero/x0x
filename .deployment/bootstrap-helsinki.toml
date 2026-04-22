@@ -25,8 +25,8 @@ known_peers = [
     "142.93.199.50:5483",      # saorsa-2 (NYC)
     "147.182.234.192:5483",    # saorsa-3 (SFO)
     "116.203.101.172:5483",    # saorsa-7 (Nuremberg)
-    "149.28.156.231:5483",     # saorsa-8 (Singapore)
-    "45.77.176.184:5483",      # saorsa-9 (Tokyo)
+    "152.42.210.67:5483",      # saorsa-8 (Singapore, DigitalOcean)
+    "170.64.176.102:5483",     # saorsa-9 (Sydney, DigitalOcean)
 ]
 
 # Logging

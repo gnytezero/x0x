@@ -12,8 +12,8 @@ This directory contains configuration files and deployment scripts for running x
 | saorsa-3 | SFO, US | DigitalOcean | 147.182.234.192 | bootstrap-sfo.toml |
 | saorsa-6 | Helsinki, FI | Hetzner | 65.21.157.229 | bootstrap-helsinki.toml |
 | saorsa-7 | Nuremberg, DE | Hetzner | 116.203.101.172 | bootstrap-nuremberg.toml |
-| saorsa-8 | Singapore, SG | Vultr | 149.28.156.231 | bootstrap-singapore.toml |
-| saorsa-9 | Tokyo, JP | Vultr | 45.77.176.184 | bootstrap-tokyo.toml |
+| saorsa-8 | Singapore, SG | Vultr | 152.42.210.67 | bootstrap-singapore.toml |
+| saorsa-9 | Sydney, JP | Vultr | 170.64.176.102 | bootstrap-sydney.toml |
 
 ## Port Allocation
 
@@ -66,7 +66,7 @@ Check health status of nodes.
 ./health-check.sh
 
 # Check single node
-./health-check.sh tokyo
+./health-check.sh sydney
 ```
 
 **Output example:**
@@ -103,8 +103,8 @@ Checking saorsa-2 (142.93.199.50)... HEALTHY (peers: 5)
 Checking saorsa-3 (147.182.234.192)... HEALTHY (peers: 5)
 Checking saorsa-6 (65.21.157.229)... HEALTHY (peers: 5)
 Checking saorsa-7 (116.203.101.172)... HEALTHY (peers: 5)
-Checking saorsa-8 (149.28.156.231)... HEALTHY (peers: 5)
-Checking saorsa-9 (45.77.176.184)... HEALTHY (peers: 5)
+Checking saorsa-8 (152.42.210.67)... HEALTHY (peers: 5)
+Checking saorsa-9 (170.64.176.102)... HEALTHY (peers: 5)
 
 =========================================
 Summary

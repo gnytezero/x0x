@@ -285,7 +285,7 @@ Four bash test scripts in `tests/` for end-to-end validation:
 |--------|-------|-----------|---------------|
 | `e2e_comprehensive.sh` | Local (alice+bob+charlie) | ~143 | ALL 75+ endpoints, 18 categories: contacts lifecycle, machine pinning, trust eval (5 paths), MLS full lifecycle (add/remove/re-add), named groups (invite validation, leave/rejoin), KV stores (multi-key, update), presence (all 6 endpoints), seedless bootstrap |
 | `e2e_live_network.sh` | Local → live VPS mesh | ~66 | Local node joins real bootstrap network, bidirectional: direct messaging, pub/sub, MLS groups with VPS members, named group invites across network, presence discovery |
-| `e2e_vps.sh` | 6 VPS bootstrap nodes | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Tokyo), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes |
+| `e2e_vps.sh` | 6 VPS bootstrap nodes | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes |
 | `e2e_deploy.sh` | Build + deploy to VPS | ~24 | Cross-compile, upload to 6 nodes, verify health/version/mesh, collect API tokens |
 
 ### Running E2E Tests

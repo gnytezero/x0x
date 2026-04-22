@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # x0x VPS End-to-End Test — All-Pairs Matrix
-# Tests across ALL 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo)
+# Tests across ALL 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney)
 #
 # PROOF POINTS: Every assertion either echoes actual API data or verifies a
 # round-trip with a unique PROOF_TOKEN — no hallucinated test results.
@@ -66,18 +66,18 @@ check_connect_outcome() {
 }
 
 # ── Node configuration ──────────────────────────────────────────────────
-NODES=(nyc sfo helsinki nuremberg singapore tokyo)
+NODES=(nyc sfo helsinki nuremberg singapore sydney)
 declare -A NODE_IPS=(
     [nyc]="142.93.199.50"
     [sfo]="147.182.234.192"
     [helsinki]="65.21.157.229"
     [nuremberg]="116.203.101.172"
-    [singapore]="149.28.156.231"
-    [tokyo]="45.77.176.184"
+    [singapore]="152.42.210.67"
+    [sydney]="170.64.176.102"
 )
 declare -A NODE_LABELS=(
     [nyc]="NYC" [sfo]="SFO" [helsinki]="Helsinki"
-    [nuremberg]="Nuremberg" [singapore]="Singapore" [tokyo]="Tokyo"
+    [nuremberg]="Nuremberg" [singapore]="Singapore" [sydney]="Sydney"
 )
 declare -A NODE_TOKENS=()
 declare -A NODE_AIDS=()
@@ -100,7 +100,7 @@ if [ -f "$SCRIPT_DIR/.vps-tokens.env" ]; then
     [ -n "${HELSINKI_TK:-}" ] && NODE_TOKENS[helsinki]="$HELSINKI_TK"
     [ -n "${NUREMBERG_TK:-}" ] && NODE_TOKENS[nuremberg]="$NUREMBERG_TK"
     [ -n "${SINGAPORE_TK:-}" ] && NODE_TOKENS[singapore]="$SINGAPORE_TK"
-    [ -n "${TOKYO_TK:-}" ] && NODE_TOKENS[tokyo]="$TOKYO_TK"
+    [ -n "${SYDNEY_TK:-}" ] && NODE_TOKENS[sydney]="$SYDNEY_TK"
 fi
 
 # Fallback: read tokens via SSH
@@ -188,7 +188,7 @@ json_transfer_output_path() {
 
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${YELLOW}   x0x v$VERSION VPS E2E Test — All-Pairs Matrix${NC}"
-echo -e "${YELLOW}   NYC · SFO · Helsinki · Nuremberg · Singapore · Tokyo${NC}"
+echo -e "${YELLOW}   NYC · SFO · Helsinki · Nuremberg · Singapore · Sydney${NC}"
 echo -e "${YELLOW}   Proof: ${PROOF_TOKEN}${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
@@ -460,8 +460,8 @@ fi
 # 9. CLI INTERFACE PROOF — x0x direct send via CLI binary
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[9/20] CLI Interface Proof (x0x direct send)${NC}"
-# Use NYC→Helsinki and Tokyo→SFO as CLI proof pairs with recipient-side evidence.
-CLI_PAIRS=("nyc:helsinki" "tokyo:sfo")
+# Use NYC→Helsinki and Sydney→SFO as CLI proof pairs with recipient-side evidence.
+CLI_PAIRS=("nyc:helsinki" "sydney:sfo")
 for pair in "${CLI_PAIRS[@]}"; do
     src="${pair%%:*}"; dst="${pair##*:}"
     src_ip="${NODE_IPS[$src]}"; src_tk="${NODE_TOKENS[$src]}"
@@ -603,8 +603,8 @@ fi
 echo -e "\n${CYAN}[13/20] Pub/Sub (global gossip)${NC}"
 PUBSUB_TOPIC="vps-e2e-${PROOF_TOKEN}"
 
-# Subscribe on Helsinki and Tokyo
-for node in helsinki tokyo; do
+# Subscribe on Helsinki and Sydney
+for node in helsinki sydney; do
     a_is_live "$node" || continue
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]:-}"
     [ -z "$tk" ] && continue
@@ -638,8 +638,8 @@ if [ -n "$NYC_TK" ]; then
     fi
 
     if [ -n "$MG" ]; then
-        # Add Helsinki, Singapore, Tokyo
-        for node in helsinki singapore tokyo; do
+        # Add Helsinki, Singapore, Sydney
+        for node in helsinki singapore sydney; do
             a_is_live "$node" || continue
             aid="${NODE_AIDS[$node]:-}"
             [ -z "$aid" ] && continue
@@ -689,50 +689,50 @@ if [ -n "$NYC_TK" ]; then
         if [ -n "$INVITE" ]; then
             check_contains "invite is x0x://invite/" "$INVITE" "x0x://invite/"
 
-            # Tokyo joins and proves local membership lifecycle in the space.
-            TKY_IP="${NODE_IPS[tokyo]}"; TKY_TK="${NODE_TOKENS[tokyo]:-}"; TKY_AID="${NODE_AIDS[tokyo]:-}"
-            if a_is_live tokyo && [ -n "$TKY_TK" ]; then
-                R=$(vps_post "$TKY_IP" "$TKY_TK" /groups/join "{\"invite\":\"$INVITE\",\"display_name\":\"Tokyo Space Tester\"}")
-                check_not_error "Tokyo joins via invite" "$R"
-                R=$(vps_get "$TKY_IP" "$TKY_TK" "/groups/$NG")
-                check_json "Tokyo group info" "$R" "members"
-                check_contains "Tokyo space member list includes self" "$R" "$TKY_AID"
-                check_contains "Tokyo space member display name persisted" "$R" "Tokyo Space Tester"
-                R=$(vps_post "$NYC_IP" "$NYC_TK" "/groups/$NG/members" "{\"agent_id\":\"$TKY_AID\",\"display_name\":\"Tokyo Space Tester\"}")
-                check_not_error "NYC adds Tokyo to named-space roster" "$R"
+            # Sydney joins and proves local membership lifecycle in the space.
+            SYD_IP="${NODE_IPS[sydney]}"; SYD_TK="${NODE_TOKENS[sydney]:-}"; SYD_AID="${NODE_AIDS[sydney]:-}"
+            if a_is_live sydney && [ -n "$SYD_TK" ]; then
+                R=$(vps_post "$SYD_IP" "$SYD_TK" /groups/join "{\"invite\":\"$INVITE\",\"display_name\":\"Sydney Space Tester\"}")
+                check_not_error "Sydney joins via invite" "$R"
+                R=$(vps_get "$SYD_IP" "$SYD_TK" "/groups/$NG")
+                check_json "Sydney group info" "$R" "members"
+                check_contains "Sydney space member list includes self" "$R" "$SYD_AID"
+                check_contains "Sydney space member display name persisted" "$R" "Sydney Space Tester"
+                R=$(vps_post "$NYC_IP" "$NYC_TK" "/groups/$NG/members" "{\"agent_id\":\"$SYD_AID\",\"display_name\":\"Sydney Space Tester\"}")
+                check_not_error "NYC adds Sydney to named-space roster" "$R"
                 R=$(vps_get "$NYC_IP" "$NYC_TK" "/groups/$NG/members")
                 check_json "NYC named-space members" "$R" "members"
-                check_contains "NYC named-space members include Tokyo" "$R" "$TKY_AID"
-                R=$(vps_del "$NYC_IP" "$NYC_TK" "/groups/$NG/members/$TKY_AID")
-                check_not_error "NYC removes Tokyo from named-space roster" "$R"
+                check_contains "NYC named-space members include Sydney" "$R" "$SYD_AID"
+                R=$(vps_del "$NYC_IP" "$NYC_TK" "/groups/$NG/members/$SYD_AID")
+                check_not_error "NYC removes Sydney from named-space roster" "$R"
                 R=$(vps_get "$NYC_IP" "$NYC_TK" "/groups/$NG/members")
                 TOTAL=$((TOTAL+1))
-                if echo "$R" | grep -q "$TKY_AID"; then
-                    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} NYC named-space roster cleared Tokyo"
+                if echo "$R" | grep -q "$SYD_AID"; then
+                    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} NYC named-space roster cleared Sydney"
                 else
-                    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} NYC named-space roster cleared Tokyo"
+                    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} NYC named-space roster cleared Sydney"
                 fi
-                TOKYO_REMOVED=false
+                SYDNEY_REMOVED=false
                 for _ in $(seq 1 20); do
-                    R=$(vps_get "$TKY_IP" "$TKY_TK" "/groups/$NG")
+                    R=$(vps_get "$SYD_IP" "$SYD_TK" "/groups/$NG")
                     if echo "$R" | grep -q 'group not found\|curl_failed'; then
-                        TOKYO_REMOVED=true
+                        SYDNEY_REMOVED=true
                         break
                     fi
                     sleep 1
                 done
                 TOTAL=$((TOTAL+1))
-                if $TOKYO_REMOVED; then
-                    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} Tokyo authoritative removal propagated"
+                if $SYDNEY_REMOVED; then
+                    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} Sydney authoritative removal propagated"
                 else
-                    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} Tokyo authoritative removal propagated"
+                    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} Sydney authoritative removal propagated"
                 fi
-                R=$(vps_get "$TKY_IP" "$TKY_TK" /groups)
+                R=$(vps_get "$SYD_IP" "$SYD_TK" /groups)
                 TOTAL=$((TOTAL+1))
                 if echo "$R" | grep -q "$NG"; then
-                    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} Tokyo group list cleared after authoritative remove"
+                    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} Sydney group list cleared after authoritative remove"
                 else
-                    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} Tokyo group list cleared after authoritative remove"
+                    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} Sydney group list cleared after authoritative remove"
                 fi
             fi
 
@@ -761,7 +761,7 @@ echo -e "\n${CYAN}[16/20] KV Stores (cross-continent)${NC}"
 KV_NODE=""
 a_is_live nuremberg && KV_NODE="nuremberg"
 [ -z "$KV_NODE" ] && a_is_live singapore && KV_NODE="singapore"
-[ -z "$KV_NODE" ] && a_is_live tokyo && KV_NODE="tokyo"
+[ -z "$KV_NODE" ] && a_is_live sydney && KV_NODE="sydney"
 KV_IP="${NODE_IPS[$KV_NODE]:-}"; KV_TK="${NODE_TOKENS[$KV_NODE]:-}"
 if [ -n "$KV_NODE" ] && [ -n "$KV_TK" ]; then
     R=$(vps_get "$KV_IP" "$KV_TK" /stores)
@@ -804,7 +804,7 @@ echo -e "\n${CYAN}[17/20] Task Lists (CRDT)${NC}"
 
 TASK_NODE=""
 a_is_live sfo && TASK_NODE="sfo"
-[ -z "$TASK_NODE" ] && a_is_live tokyo && TASK_NODE="tokyo"
+[ -z "$TASK_NODE" ] && a_is_live sydney && TASK_NODE="sydney"
 [ -z "$TASK_NODE" ] && a_is_live singapore && TASK_NODE="singapore"
 TASK_IP="${NODE_IPS[$TASK_NODE]:-}"; TASK_TK="${NODE_TOKENS[$TASK_NODE]:-}"
 if [ -n "$TASK_NODE" ] && [ -n "$TASK_TK" ]; then
@@ -834,41 +834,41 @@ if [ -n "$TASK_NODE" ] && [ -n "$TASK_TK" ]; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# 18. FILE TRANSFER — Singapore→Tokyo full accept/complete proof
+# 18. FILE TRANSFER — Singapore→Sydney full accept/complete proof
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[18/20] File Transfer${NC}"
 
 SGP_IP="${NODE_IPS[singapore]}"; SGP_TK="${NODE_TOKENS[singapore]:-}"
-TKY_IP="${NODE_IPS[tokyo]}"; TKY_TK="${NODE_TOKENS[tokyo]:-}"; TKY_AID="${NODE_AIDS[tokyo]:-}"
-if a_is_live singapore && a_is_live tokyo && [ -n "$SGP_TK" ] && [ -n "$TKY_TK" ] && [ -n "$TKY_AID" ] && [ -n "${PAIR_CONNECTED[singapore_tokyo]:-}" ]; then
+SYD_IP="${NODE_IPS[sydney]}"; SYD_TK="${NODE_TOKENS[sydney]:-}"; SYD_AID="${NODE_AIDS[sydney]:-}"
+if a_is_live singapore && a_is_live sydney && [ -n "$SGP_TK" ] && [ -n "$SYD_TK" ] && [ -n "$SYD_AID" ] && [ -n "${PAIR_CONNECTED[singapore_tokyo]:-}" ]; then
     SEND_PATH="/tmp/x0x-vps-file-${PROOF_TOKEN}.txt"
     vps_ssh "$SGP_IP" "printf '%s\n' '${PROOF_TOKEN}-file-transfer-vps' > '$SEND_PATH'"
     FILE_SHA=$(vps_ssh "$SGP_IP" "shasum -a 256 '$SEND_PATH' | awk '{print \$1}'")
     FILE_SIZE=$(vps_ssh "$SGP_IP" "wc -c < '$SEND_PATH' | tr -d ' '")
-    R=$(vps_post "$SGP_IP" "$SGP_TK" /files/send "{\"agent_id\":\"$TKY_AID\",\"filename\":\"matrix-test-${PROOF_TOKEN}.txt\",\"size\":$FILE_SIZE,\"sha256\":\"$FILE_SHA\",\"path\":\"$SEND_PATH\"}")
-    check_not_error "Singapore→Tokyo file offer" "$R"
+    R=$(vps_post "$SGP_IP" "$SGP_TK" /files/send "{\"agent_id\":\"$SYD_AID\",\"filename\":\"matrix-test-${PROOF_TOKEN}.txt\",\"size\":$FILE_SIZE,\"sha256\":\"$FILE_SHA\",\"path\":\"$SEND_PATH\"}")
+    check_not_error "Singapore→Sydney file offer" "$R"
     FT_ID=$(jq_field "$R" "transfer_id")
     R=$(vps_get "$SGP_IP" "$SGP_TK" /files/transfers)
     check_not_error "Singapore transfers list" "$R"
     T_SEEN=""
     for _ in $(seq 1 40); do
-        TR=$(vps_get "$TKY_IP" "$TKY_TK" /files/transfers)
+        TR=$(vps_get "$SYD_IP" "$SYD_TK" /files/transfers)
         T_SEEN=$(json_has_transfer "$TR" "$FT_ID")
         [ -n "$T_SEEN" ] && break
         sleep 1
     done
     TOTAL=$((TOTAL+1))
     if [ -n "$T_SEEN" ]; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} Tokyo sees incoming transfer"
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} Sydney sees incoming transfer"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} Tokyo sees incoming transfer"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} Sydney sees incoming transfer"
     fi
-    R=$(vps_post "$TKY_IP" "$TKY_TK" "/files/accept/$FT_ID" '{}')
-    check_not_error "Tokyo accepts incoming transfer" "$R"
+    R=$(vps_post "$SYD_IP" "$SYD_TK" "/files/accept/$FT_ID" '{}')
+    check_not_error "Sydney accepts incoming transfer" "$R"
     S_STATUS=""; T_STATUS=""
     for _ in $(seq 1 50); do
         SR=$(vps_get "$SGP_IP" "$SGP_TK" "/files/transfers/$FT_ID")
-        TR=$(vps_get "$TKY_IP" "$TKY_TK" "/files/transfers/$FT_ID")
+        TR=$(vps_get "$SYD_IP" "$SYD_TK" "/files/transfers/$FT_ID")
         S_STATUS=$(json_transfer_status "$SR")
         T_STATUS=$(json_transfer_status "$TR")
         [ "$S_STATUS" = "Complete" ] && [ "$T_STATUS" = "Complete" ] && break
@@ -879,12 +879,12 @@ if a_is_live singapore && a_is_live tokyo && [ -n "$SGP_TK" ] && [ -n "$TKY_TK" 
     TOTAL=$((TOTAL+1))
     if [ "$T_STATUS" = "Complete" ]; then PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} receiver transfer reaches Complete"; else FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} receiver transfer reaches Complete"; fi
     OUT_PATH=$(json_transfer_output_path "$TR")
-    RECV_SHA=$(vps_ssh "$TKY_IP" "shasum -a 256 '$OUT_PATH' | awk '{print \$1}'" 2>/dev/null || echo "")
-    RECV_BODY=$(vps_ssh "$TKY_IP" "cat '$OUT_PATH' 2>/dev/null || true")
+    RECV_SHA=$(vps_ssh "$SYD_IP" "shasum -a 256 '$OUT_PATH' | awk '{print \$1}'" 2>/dev/null || echo "")
+    RECV_BODY=$(vps_ssh "$SYD_IP" "cat '$OUT_PATH' 2>/dev/null || true")
     check_eq "received file sha256 matches" "$RECV_SHA" "$FILE_SHA"
     check_contains "received file body contains proof token" "$RECV_BODY" "$PROOF_TOKEN"
 else
-    skip "File transfer proof" "Singapore/Tokyo not fully available"
+    skip "File transfer proof" "Singapore/Sydney not fully available"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════

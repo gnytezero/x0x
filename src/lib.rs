@@ -46,7 +46,7 @@
 //!
 //! Agents automatically connect to Saorsa Labs' global bootstrap network:
 //! - NYC, US · SFO, US · Helsinki, FI
-//! - Nuremberg, DE · Singapore, SG · Tokyo, JP
+//! - Nuremberg, DE · Singapore, SG · Sydney, JP
 //!
 //! These nodes provide initial peer discovery and NAT traversal.
 
@@ -6451,13 +6451,15 @@ mod tests {
 
     #[test]
     fn announcement_assist_snapshot_uses_capabilities_not_activity() {
-        let mut status = ant_quic::NodeStatus::default();
-        status.nat_type = ant_quic::NatType::FullCone;
-        status.can_receive_direct = true;
-        status.relay_service_enabled = true;
-        status.coordinator_service_enabled = true;
-        status.is_relaying = false;
-        status.is_coordinating = false;
+        let status = ant_quic::NodeStatus {
+            nat_type: ant_quic::NatType::FullCone,
+            can_receive_direct: true,
+            relay_service_enabled: true,
+            coordinator_service_enabled: true,
+            is_relaying: false,
+            is_coordinating: false,
+            ..Default::default()
+        };
 
         let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
         assert_eq!(snapshot.nat_type.as_deref(), Some("Full Cone"));

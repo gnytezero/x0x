@@ -1,7 +1,7 @@
 # x0x Node Configuration - Singapore (saorsa-8)
-# Location: Singapore (Vultr)
-# Public IPv4: 149.28.156.231
-# Public IPv6: 2001:19f0:4401:346:5400:5ff:fed9:9735
+# Location: Singapore (DigitalOcean SGP1)
+# Public IPv4: 152.42.210.67
+# Public IPv6: 2400:6180:0:d2:0:2:d30b:d000
 
 # QUIC transport bind address (dual-stack: accepts both IPv4 and IPv6)
 bind_address = "[::]:5483"
@@ -26,7 +26,7 @@ known_peers = [
     "147.182.234.192:5483",    # saorsa-3 (SFO)
     "65.21.157.229:5483",      # saorsa-6 (Helsinki)
     "116.203.101.172:5483",    # saorsa-7 (Nuremberg)
-    "45.77.176.184:5483",      # saorsa-9 (Tokyo)
+    "170.64.176.102:5483",     # saorsa-9 (Sydney)
 ]
 
 # Logging

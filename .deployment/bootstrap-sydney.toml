@@ -1,7 +1,7 @@
-# x0x Node Configuration - Tokyo (saorsa-9)
-# Location: Tokyo, Japan (Vultr)
-# Public IPv4: 45.77.176.184
-# Public IPv6: 2401:c080:1000:4c32:5400:5ff:fed9:9737
+# x0x Node Configuration - Sydney (saorsa-9)
+# Location: Sydney, AU (DigitalOcean SYD1)
+# Public IPv4: 170.64.176.102
+# Public IPv6: 2400:6180:10:200::ba69:b000
 
 # QUIC transport bind address (dual-stack: accepts both IPv4 and IPv6)
 bind_address = "[::]:5483"
@@ -26,7 +26,7 @@ known_peers = [
     "147.182.234.192:5483",    # saorsa-3 (SFO)
     "65.21.157.229:5483",      # saorsa-6 (Helsinki)
     "116.203.101.172:5483",    # saorsa-7 (Nuremberg)
-    "149.28.156.231:5483",     # saorsa-8 (Singapore)
+    "152.42.210.67:5483",      # saorsa-8 (Singapore)
 ]
 
 # Logging

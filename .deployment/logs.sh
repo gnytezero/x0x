@@ -1,7 +1,7 @@
 #!/bin/bash
 # View logs from x0x bootstrap nodes
 # Usage: ./logs.sh [node_name] [lines]
-#   node_name: nyc, sfo, helsinki, nuremberg, singapore, tokyo
+#   node_name: nyc, sfo, helsinki, nuremberg, singapore, sydney
 #   lines: number of lines to show (default: 50)
 
 set -euo pipefail
@@ -12,8 +12,8 @@ declare -A NODES=(
     ["sfo"]="147.182.234.192"
     ["helsinki"]="65.21.157.229"
     ["nuremberg"]="116.203.101.172"
-    ["singapore"]="149.28.156.231"
-    ["tokyo"]="45.77.176.184"
+    ["singapore"]="152.42.210.67"
+    ["sydney"]="170.64.176.102"
 )
 
 main() {

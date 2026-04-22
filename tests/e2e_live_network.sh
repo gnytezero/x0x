@@ -94,10 +94,10 @@ vps_api() {
 }
 
 # ── VPS node definitions ────────────────────────────────────────────────
-declare -a VPS_NAMES=(nyc sfo helsinki nuremberg singapore tokyo)
+declare -a VPS_NAMES=(nyc sfo helsinki nuremberg singapore sydney)
 declare -A VPS_IPS=(
     [nyc]="142.93.199.50" [sfo]="147.182.234.192" [helsinki]="65.21.157.229"
-    [nuremberg]="116.203.101.172" [singapore]="149.28.156.231" [tokyo]="45.77.176.184"
+    [nuremberg]="116.203.101.172" [singapore]="152.42.210.67" [sydney]="170.64.176.102"
 )
 declare -A VPS_TOKENS=()
 
@@ -138,7 +138,7 @@ if [ -f "$SCRIPT_DIR/.vps-tokens.env" ]; then
     [ -n "${HELSINKI_TK:-}" ] && VPS_TOKENS[helsinki]="$HELSINKI_TK"
     [ -n "${NUREMBERG_TK:-}" ] && VPS_TOKENS[nuremberg]="$NUREMBERG_TK"
     [ -n "${SINGAPORE_TK:-}" ] && VPS_TOKENS[singapore]="$SINGAPORE_TK"
-    [ -n "${TOKYO_TK:-}" ] && VPS_TOKENS[tokyo]="$TOKYO_TK"
+    [ -n "${SYDNEY_TK:-}" ] && VPS_TOKENS[sydney]="$SYDNEY_TK"
 fi
 
 # Fallback: read tokens via SSH for missing

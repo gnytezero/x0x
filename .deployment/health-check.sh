@@ -1,7 +1,7 @@
 #!/bin/bash
 # Health check for x0x bootstrap network
 # Usage: ./health-check.sh [node_name|all] [--extended]
-#   node_name: nyc, sfo, helsinki, nuremberg, singapore, tokyo, or 'all' (default)
+#   node_name: nyc, sfo, helsinki, nuremberg, singapore, sydney, or 'all' (default)
 #   --extended: also show peer count
 
 set -euo pipefail
@@ -119,7 +119,7 @@ main() {
 
     if [[ "$target" == "all" ]]; then
         local total=0 healthy=0
-        local -a nodes=("nyc:142.93.199.50" "sfo:147.182.234.192" "helsinki:65.21.157.229" "nuremberg:116.203.101.172" "singapore:149.28.156.231" "tokyo:45.77.176.184")
+        local -a nodes=("nyc:142.93.199.50" "sfo:147.182.234.192" "helsinki:65.21.157.229" "nuremberg:116.203.101.172" "singapore:152.42.210.67" "sydney:170.64.176.102")
 
         for entry in "${nodes[@]}"; do
             local node="${entry%%:*}" ip="${entry##*:}"
@@ -144,8 +144,8 @@ main() {
         case "$target" in
             nyc) ip="142.93.199.50" ;; sfo) ip="147.182.234.192" ;;
             helsinki) ip="65.21.157.229" ;; nuremberg) ip="116.203.101.172" ;;
-            singapore) ip="149.28.156.231" ;; tokyo) ip="45.77.176.184" ;;
-            *) echo "Unknown node: $target"; echo "Available: nyc sfo helsinki nuremberg singapore tokyo"; exit 1 ;;
+            singapore) ip="152.42.210.67" ;; sydney) ip="170.64.176.102" ;;
+            *) echo "Unknown node: $target"; echo "Available: nyc sfo helsinki nuremberg singapore sydney"; exit 1 ;;
         esac
         check_node "$target" "$ip"
     fi

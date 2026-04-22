@@ -707,8 +707,8 @@ run_vps_probe() {
         [sfo]="147.182.234.192"
         [hel]="65.21.157.229"
         [nur]="116.203.101.172"
-        [sin]="149.28.156.231"
-        [tok]="45.77.176.184"
+        [sin]="152.42.210.67"
+        [tok]="170.64.176.102"
     )
 
     local SSH_CMD="ssh -o ConnectTimeout=5 -o ControlMaster=no -o ControlPath=none \
