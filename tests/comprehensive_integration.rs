@@ -196,8 +196,8 @@ fn test_three_language_interop() {
 #[test]
 fn test_agent_id_uniqueness() {
     // Verify different agents have different IDs
-    let agent1 = AgentId([rand::random::<u8>(); 32]);
-    let agent2 = AgentId([rand::random::<u8>(); 32]);
+    let agent1 = AgentId(rand::random::<[u8; 32]>());
+    let agent2 = AgentId(rand::random::<[u8; 32]>());
     assert_ne!(agent1, agent2, "Agent IDs must be unique");
 }
 
@@ -258,7 +258,7 @@ fn test_agent_creation_performance() {
     use std::time::Instant;
 
     let start = Instant::now();
-    let _agent_id = AgentId([rand::random::<u8>(); 32]);
+    let _agent_id = AgentId(rand::random::<[u8; 32]>());
     let elapsed = start.elapsed();
 
     println!("Agent creation time: {:?}", elapsed);
