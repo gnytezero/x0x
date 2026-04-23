@@ -2,6 +2,73 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.19.0] - 2026-04-23
+
+### Breaking — wire format v2
+
+All identity / machine announcements are now on v2 topics. v1 is retired
+and **v0.18.x is yanked from crates.io** — nodes must upgrade together.
+
+- `x0x.identity.announce.v1` → `x0x.identity.announce.v2`
+- `x0x.machine.announce.v1`  → `x0x.machine.announce.v2`
+- `x0x.identity.shard.<n>`   → `x0x.identity.shard.v2.<n>`
+- `x0x.machine.shard.<n>`    → `x0x.machine.shard.v2.<n>`
+
+The `x0x.rendezvous.shard.<n>` topic is unchanged (it carries
+`saorsa-gossip` `ProviderSummary`, not x0x wire types).
+
+### Added
+
+- **`reachable_via` + `relay_candidates` on announcements.**
+  `IdentityAnnouncement` and `MachineAnnouncement` now carry
+  `Vec<MachineId>` backpointers naming coordinator / relay peers through
+  which a NAT-locked agent wants to be dialled. Populated from currently-
+  connected peers the machine cache marks `is_coordinator == Some(true)` /
+  `is_relay == Some(true)`, capped at 8 each, emitted only when
+  `can_receive_direct` is not known-true. `connect_to_agent` now seeds
+  these coordinators as transport peer hints before the coordinated dial,
+  so ant-quic picks up an explicit NAT-traversal target rather than
+  guessing from the bootstrap cache.
+- **`UserAnnouncement` — first-class agent-ownership rosters.** A
+  human identity (`UserId`) can now assert "these N agents are mine" as
+  a first-class record on the new `x0x.user.announce.v2` topic (plus a
+  `x0x.user.shard.v2.<n>` per-user shard). Each announcement is
+  user-signed (ML-DSA-65) over the canonical bincode of the unsigned
+  form, and carries a `Vec<AgentCertificate>` — each cert itself
+  user-signed — so every agent-ownership claim is individually
+  verifiable. New `Agent::announce_user_identity(human_consent)`,
+  `discovered_user(user_id)`, `discovered_users()` APIs. Listener
+  subscribes to both global and own-shard topics with dedup-windowed
+  rebroadcast matching the identity/machine paths.
+- **Real `IntroductionCard` signature.** Previously the card's
+  `signature` field held a placeholder machine public key. Cards are
+  now ML-DSA-65-signed over the canonical form (`"x0x-introduction-
+  card-v1"` prefix + bincode of the unsigned fields, including
+  `machine_public_key`), with a `verify()` method that checks machine-
+  key→machine_id binding, the outer signature, and the embedded
+  `AgentCertificate` chain. Closes a forgery hole where any node could
+  mint a card claiming any (agent_id, machine_id, user_id) pair by
+  copying a target's machine pubkey.
+
+### Tests
+
+- 6 new tests on `IntroductionCard`: round-trip, user-backed, tampered
+  display_name / agent_id / machine_id, foreign-signature splice.
+- 5 new tests on `UserAnnouncement`: round-trip, foreign-cert rejection
+  at sign time, tampered cert list, tampered user_public_key, shard
+  topic determinism.
+- Expanded `IdentityAnnouncement` bincode round-trip to include the new
+  `reachable_via` / `relay_candidates` fields.
+
+### Validation
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --all-features --all-targets -- -D warnings`: clean.
+- `cargo nextest run --all-features --workspace`: 1023/1024 (the one
+  failure is `parity_cli::every_endpoint_is_reachable_from_cli`,
+  pre-existing on HEAD, flags missing `/machines/*` CLI subcommands —
+  unrelated to this release).
+
 ## [v0.18.5] - 2026-04-21
 
 ### Added
