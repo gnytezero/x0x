@@ -21,7 +21,7 @@ proptest! {
         nat in prop_oneof![Just(None), Just(Some("FullCone".into())), Just(Some("Symmetric".into())), Just(Some("None".into()))],
         cd in prop::option::of(any::<bool>()),
     ) {
-        let info = ReachabilityInfo { addresses: addrs, nat_type: nat, can_receive_direct: cd, is_relay: None, is_coordinator: None };
+        let info = ReachabilityInfo { addresses: addrs, nat_type: nat, can_receive_direct: cd, is_relay: None, is_coordinator: None, reachable_via: Vec::new(), relay_candidates: Vec::new() };
         // Just verify they don't panic — the heuristics may overlap.
         let _d = info.likely_direct();
         let _c = info.needs_coordination();
@@ -29,19 +29,19 @@ proptest! {
 
     #[test]
     fn empty_addrs_not_direct(nat in prop_oneof![Just(None), Just(Some("FullCone".into()))], cd in prop::option::of(any::<bool>())) {
-        let info = ReachabilityInfo { addresses: vec![], nat_type: nat, can_receive_direct: cd, is_relay: None, is_coordinator: None };
+        let info = ReachabilityInfo { addresses: vec![], nat_type: nat, can_receive_direct: cd, is_relay: None, is_coordinator: None, reachable_via: Vec::new(), relay_candidates: Vec::new() };
         prop_assert!(!info.likely_direct());
     }
 
     #[test]
     fn explicit_direct_true(addr in arb_addr()) {
-        let info = ReachabilityInfo { addresses: vec![addr], nat_type: None, can_receive_direct: Some(true), is_relay: None, is_coordinator: None };
+        let info = ReachabilityInfo { addresses: vec![addr], nat_type: None, can_receive_direct: Some(true), is_relay: None, is_coordinator: None, reachable_via: Vec::new(), relay_candidates: Vec::new() };
         prop_assert!(info.likely_direct());
     }
 
     #[test]
     fn symmetric_nat_needs_coord(_seed in 0u64..100) {
-        let info = ReachabilityInfo { addresses: vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1,2,3,4), 5000))], nat_type: Some("Symmetric".into()), can_receive_direct: Some(false), is_relay: None, is_coordinator: None };
+        let info = ReachabilityInfo { addresses: vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1,2,3,4), 5000))], nat_type: Some("Symmetric".into()), can_receive_direct: Some(false), is_relay: None, is_coordinator: None, reachable_via: Vec::new(), relay_candidates: Vec::new() };
         prop_assert!(info.needs_coordination());
     }
 

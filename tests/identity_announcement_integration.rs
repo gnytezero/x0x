@@ -229,7 +229,7 @@ fn test_shard_topic_deterministic() {
         "same AgentId must always yield the same topic"
     );
     assert!(
-        topic_a.starts_with("x0x.identity.shard."),
+        topic_a.starts_with("x0x.identity.shard.v2."),
         "topic must use expected prefix"
     );
 }
@@ -249,7 +249,7 @@ fn test_shard_distribution_uniform() {
         let agent_id = x0x::identity::AgentId(id_bytes);
         let topic = x0x::shard_topic_for_agent(&agent_id);
         let shard: u16 = topic
-            .trim_start_matches("x0x.identity.shard.")
+            .trim_start_matches("x0x.identity.shard.v2.")
             .parse()
             .unwrap();
         *counts.entry(shard).or_insert(0) += 1;
@@ -293,7 +293,7 @@ fn test_rendezvous_and_identity_shard_numbers_match() {
     let id_topic = x0x::shard_topic_for_agent(&agent_id);
     let rdv_topic = x0x::rendezvous_shard_topic_for_agent(&agent_id);
     // Both should end in the same shard number
-    let id_num = id_topic.trim_start_matches("x0x.identity.shard.");
+    let id_num = id_topic.trim_start_matches("x0x.identity.shard.v2.");
     let rdv_num = rdv_topic.trim_start_matches("x0x.rendezvous.shard.");
     assert_eq!(id_num, rdv_num, "shard numbers must be identical");
 }
@@ -362,6 +362,8 @@ fn fake_agent(last_seen: u64) -> DiscoveredAgent {
         can_receive_direct: None,
         is_relay: None,
         is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
     }
 }
 

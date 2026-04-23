@@ -271,24 +271,30 @@ pub struct Message {
 }
 
 /// Reserved gossip topic for signed identity announcements.
-pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v1";
+///
+/// **v2** carries additional `reachable_via` / `relay_candidates` fields for
+/// NAT-aware coordinator hints. v1 is retired; v0.18.x is yanked.
+pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v2";
 
 /// Reserved gossip topic for signed machine endpoint announcements.
-pub const MACHINE_ANNOUNCE_TOPIC: &str = "x0x.machine.announce.v1";
+///
+/// **v2** carries the same NAT-aware coordinator hints as the identity
+/// topic. v1 is retired.
+pub const MACHINE_ANNOUNCE_TOPIC: &str = "x0x.machine.announce.v2";
 
 /// Return the shard-specific gossip topic for the given `agent_id`.
 ///
 /// Each agent publishes identity announcements to a deterministic shard topic
-/// (`x0x.identity.shard.<u16>`) derived from its agent ID, in addition to the
-/// legacy broadcast topic.  This distributes announcements across 65,536 shards
-/// so that at scale not every node is forced to receive every announcement.
+/// (`x0x.identity.shard.v2.<u16>`) derived from its agent ID, in addition to
+/// the broadcast topic. This distributes announcements across 65,536 shards so
+/// that at scale not every node is forced to receive every announcement.
 ///
 /// The shard is computed with `saorsa_gossip_rendezvous::calculate_shard`, which
 /// applies BLAKE3(`"saorsa-rendezvous" || agent_id`) and takes the low 16 bits.
 #[must_use]
 pub fn shard_topic_for_agent(agent_id: &identity::AgentId) -> String {
     let shard = saorsa_gossip_rendezvous::calculate_shard(&agent_id.0);
-    format!("x0x.identity.shard.{shard}")
+    format!("x0x.identity.shard.v2.{shard}")
 }
 
 /// Return the shard-specific gossip topic for the given `machine_id`.
@@ -298,7 +304,7 @@ pub fn shard_topic_for_agent(agent_id: &identity::AgentId) -> String {
 #[must_use]
 pub fn shard_topic_for_machine(machine_id: &identity::MachineId) -> String {
     let shard = saorsa_gossip_rendezvous::calculate_shard(&machine_id.0);
-    format!("x0x.machine.shard.{shard}")
+    format!("x0x.machine.shard.v2.{shard}")
 }
 
 /// Gossip topic prefix for rendezvous `ProviderSummary` advertisements.
@@ -465,6 +471,17 @@ struct IdentityAnnouncementUnsigned {
     /// This is a stable capability hint, not proof that the machine is
     /// actively coordinating a traversal right now.
     is_coordinator: Option<bool>,
+    /// Coordinator machines through which this agent is reachable.
+    ///
+    /// When `can_receive_direct == Some(false)` (typically symmetric NAT),
+    /// the advertising agent lists machine IDs of peers that can act as
+    /// coordinators for hole-punching. Empty when the agent is directly
+    /// reachable or has not yet learned any coordinator candidates.
+    reachable_via: Vec<identity::MachineId>,
+    /// Relay machines the advertising agent proposes as fallback paths.
+    ///
+    /// Used when hole-punching is not viable (extreme NAT). Empty by default.
+    relay_candidates: Vec<identity::MachineId>,
 }
 
 /// Signed identity announcement broadcast by agents.
@@ -507,6 +524,19 @@ pub struct IdentityAnnouncement {
     /// not proof that the machine is actively coordinating a traversal right
     /// now. `None` when the network is not yet started.
     pub is_coordinator: Option<bool>,
+    /// Coordinator machines through which this agent is reachable.
+    ///
+    /// Populated when the agent is behind NAT that blocks direct inbound
+    /// connections (`can_receive_direct == Some(false)`). Callers should
+    /// dial one of these coordinators first, then hole-punch via peer-ID
+    /// traversal. Empty when the agent is directly reachable or has no
+    /// coordinator candidates yet.
+    pub reachable_via: Vec<identity::MachineId>,
+    /// Relay machines the advertising agent proposes as fallback paths.
+    ///
+    /// Used when hole-punching is not viable (e.g. endpoint-dependent
+    /// mapping). Empty by default.
+    pub relay_candidates: Vec<identity::MachineId>,
 }
 
 impl IdentityAnnouncement {
@@ -523,6 +553,8 @@ impl IdentityAnnouncement {
             can_receive_direct: self.can_receive_direct,
             is_relay: self.is_relay,
             is_coordinator: self.is_coordinator,
+            reachable_via: self.reachable_via.clone(),
+            relay_candidates: self.relay_candidates.clone(),
         }
     }
 
@@ -606,6 +638,10 @@ struct MachineAnnouncementUnsigned {
     is_relay: Option<bool>,
     /// Whether the machine advertises coordinator capability to peers.
     is_coordinator: Option<bool>,
+    /// Coordinator machines through which this machine is reachable.
+    reachable_via: Vec<identity::MachineId>,
+    /// Relay machines the advertising machine proposes as fallback paths.
+    relay_candidates: Vec<identity::MachineId>,
 }
 
 /// Signed machine endpoint announcement.
@@ -636,6 +672,14 @@ pub struct MachineAnnouncement {
     pub is_relay: Option<bool>,
     /// Whether the machine advertises coordinator capability to peers.
     pub is_coordinator: Option<bool>,
+    /// Coordinator machines through which this machine is reachable.
+    ///
+    /// Populated when the machine is behind NAT that blocks direct inbound
+    /// connections. Callers should dial one of these coordinators first,
+    /// then hole-punch via peer-ID traversal.
+    pub reachable_via: Vec<identity::MachineId>,
+    /// Relay machines this machine proposes as fallback paths.
+    pub relay_candidates: Vec<identity::MachineId>,
 }
 
 impl MachineAnnouncement {
@@ -649,6 +693,8 @@ impl MachineAnnouncement {
             can_receive_direct: self.can_receive_direct,
             is_relay: self.is_relay,
             is_coordinator: self.is_coordinator,
+            reachable_via: self.reachable_via.clone(),
+            relay_candidates: self.relay_candidates.clone(),
         }
     }
 
@@ -728,6 +774,11 @@ pub struct DiscoveredAgent {
     /// Whether this agent's machine advertises coordinator capability.
     /// `None` if not reported.
     pub is_coordinator: Option<bool>,
+    /// Coordinator machines through which this agent advertises itself as
+    /// reachable when behind NAT that blocks direct inbound connections.
+    pub reachable_via: Vec<identity::MachineId>,
+    /// Relay machines this agent proposes as fallback paths.
+    pub relay_candidates: Vec<identity::MachineId>,
 }
 
 /// Cached machine endpoint data derived from signed machine announcements.
@@ -751,6 +802,11 @@ pub struct DiscoveredMachine {
     pub is_relay: Option<bool>,
     /// Whether this machine advertises coordinator capability.
     pub is_coordinator: Option<bool>,
+    /// Coordinator machines through which this machine advertises itself as
+    /// reachable when it cannot receive direct inbound connections.
+    pub reachable_via: Vec<identity::MachineId>,
+    /// Relay machines this machine proposes as fallback paths.
+    pub relay_candidates: Vec<identity::MachineId>,
     /// Agent identities currently linked to this machine.
     pub agent_ids: Vec<identity::AgentId>,
     /// Human identities currently linked to this machine by consented agent
@@ -774,6 +830,8 @@ impl DiscoveredMachine {
             can_receive_direct: announcement.can_receive_direct,
             is_relay: announcement.is_relay,
             is_coordinator: announcement.is_coordinator,
+            reachable_via: announcement.reachable_via.clone(),
+            relay_candidates: announcement.relay_candidates.clone(),
             agent_ids: Vec::new(),
             user_ids: Vec::new(),
         }
@@ -790,6 +848,8 @@ impl DiscoveredMachine {
             can_receive_direct: agent.can_receive_direct,
             is_relay: agent.is_relay,
             is_coordinator: agent.is_coordinator,
+            reachable_via: agent.reachable_via.clone(),
+            relay_candidates: agent.relay_candidates.clone(),
             agent_ids: vec![agent.agent_id],
             user_ids: agent.user_id.into_iter().collect(),
         }
@@ -829,6 +889,8 @@ fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
     machine.addresses.sort_by_key(|addr| addr.to_string());
     machine.agent_ids.sort_by_key(|id| id.0);
     machine.user_ids.sort_by_key(|id| id.0);
+    machine.reachable_via.sort_by_key(|id| id.0);
+    machine.relay_candidates.sort_by_key(|id| id.0);
 }
 
 async fn upsert_discovered_machine(
@@ -867,6 +929,11 @@ async fn upsert_discovered_machine(
                 if incoming.is_coordinator.is_some() {
                     existing.is_coordinator = incoming.is_coordinator;
                 }
+                // Coordinator / relay hint lists are LWW: the newest
+                // announcement knows best whether its set has shrunk
+                // (e.g. a coordinator peer just disconnected).
+                existing.reachable_via = incoming.reachable_via;
+                existing.relay_candidates = incoming.relay_candidates;
             }
             existing.last_seen = existing.last_seen.max(incoming.last_seen);
             for agent_id in incoming.agent_ids {
@@ -916,11 +983,69 @@ fn deserialize_machine_announcement(
         .deserialize(payload)
 }
 
+/// Compute coordinator / relay hint lists for an announcement.
+///
+/// Collects machine IDs of currently-connected peers that the machine cache
+/// marks as coordinator- or relay-capable. Deduplicated, capped to
+/// `MAX_COORDINATOR_HINTS` each, and returned in stable order.
+///
+/// Used to populate `reachable_via` / `relay_candidates` on outgoing
+/// announcements so that remote peers have concrete targets to dial when
+/// the advertising machine is NAT-locked.
+async fn collect_coordinator_hints(
+    network: &network::NetworkNode,
+    machine_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    own_machine_id: identity::MachineId,
+) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
+    /// Upper bound on hint list length. Keeps the signed payload small and
+    /// avoids amplifying gossip if we accumulate many peers.
+    const MAX_COORDINATOR_HINTS: usize = 8;
+
+    let connected = network.connected_peers().await;
+    if connected.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cache = machine_cache.read().await;
+    let mut reachable_via: Vec<identity::MachineId> = Vec::new();
+    let mut relay_candidates: Vec<identity::MachineId> = Vec::new();
+
+    for peer_id in connected {
+        let mid = identity::MachineId(peer_id.0);
+        if mid == own_machine_id {
+            continue;
+        }
+        let Some(entry) = cache.get(&mid) else {
+            continue;
+        };
+        if entry.is_coordinator == Some(true)
+            && !reachable_via.contains(&mid)
+            && reachable_via.len() < MAX_COORDINATOR_HINTS
+        {
+            reachable_via.push(mid);
+        }
+        if entry.is_relay == Some(true)
+            && !relay_candidates.contains(&mid)
+            && relay_candidates.len() < MAX_COORDINATOR_HINTS
+        {
+            relay_candidates.push(mid);
+        }
+    }
+
+    reachable_via.sort_by_key(|id| id.0);
+    relay_candidates.sort_by_key(|id| id.0);
+    (reachable_via, relay_candidates)
+}
+
 fn build_machine_announcement_for_identity(
     identity: &identity::Identity,
     addresses: Vec<std::net::SocketAddr>,
     announced_at: u64,
     assist_snapshot: Option<&AnnouncementAssistSnapshot>,
+    reachable_via: Vec<identity::MachineId>,
+    relay_candidates: Vec<identity::MachineId>,
 ) -> error::Result<MachineAnnouncement> {
     let machine_public_key = identity.machine_keypair().public_key().as_bytes().to_vec();
     let unsigned = MachineAnnouncementUnsigned {
@@ -932,6 +1057,8 @@ fn build_machine_announcement_for_identity(
         can_receive_direct: assist_snapshot.and_then(|snapshot| snapshot.can_receive_direct),
         is_relay: assist_snapshot.and_then(|snapshot| snapshot.relay_capable),
         is_coordinator: assist_snapshot.and_then(|snapshot| snapshot.coordinator_capable),
+        reachable_via,
+        relay_candidates,
     };
     let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
         error::IdentityError::Serialization(format!(
@@ -961,6 +1088,8 @@ fn build_machine_announcement_for_identity(
         can_receive_direct: unsigned.can_receive_direct,
         is_relay: unsigned.is_relay,
         is_coordinator: unsigned.is_coordinator,
+        reachable_via: unsigned.reachable_via,
+        relay_candidates: unsigned.relay_candidates,
     })
 }
 
@@ -1129,6 +1258,20 @@ impl HeartbeatContext {
         let relay_capable = assist_snapshot.relay_capable;
         let coordinator_capable = assist_snapshot.coordinator_capable;
 
+        // Only emit coordinator / relay hints when we believe remote peers
+        // cannot reach us directly. Directly-reachable peers don't need
+        // help, and advertising hints we don't need just bloats gossip.
+        let (reachable_via, relay_candidates) = if can_receive_direct == Some(true) {
+            (Vec::new(), Vec::new())
+        } else {
+            collect_coordinator_hints(
+                self.network.as_ref(),
+                &self.machine_cache,
+                self.identity.machine_id(),
+            )
+            .await
+        };
+
         // Include user identity ONLY if the user has previously consented
         // via announce_identity(true, true). This preserves the consented
         // disclosure across heartbeats without ever escalating on its own.
@@ -1158,6 +1301,8 @@ impl HeartbeatContext {
             can_receive_direct,
             is_relay: relay_capable,
             is_coordinator: coordinator_capable,
+            reachable_via: reachable_via.clone(),
+            relay_candidates: relay_candidates.clone(),
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -1190,6 +1335,8 @@ impl HeartbeatContext {
             can_receive_direct,
             is_relay: relay_capable,
             is_coordinator: coordinator_capable,
+            reachable_via: reachable_via.clone(),
+            relay_candidates: relay_candidates.clone(),
         };
         tracing::debug!(
             target: "x0x::discovery",
@@ -1202,6 +1349,8 @@ impl HeartbeatContext {
             coordinator_capable = ?announcement.is_coordinator,
             relay_active = ?assist_snapshot.relay_active,
             coordinator_active = ?assist_snapshot.coordinator_active,
+            reachable_via_count = announcement.reachable_via.len(),
+            relay_candidate_count = announcement.relay_candidates.len(),
             "publishing identity announcement"
         );
 
@@ -1210,6 +1359,8 @@ impl HeartbeatContext {
             announcement.addresses.clone(),
             announced_at,
             Some(&assist_snapshot),
+            reachable_via.clone(),
+            relay_candidates.clone(),
         )?;
         tracing::debug!(
             target: "x0x::discovery",
@@ -1289,6 +1440,8 @@ impl HeartbeatContext {
             can_receive_direct: announcement.can_receive_direct,
             is_relay: announcement.is_relay,
             is_coordinator: announcement.is_coordinator,
+            reachable_via: announcement.reachable_via.clone(),
+            relay_candidates: announcement.relay_candidates.clone(),
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         self.cache
@@ -1937,6 +2090,37 @@ impl Agent {
         //    authenticated peer ID with known addresses from x0x discovery /
         //    imported cards, unlocking the full direct → hole-punch → relay path.
         if info.needs_coordination() || !info.should_attempt_direct() {
+            // Prefer coordinators the target has explicitly named in its
+            // announcement (`reachable_via`). Seed transport hints for each
+            // so ant-quic picks whichever is already connected (or can reach
+            // one) as the coordinator peer for NAT punch-timing.
+            for coord in &info.reachable_via {
+                if let Some(coord_machine) = self
+                    .machine_discovery_cache
+                    .read()
+                    .await
+                    .get(coord)
+                    .cloned()
+                {
+                    let coord_peer = ant_quic::PeerId(coord_machine.machine_id.0);
+                    let coord_addrs = coord_machine.addresses.clone();
+                    if !coord_addrs.is_empty() {
+                        if let Err(e) = network
+                            .upsert_peer_hints(coord_peer, coord_addrs, None)
+                            .await
+                        {
+                            tracing::debug!(
+                                target: "x0x::connect",
+                                %agent_prefix,
+                                coord_prefix = %network::hex_prefix(&coord.0, 4),
+                                error = %e,
+                                "failed to seed coordinator hints from reachable_via"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Use the machine_id from discovery cache as the peer_id hint.
             // NOTE: This may be a zeroed placeholder if the peer was discovered via
             // gossip and hasn't been verified via QUIC handshake yet.
@@ -2816,11 +3000,29 @@ impl Agent {
         // analysis report under tests/proof-reports/ for details.
         addresses.retain(|a| is_publicly_advertisable(*a));
 
+        // Emit coordinator / relay hints only when direct inbound is not
+        // known to work. See HeartbeatContext::announce() for rationale.
+        let (reachable_via, relay_candidates) = if assist_snapshot.can_receive_direct == Some(true)
+        {
+            (Vec::new(), Vec::new())
+        } else if let Some(network) = self.network.as_ref() {
+            collect_coordinator_hints(
+                network.as_ref(),
+                &self.machine_discovery_cache,
+                self.machine_id(),
+            )
+            .await
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         let announcement = self.build_identity_announcement_with_addrs(
             include_user_identity,
             human_consent,
             addresses,
             Some(&assist_snapshot),
+            reachable_via,
+            relay_candidates,
         )?;
         tracing::debug!(
             target: "x0x::discovery",
@@ -2841,6 +3043,8 @@ impl Agent {
             announcement.addresses.clone(),
             announcement.announced_at,
             Some(&assist_snapshot),
+            announcement.reachable_via.clone(),
+            announcement.relay_candidates.clone(),
         )?;
         tracing::debug!(
             target: "x0x::discovery",
@@ -2851,6 +3055,8 @@ impl Agent {
             can_receive_direct = ?machine_announcement.can_receive_direct,
             relay_capable = ?machine_announcement.is_relay,
             coordinator_capable = ?machine_announcement.is_coordinator,
+            reachable_via_count = machine_announcement.reachable_via.len(),
+            relay_candidate_count = machine_announcement.relay_candidates.len(),
             "publishing machine announcement"
         );
         let machine_payload =
@@ -2934,6 +3140,8 @@ impl Agent {
             can_receive_direct: announcement.can_receive_direct,
             is_relay: announcement.is_relay,
             is_coordinator: announcement.is_coordinator,
+            reachable_via: announcement.reachable_via.clone(),
+            relay_candidates: announcement.relay_candidates.clone(),
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -3430,6 +3638,8 @@ impl Agent {
                     can_receive_direct: announcement.can_receive_direct,
                     is_relay: announcement.is_relay,
                     is_coordinator: announcement.is_coordinator,
+                    reachable_via: announcement.reachable_via.clone(),
+                    relay_candidates: announcement.relay_candidates.clone(),
                 };
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
                 cache
@@ -3447,6 +3657,8 @@ impl Agent {
                     can_receive_direct = ?announcement.can_receive_direct,
                     relay_capable = ?announcement.is_relay,
                     coordinator_capable = ?announcement.is_coordinator,
+                    reachable_via_count = announcement.reachable_via.len(),
+                    relay_candidate_count = announcement.relay_candidates.len(),
                     "cached verified identity announcement"
                 );
 
@@ -3570,6 +3782,8 @@ impl Agent {
             human_consent,
             self.announcement_addresses(),
             None,
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -3579,6 +3793,8 @@ impl Agent {
         human_consent: bool,
         addresses: Vec<std::net::SocketAddr>,
         assist_snapshot: Option<&AnnouncementAssistSnapshot>,
+        reachable_via: Vec<identity::MachineId>,
+        relay_candidates: Vec<identity::MachineId>,
     ) -> error::Result<IdentityAnnouncement> {
         if include_user_identity && !human_consent {
             return Err(error::IdentityError::Storage(std::io::Error::other(
@@ -3621,6 +3837,8 @@ impl Agent {
             can_receive_direct: assist_snapshot.and_then(|snapshot| snapshot.can_receive_direct),
             is_relay: assist_snapshot.and_then(|snapshot| snapshot.relay_capable),
             is_coordinator: assist_snapshot.and_then(|snapshot| snapshot.coordinator_capable),
+            reachable_via,
+            relay_candidates,
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -3653,6 +3871,8 @@ impl Agent {
             can_receive_direct: unsigned.can_receive_direct,
             is_relay: unsigned.is_relay,
             is_coordinator: unsigned.is_coordinator,
+            reachable_via: unsigned.reachable_via,
+            relay_candidates: unsigned.relay_candidates,
         })
     }
 
@@ -4420,6 +4640,8 @@ impl Agent {
                                 can_receive_direct: ann.can_receive_direct,
                                 is_relay: ann.is_relay,
                                 is_coordinator: ann.is_coordinator,
+                                reachable_via: ann.reachable_via.clone(),
+                                relay_candidates: ann.relay_candidates.clone(),
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
@@ -4457,6 +4679,8 @@ impl Agent {
                     can_receive_direct: None,
                     is_relay: None,
                     is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
                 });
             return Ok(Some(addrs));
         }
@@ -4628,6 +4852,8 @@ impl Agent {
             self.announcement_addresses(),
             Self::unix_timestamp_secs(),
             None,
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -6523,6 +6749,8 @@ mod tests {
             can_receive_direct: Some(true),
             is_relay: Some(false),
             is_coordinator: Some(true),
+            reachable_via: vec![MachineId([5u8; 32])],
+            relay_candidates: vec![MachineId([6u8; 32])],
         };
         let bytes = bincode::serialize(&unsigned).expect("serialize");
         let decoded: IdentityAnnouncementUnsigned =
@@ -6531,6 +6759,8 @@ mod tests {
         assert_eq!(decoded.can_receive_direct, Some(true));
         assert_eq!(decoded.is_relay, Some(false));
         assert_eq!(decoded.is_coordinator, Some(true));
+        assert_eq!(decoded.reachable_via, vec![MachineId([5u8; 32])]);
+        assert_eq!(decoded.relay_candidates, vec![MachineId([6u8; 32])]);
     }
 
     /// An announcement with None for all NAT fields (e.g. network not started)
@@ -6551,6 +6781,8 @@ mod tests {
             can_receive_direct: None,
             is_relay: None,
             is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
         };
         let bytes = bincode::serialize(&unsigned).expect("serialize");
         let decoded: IdentityAnnouncementUnsigned =
@@ -6559,5 +6791,47 @@ mod tests {
         assert!(decoded.can_receive_direct.is_none());
         assert!(decoded.is_relay.is_none());
         assert!(decoded.is_coordinator.is_none());
+        assert!(decoded.reachable_via.is_empty());
+        assert!(decoded.relay_candidates.is_empty());
+    }
+
+    /// Wire format v2 populates coordinator-hint fields: full round-trip and
+    /// deterministic signing.
+    #[test]
+    fn identity_announcement_reachable_via_round_trip() {
+        use identity::{AgentId, MachineId};
+
+        let coord_a = MachineId([0xAAu8; 32]);
+        let coord_b = MachineId([0xBBu8; 32]);
+        let unsigned = IdentityAnnouncementUnsigned {
+            agent_id: AgentId([9u8; 32]),
+            machine_id: MachineId([8u8; 32]),
+            user_id: None,
+            agent_certificate: None,
+            machine_public_key: vec![0u8; 10],
+            addresses: Vec::new(),
+            announced_at: 555,
+            nat_type: Some("Symmetric".to_string()),
+            can_receive_direct: Some(false),
+            is_relay: Some(false),
+            is_coordinator: Some(false),
+            reachable_via: vec![coord_a, coord_b],
+            relay_candidates: vec![coord_a],
+        };
+        let bytes = bincode::serialize(&unsigned).expect("serialize");
+        let decoded: IdentityAnnouncementUnsigned =
+            bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded.reachable_via, vec![coord_a, coord_b]);
+        assert_eq!(decoded.relay_candidates, vec![coord_a]);
+
+        // Mutating reachable_via MUST invalidate the outer sig — signing over
+        // the unsigned form guarantees integrity. Here we only verify the
+        // bincode is stable; cryptographic coverage lives in the existing
+        // `identity_announcement_machine_signature_verifies` tests.
+        let re_encoded = bincode::serialize(&decoded).expect("re-serialize");
+        assert_eq!(
+            bytes, re_encoded,
+            "canonical bincode round-trip must be stable"
+        );
     }
 }

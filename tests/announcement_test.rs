@@ -128,6 +128,7 @@ async fn announcement_timestamp_non_zero() {
 /// Here we verify the struct accepts and round-trips NAT fields correctly.
 #[test]
 fn announcement_nat_fields_round_trip() {
+    let coord = x0x::identity::MachineId([9u8; 32]);
     let ann = IdentityAnnouncement {
         agent_id: x0x::identity::AgentId([1u8; 32]),
         machine_id: x0x::identity::MachineId([2u8; 32]),
@@ -141,6 +142,8 @@ fn announcement_nat_fields_round_trip() {
         can_receive_direct: Some(true),
         is_relay: Some(false),
         is_coordinator: Some(true),
+        reachable_via: vec![coord],
+        relay_candidates: vec![coord],
     };
 
     let bytes = bincode::serialize(&ann).unwrap();
@@ -150,6 +153,8 @@ fn announcement_nat_fields_round_trip() {
     assert_eq!(decoded.can_receive_direct, Some(true));
     assert_eq!(decoded.is_relay, Some(false));
     assert_eq!(decoded.is_coordinator, Some(true));
+    assert_eq!(decoded.reachable_via, vec![coord]);
+    assert_eq!(decoded.relay_candidates, vec![coord]);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +212,8 @@ async fn discovery_cache_insert_and_retrieve() {
         can_receive_direct: Some(true),
         is_relay: None,
         is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
     };
 
     agent
@@ -252,6 +259,8 @@ async fn reachability_info_from_discovery_cache() {
         can_receive_direct: Some(false),
         is_relay: None,
         is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
     };
 
     agent.insert_discovered_agent_for_testing(fake).await;

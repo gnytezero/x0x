@@ -71,6 +71,8 @@ proptest! {
                 can_receive_direct: None,
                 is_relay: None,
                 is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
             },
         );
 

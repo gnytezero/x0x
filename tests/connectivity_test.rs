@@ -51,6 +51,8 @@ fn fake_discovered(
         can_receive_direct,
         is_relay,
         is_coordinator,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
     }
 }
 

@@ -8,6 +8,7 @@
 //! 2. **Coordinated** — hole-punching via a common coordinator node.
 //! 3. **Unreachable** — no viable path found with current information.
 
+use crate::identity::MachineId;
 use crate::{DiscoveredAgent, DiscoveredMachine};
 
 /// Summarises the connectivity properties of a discovered agent.
@@ -33,6 +34,13 @@ pub struct ReachabilityInfo {
     /// Whether the agent advertises coordinator capability.
     /// `None` when not reported.
     pub is_coordinator: Option<bool>,
+    /// Coordinator machines through which the advertising peer is reachable.
+    ///
+    /// Prefer these when `can_receive_direct == Some(false)` — the peer has
+    /// explicitly named who can hole-punch for them.
+    pub reachable_via: Vec<MachineId>,
+    /// Relay machines the peer proposes as a fallback.
+    pub relay_candidates: Vec<MachineId>,
 }
 
 impl ReachabilityInfo {
@@ -45,6 +53,8 @@ impl ReachabilityInfo {
             can_receive_direct: agent.can_receive_direct,
             is_relay: agent.is_relay,
             is_coordinator: agent.is_coordinator,
+            reachable_via: agent.reachable_via.clone(),
+            relay_candidates: agent.relay_candidates.clone(),
         }
     }
 
@@ -57,6 +67,8 @@ impl ReachabilityInfo {
             can_receive_direct: machine.can_receive_direct,
             is_relay: machine.is_relay,
             is_coordinator: machine.is_coordinator,
+            reachable_via: machine.reachable_via.clone(),
+            relay_candidates: machine.relay_candidates.clone(),
         }
     }
 
@@ -151,6 +163,8 @@ mod tests {
             can_receive_direct,
             is_relay,
             is_coordinator,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
         }
     }
 
