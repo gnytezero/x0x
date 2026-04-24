@@ -380,6 +380,11 @@ enum AgentsSub {
         /// Agent ID (hex).
         agent_id: String,
     },
+    /// Resolve an agent to its current discovered machine endpoint.
+    Machine {
+        /// Agent ID (hex).
+        agent_id: String,
+    },
     /// List agents belonging to a user.
     ByUser {
         /// User ID (hex).
@@ -435,6 +440,30 @@ enum ContactsSub {
 
 #[derive(Subcommand)]
 enum MachinesSub {
+    /// List discovered machine endpoints.
+    Discovered {
+        /// Include TTL-expired machines.
+        #[arg(long)]
+        unfiltered: bool,
+    },
+    /// Get details for a discovered machine endpoint.
+    Get {
+        /// Machine ID (hex).
+        machine_id: String,
+        /// Wait for the machine to appear before returning.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List machine endpoints belonging to a user.
+    ByUser {
+        /// User ID (hex).
+        user_id: String,
+    },
+    /// Connect to a discovered machine endpoint.
+    Connect {
+        /// Machine ID (hex).
+        machine_id: String,
+    },
     /// List machines for a contact.
     List {
         /// Agent ID (hex).
@@ -1100,6 +1129,9 @@ async fn run(
             Some(AgentsSub::Reachability { agent_id }) => {
                 commands::discovery::reachability(&client, &agent_id).await
             }
+            Some(AgentsSub::Machine { agent_id }) => {
+                commands::discovery::machine(&client, &agent_id).await
+            }
             Some(AgentsSub::ByUser { user_id }) => {
                 commands::discovery::by_user(&client, &user_id).await
             }
@@ -1136,6 +1168,16 @@ async fn run(
             }
         },
         Commands::Machines { sub } => match sub {
+            MachinesSub::Discovered { unfiltered } => {
+                commands::machines::discovered(&client, unfiltered).await
+            }
+            MachinesSub::Get { machine_id, wait } => {
+                commands::machines::get_discovered(&client, &machine_id, wait).await
+            }
+            MachinesSub::ByUser { user_id } => commands::machines::by_user(&client, &user_id).await,
+            MachinesSub::Connect { machine_id } => {
+                commands::machines::connect(&client, &machine_id).await
+            }
             MachinesSub::List { agent_id } => commands::machines::list(&client, &agent_id).await,
             MachinesSub::Add {
                 agent_id,
@@ -1491,6 +1533,7 @@ x0x (v{VERSION})
 |   +-- agents get         Get agent details
 |   +-- agents find        Find an agent (3-stage: cache/shard/rendezvous)
 |   +-- agents reachability  Check if agent is directly reachable
+|   +-- agents machine     Resolve agent to current machine endpoint
 |   +-- agents by-user     Find agents by user ID
 |
 +-- Contacts & Trust
@@ -1502,6 +1545,10 @@ x0x (v{VERSION})
 |   +-- contacts revocations  List revocations
 |   +-- trust set          Quick-set trust level
 |   +-- trust evaluate     Evaluate agent+machine trust
+|   +-- machines discovered  List discovered machine endpoints
+|   +-- machines get       Get discovered machine endpoint details
+|   +-- machines by-user   Find machine endpoints by user ID
+|   +-- machines connect   Connect to a discovered machine
 |   +-- machines list      List machine records for contact
 |   +-- machines add       Add machine record
 |   +-- machines remove    Remove machine record

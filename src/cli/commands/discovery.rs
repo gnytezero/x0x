@@ -52,6 +52,14 @@ pub async fn reachability(client: &DaemonClient, agent_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `x0x agents machine` — GET /agents/:agent_id/machine
+pub async fn machine(client: &DaemonClient, agent_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get(&format!("/agents/{agent_id}/machine")).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x agents by-user` — GET /users/:user_id/agents
 pub async fn by_user(client: &DaemonClient, user_id: &str) -> Result<()> {
     client.ensure_running().await?;
