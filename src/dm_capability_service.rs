@@ -1,6 +1,6 @@
 //! Runtime service that publishes this agent's DM capability advert to the
 //! mesh-wide `x0x/caps/v1` topic and consumes peers' adverts into a
-//! shared [`CapabilityStore`].
+//! shared [`crate::dm_capability::CapabilityStore`].
 
 use crate::dm::DmCapabilities;
 use crate::dm_capability::{
