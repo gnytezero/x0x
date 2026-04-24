@@ -19,6 +19,7 @@ GET /presence
 
 # ── SSE stream — consumed via EventSource, not the api() helper. ──
 GET /presence/events
+GET /peers/events
 
 # ── Raw text response — admin panel calls fetch() directly because
 # api() always parses JSON. Same endpoint, different helper. ──

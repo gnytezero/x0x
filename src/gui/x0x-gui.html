@@ -510,7 +510,8 @@ tr:hover td{background:rgba(255,255,255,.01)}
   #sidebar{position:fixed;left:-300px;top:0;bottom:0;width:280px;z-index:100;transition:left var(--t-slow);border-right:1px solid var(--bd)}
   #sidebar.open{left:0;box-shadow:4px 0 24px rgba(0,0,0,.5)}
   #main{grid-row:1!important;grid-column:1!important}
-  #detail{position:fixed;right:0;top:0;bottom:32px;width:100%;z-index:99;background:var(--bg2)}
+  #detail{position:fixed;right:0;top:0;bottom:32px;width:100%;z-index:99;background:var(--bg2);transform:translateX(100%);visibility:hidden;pointer-events:none}
+  #app.detail-open #detail{transform:translateX(0);visibility:visible;pointer-events:auto}
   #hamburger{display:block}
   .g2,.g3,.g4{grid-template-columns:1fr}
   .kanban{flex-direction:column}
@@ -2616,12 +2617,128 @@ function renderNetwork(){
     <div id="g-note" style="margin-top:var(--sp2);color:var(--tx2);font-size:11px"></div>
   </div>
   <h3>Peers</h3>
-  <div class="card mb"><table><thead><tr><th>Peer ID</th><th>Address</th><th>RTT</th><th>State</th></tr></thead><tbody id="n-peers"></tbody></table></div>
+  <div class="card mb">
+    <div class="row mb" style="justify-content:flex-end">
+      <label style="font-size:12px;color:var(--tx2)"><input type="checkbox" onchange="togglePeerEvents(this.checked)"> Live peer events</label>
+    </div>
+    <table><thead><tr><th>Peer ID</th><th>Health</th><th>Probe RTT</th><th>State</th></tr></thead><tbody id="n-peers"></tbody></table>
+    <div id="n-peer-events" style="margin-top:var(--sp2);font-size:11px;color:var(--tx3);max-height:96px;overflow:auto"></div>
+  </div>
+  <h3>Discovered Machines</h3>
+  <div class="card mb2">
+    <div class="row mb" style="gap:var(--sp2)">
+      <input id="n-machine-id" placeholder="Machine ID" style="flex:1;font-size:11px">
+      <button onclick="fetchMachineDetail()">Details</button>
+      <button onclick="connectMachineInput()">Connect</button>
+      <button onclick="pollMachineDiscovery(true)">Refresh</button>
+    </div>
+    <div class="row mb" style="gap:var(--sp2)">
+      <input id="n-user-id" placeholder="User ID" style="flex:1;font-size:11px">
+      <button onclick="fetchUserMachines()">User machines</button>
+    </div>
+    <div id="n-machines" style="font-size:12px;color:var(--tx2)">—</div>
+    <pre id="n-machine-out" style="margin-top:var(--sp3);font-size:11px;color:var(--tx3);white-space:pre-wrap;max-height:180px;overflow:auto"></pre>
+  </div>
   <h3>Bootstrap Cache</h3>
   <div class="card" id="n-cache" style="font-size:12px">—</div>`;
 }
 
 async function mountNetwork(){pollNetworkView()}
+
+let peerEventsSse=null;
+
+function peerHealthText(h){
+  if(!h)return 'Unavailable';
+  if(h.ok)return h.health||'Healthy';
+  return h.error||'Unavailable';
+}
+
+function probeText(p){
+  if(!p)return '—';
+  if(p.ok&&p.rtt_ms!=null)return p.rtt_ms+' ms';
+  if(p.ok&&p.rtt_us!=null)return p.rtt_us+' us';
+  if(p.ok)return 'OK';
+  return p.error||'Probe failed';
+}
+
+function setMachineOut(obj){
+  const el=document.getElementById('n-machine-out');
+  if(el)el.textContent=typeof obj==='string'?obj:JSON.stringify(obj,null,2);
+}
+
+function renderMachineList(machines){
+  const el=document.getElementById('n-machines');if(!el)return;
+  if(!machines.length){el.innerHTML='<span style="color:var(--tx3)">No discovered machines.</span>';return}
+  el.innerHTML=`<table><thead><tr><th>Machine ID</th><th>Addresses</th><th>Agents</th><th></th></tr></thead><tbody>${
+    machines.map(m=>`<tr>
+      <td class="aid-short" title="${esc(m.machine_id)}">${short(m.machine_id,14)}</td>
+      <td>${(m.addresses||[]).map(esc).join('<br>')||'—'}</td>
+      <td>${(m.agent_ids||[]).map(a=>short(a,8)).join(', ')||'—'}</td>
+      <td><button onclick="fetchMachineDetailId('${escJs(m.machine_id)}')">Details</button> <button onclick="connectMachineId('${escJs(m.machine_id)}')">Connect</button></td>
+    </tr>`).join('')
+  }</tbody></table>`;
+}
+
+async function pollMachineDiscovery(showToast){
+  const r=await api('/machines/discovered');
+  if(r&&r.machines){
+    renderMachineList(r.machines);
+    if(showToast)toast('Machine discovery refreshed','success');
+  }else if(showToast){
+    toast('Machine discovery failed','error');
+  }
+}
+
+async function fetchMachineDetail(){
+  const id=(document.getElementById('n-machine-id').value||'').trim();
+  if(!id){setMachineOut('Enter a machine ID');return}
+  await fetchMachineDetailId(id);
+}
+
+async function fetchMachineDetailId(machineId){
+  const r=await api('/machines/discovered/'+encodeURIComponent(machineId));
+  setMachineOut(r||'No response');
+}
+
+async function connectMachineInput(){
+  const id=(document.getElementById('n-machine-id').value||'').trim();
+  if(!id){setMachineOut('Enter a machine ID');return}
+  await connectMachineId(id);
+}
+
+async function connectMachineId(machineId){
+  const r=await api('/machines/connect',{method:'POST',body:JSON.stringify({machine_id:machineId})});
+  setMachineOut(r||'No response');
+  if(r&&r.ok)toast('Machine connect: '+(r.outcome||'ok'),'success');
+}
+
+async function fetchUserMachines(){
+  const uid=(document.getElementById('n-user-id').value||'').trim();
+  if(!uid){setMachineOut('Enter a user ID');return}
+  const r=await api('/users/'+encodeURIComponent(uid)+'/machines');
+  setMachineOut(r||'No response');
+  if(r&&r.machines)renderMachineList(r.machines);
+}
+
+function togglePeerEvents(on){
+  if(peerEventsSse){peerEventsSse.close();peerEventsSse=null}
+  const out=document.getElementById('n-peer-events');
+  if(!on){if(out)out.innerHTML='';return}
+  try{
+    const url=BASE+'/peers/events'+(API_TOKEN?'?token='+encodeURIComponent(API_TOKEN):'');
+    peerEventsSse=new EventSource(url);
+    peerEventsSse.onmessage=e=>{
+      if(!out)return;
+      const line=document.createElement('div');
+      line.textContent=new Date().toLocaleTimeString()+' '+e.data;
+      out.prepend(line);
+      while(out.children.length>20)out.removeChild(out.lastChild);
+    };
+    peerEventsSse.onerror=()=>{if(out)out.innerHTML='<span style="color:var(--am)">peer event stream unavailable</span>'};
+  }catch(e){
+    if(out)out.innerHTML='<span style="color:var(--rd)">failed to open peer events</span>';
+  }
+}
 
 async function pollNetworkView(){
   const s=await api('/network/status');
@@ -2652,8 +2769,17 @@ async function pollNetworkView(){
   const p=await api('/peers');
   if(p&&p.peers){
     const tb=document.getElementById('n-peers');
-    if(tb)tb.innerHTML=p.peers.map(x=>`<tr><td class="aid-short">${short(x.id)}</td><td>—</td><td>—</td><td><span class="trust trust-trusted" style="font-size:9px">connected</span></td></tr>`).join('');
+    if(tb){
+      const rows=[];
+      for(const x of p.peers){
+        const h=await api('/peers/'+encodeURIComponent(x.id)+'/health');
+        const pr=await api('/peers/'+encodeURIComponent(x.id)+'/probe',{method:'POST'});
+        rows.push(`<tr><td class="aid-short" title="${esc(x.id)}">${short(x.id)}</td><td title="${esc(peerHealthText(h))}">${esc(short(peerHealthText(h),42))}</td><td>${esc(probeText(pr))}</td><td><span class="trust trust-trusted" style="font-size:9px">connected</span></td></tr>`);
+      }
+      tb.innerHTML=rows.join('');
+    }
   }
+  await pollMachineDiscovery(false);
   const c=await api('/network/bootstrap-cache');
   if(c&&c.ok){
     const el=document.getElementById('n-cache');
