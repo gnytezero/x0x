@@ -1,6 +1,10 @@
 # Identity Architecture
 
-x0x uses a three-layer identity model where each layer builds on the one below it.
+x0x uses a three-layer identity model. The layers are separate keys with different operational roles:
+
+- machine identity authenticates transport;
+- agent identity names the logical agent;
+- user identity optionally binds a human operator to one or more agents.
 
 ## Layer 0: Machine Identity
 
@@ -10,7 +14,7 @@ A `MachineId` is derived from an ML-DSA-65 public key:
 MachineId = SHA-256(ML-DSA-65 public key bytes)
 ```
 
-The key pair is stored in `~/.x0x/machine.key` (bincode format). It is auto-generated on first run and never leaves the machine. The `MachineId` is used as the QUIC transport identity — the same key pair is passed to `ant-quic::NodeConfig` so that the QUIC `PeerId` equals the `MachineId`.
+The key pair is stored in `~/.x0x/machine.key` (bincode format). It is auto-generated on first run and should not leave the machine during normal operation. The `MachineId` is used as the QUIC transport identity — the same key pair is passed to `ant-quic::NodeConfig` so that the QUIC `PeerId` equals the `MachineId`.
 
 **Purpose**: Hardware-pinned identity for NAT traversal and transport authentication.
 
@@ -22,19 +26,19 @@ An `AgentId` is derived from a separate ML-DSA-65 key pair:
 AgentId = SHA-256(ML-DSA-65 public key bytes)
 ```
 
-Stored in `~/.x0x/agent.key`. Portable — can be copied to another machine to run the same logical agent on different hardware.
+Stored in `~/.x0x/agent.key`. Portable — can be copied to another machine to run the same logical agent on different hardware. Moving only this key preserves `agent_id` but normally changes `machine_id`.
 
 **Purpose**: Persistent agent identity that survives hardware changes.
 
 ## Layer 2: User Identity (optional)
 
-A `UserId` binds a human identity to an agent via an `AgentCertificate`:
+A `UserId` is derived from a user key and can bind a human identity to an agent via an `AgentCertificate`:
 
 ```
-AgentCertificate = sign(UserKeypair, (AgentId, UserId))
+AgentCertificate = sign(UserKeypair, context || user_public_key || agent_public_key || issued_at)
 ```
 
-Never auto-generated. Opt-in only (`with_user_key()`). When included in an announcement, both the certificate and user ID are present or neither is.
+Never auto-generated. Opt-in only (`with_user_key()` or `with_user_key_path()`). When included in an announcement, both the certificate and user ID are present or neither is. Announcement APIs also require explicit human consent before disclosing `user_id`.
 
 **Purpose**: Optional human accountability layer.
 
@@ -76,6 +80,8 @@ The announcement is signed by the machine key to bind the portable agent identit
 3. Verify `machine_signature` over the serialized unsigned fields
 4. If `user_id` is present, verify `agent_certificate` and check its `agent_id` and `user_id` match
 
+This split is intentional: QUIC authenticates the machine, while identity announcements bind that authenticated machine to a portable agent. Direct-message receivers treat a claimed `AgentId` as verified only when discovery already contains a matching `AgentId -> MachineId` binding.
+
 ## Trust Evaluation
 
 The identity listener applies `TrustEvaluator` to every incoming announcement:
@@ -103,8 +109,15 @@ All key files use bincode 1.x format:
 ~/.x0x/
   machine.key   # MachineKeypair: {public_key: [u8], secret_key: [u8]}
   agent.key     # AgentKeypair:   {public_key: [u8], secret_key: [u8]}
-  user.key      # UserKeypair:    {public_key: [u8], secret_key: [u8]}
+  user.key      # UserKeypair:    {public_key: [u8], secret_key: [u8]}, optional
+  agent.cert    # AgentCertificate binding user_public_key to agent_public_key, optional
   contacts.json # ContactStore:   JSON with contacts array
 ```
 
 The contacts file uses JSON (not bincode) for human readability and editability.
+
+The default unnamed daemon uses `~/.x0x` for identity keys. Named instances use matching identity directories such as `~/.x0x-alice`, keeping their machine and agent identities separate from the default instance.
+
+## Architecture Decision
+
+See [ADR 0007: Three-Layer Identity Model](./adr/0007-three-layer-identity-model.md) for the accepted decision and operational rules.
