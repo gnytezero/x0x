@@ -37,6 +37,24 @@ use std::collections::HashSet;
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tower_http::cors::CorsLayer;
+#[cfg(feature = "profile-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+// jemalloc as the daemon's global allocator. Eliminates the 50 MB+
+// heap-to-RSS amplification observed under glibc malloc, where retired
+// arenas held pages indefinitely. dirty_decay_ms / muzzy_decay_ms are
+// configured via MALLOC_CONF below for aggressive page return.
+#[cfg(all(feature = "jemalloc", not(feature = "profile-heap")))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "jemalloc", not(feature = "profile-heap")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true\0";
+
 use x0x::contacts::{ContactStore, IdentityType, MachineRecord, TrustLevel};
 use x0x::identity::AgentId;
 use x0x::identity::MachineId;
@@ -812,6 +830,16 @@ struct TaskEntry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // dhat heap profiler. Each daemon writes its own file so multi-daemon
+    // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
+    #[cfg(feature = "profile-heap")]
+    let _dhat_profiler = {
+        let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
+        eprintln!("dhat: writing heap dump to {} on exit", path);
+        dhat::Profiler::builder().file_name(&path).build()
+    };
+
     let args: Vec<String> = std::env::args().collect();
 
     // Handle --version and --help before anything else

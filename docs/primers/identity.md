@@ -105,6 +105,82 @@ If you want the exact same machine identity too, you need the machine key as wel
 - The data directory and identity directory are different things: the data directory holds daemon state like `api.port`, `api-token`, contacts, and group metadata; the identity directory holds the keys that define who the agent is.
 - `agent.cert` is optional. If a configured user key exists, x0x checks whether the certificate binds that user key to the current agent key and reissues it if the binding is stale.
 
+## Identity Lifecycle
+
+The complete lifecycle from key generation to network participation:
+
+### 1. Key Generation (First Run)
+
+```
+~/.x0x/machine.key   ← auto-generated (ML-DSA-65 keypair)
+~/.x0x/agent.key     ← auto-generated (ML-DSA-65 keypair)
+```
+
+The daemon generates both keys on first startup. No user key is created.
+
+### 2. Certificate Creation (Optional)
+
+If a user key is configured:
+
+```
+~/.x0x/user.key      ← provided by user (NEVER auto-generated)
+~/.x0x/agent.cert    ← generated from user.key + agent.key
+```
+
+The certificate binds the user identity to the agent identity via cryptographic signature.
+
+### 3. Announcement Signing
+
+On heartbeat or explicit announce:
+
+1. Build `IdentityAnnouncement` with current agent_id, machine_id, addresses
+2. Serialize unsigned fields
+3. Sign with machine key → `machine_signature`
+4. If user key configured and consent given, include `user_id` and `agent_certificate`
+5. Publish to gossip topics
+
+### 4. Network Discovery
+
+Other agents receive the announcement:
+
+1. Verify machine signature
+2. Evaluate trust policy
+3. Cache in discovery cache (if not blocked)
+4. Rebroadcast to peers (epidemic flood)
+
+### 5. Connection Establishment
+
+When agent A wants to message agent B:
+
+1. Look up B in discovery cache
+2. Evaluate trust for (B.agent_id, B.machine_id)
+3. Seed transport peer hints
+4. Attempt QUIC connection
+5. Exchange messages over authenticated transport
+
+## Consent Mechanism Details
+
+User identity disclosure requires explicit consent at multiple levels:
+
+### API Level
+
+The `announce_identity()` endpoint requires:
+- `include_user_identity: true` — includes user_id in announcement
+- `human_consent: true` — confirms human operator consents to disclosure
+
+Both must be true for user identity to appear in announcements.
+
+### Sticky Consent
+
+Once consent is given, it persists across heartbeats via an internal `AtomicBool`. This means:
+- You don't need to call `announce_identity()` before every heartbeat
+- Consent lasts until daemon restart
+- Consent is NOT automatically escalated — it must be explicitly requested
+
+### Certificate Validation
+
+The `agent.cert` file is validated at announcement time, not just at creation. If the certificate doesn't match the current user key and agent key, it is treated as stale and a new certificate is issued.
+
 ## Current limits
 
 - No identity recovery if you lose the keys.
@@ -116,5 +192,6 @@ If you want the exact same machine identity too, you need the machine key as wel
 
 - [Identity architecture](../identity-architecture.md)
 - [ADR 0007: Three-Layer Identity Model](../adr/0007-three-layer-identity-model.md)
+- [ADR 0008: Trust Evaluation System](../adr/0008-trust-evaluation-system.md)
 - [API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)
 - [Source](https://github.com/saorsa-labs/x0x)

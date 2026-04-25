@@ -604,6 +604,40 @@ Metrics (behind `features = ["metrics"]`):
 - [ ] Deprecation notice in x0x 0.18.1.
 - [ ] Hard cutover in x0x 0.20.0.
 
+## Agent-to-Machine Resolution
+
+The DM system maintains its own agent→machine mapping separate from the discovery cache. This is necessary because:
+
+1. **Discovery cache is ephemeral** — entries may be evicted or stale
+2. **DM requires active connections** — we need to know which machine is currently reachable
+3. **One agent may have multiple machines** — the discovery cache tracks all, DM needs the active one
+
+### Resolution Flow
+
+When `send_direct` is called with a recipient `AgentId`:
+
+1. **Check DM registry** — `direct_messaging.get_machine_id(agent_id)` returns the last known MachineId
+2. **Check discovery cache** — If no DM mapping, look up in `identity_discovery_cache`
+3. **Check active connections** — `network.is_connected(machine_id)` verifies QUIC connection exists
+4. **Attempt connection** — If not connected, use `connect_to_agent()` with reachability heuristics
+
+### DM Registry Maintenance
+
+The DM registry is updated in several contexts:
+
+- **Identity announcement receipt** — `register_agent(agent_id, machine_id)` maps announced agent to machine
+- **Connection establishment** — `mark_connected(agent_id, machine_id)` confirms active QUIC connection
+- **Direct message receipt** — Inbound messages on a QUIC stream update the mapping
+- **Connection loss** — Transport disconnects invalidate the mapping
+
+### Why Separate from Discovery Cache
+
+The discovery cache answers "what do we know about this agent?" while the DM registry answers "which machine should we send to right now?". The separation allows:
+
+- Discovery to cache multiple machines per agent (for reachability queries)
+- DM to track exactly one active machine per agent (for message routing)
+- Independent TTL policies — discovery entries persist longer than DM mappings
+
 ## Open questions for review
 
 1. **AgentCard signature compatibility** — needs confirmation before

@@ -101,6 +101,63 @@ Decision flow:
 
 Rejected announcements (`RejectBlocked`, `RejectMachineMismatch`) are silently dropped and not added to the discovery cache.
 
+## Identity Announcement Processing
+
+The identity listener processes incoming identity announcements from the gossip network. It performs verification, trust evaluation, caching, epidemic rebroadcast, and auto-connect for each announcement.
+
+### Verification Pipeline
+
+1. Deserialize the announcement payload
+2. Check if the payload has been recently verified (blake3 hash deduplication, 60-second window)
+3. If not already verified, verify the machine signature
+4. Remember verified payloads to avoid redundant signature checks
+
+### Trust Evaluation
+
+5. Apply `TrustEvaluator` to the `(agent_id, machine_id)` pair
+6. `RejectBlocked` and `RejectMachineMismatch` announcements are silently dropped
+
+### Caching and Rebroadcast
+
+7. Filter addresses to globally-advertisable scope only
+8. Update the discovery cache with the verified announcement
+9. Update machine records in the contact store
+10. Register the agent→machine mapping in the direct messaging system
+11. Re-publish non-self announcements to the gossip topic with a 20-second dedup window
+
+### Auto-Connect
+
+12. If addresses are present and not already connected, spawn a background task to attempt QUIC connection
+13. This ensures pub/sub messages can route between peers that share bootstrap nodes
+
+## Discovery Cache and Contact Store
+
+x0x maintains two separate data structures for managing peer identity. The discovery cache is ephemeral and populated from announcements. The contact store is persistent and contains trust policy.
+
+### Discovery Cache (Ephemeral)
+
+- `identity_discovery_cache`: `HashMap<AgentId, DiscoveredAgent>`
+- `machine_discovery_cache`: `HashMap<MachineId, DiscoveredMachine>`
+- Populated from verified identity announcements
+- Entries include: addresses, NAT type, relay capability, timestamps
+- No TTL or eviction — entries are updated on new announcements
+- Used for connection establishment and reachability queries
+
+### Contact Store (Persistent)
+
+- Stored in `~/.x0x/contacts.json`
+- Contains trust levels, identity types, and machine records
+- Updated via REST API (`/contacts/*` endpoints)
+- Trust decisions are persistent across restarts
+- Machine pinning constraints are stored here
+
+### Interaction
+
+- **Discovery → Contacts**: New discovered agents can be added to contacts via `POST /contacts`
+- **Contacts → Discovery**: Trust evaluation filters which announcements enter the discovery cache
+- **Discovery cache is permissive**: Even `Unknown` trust level announcements are cached
+- **Contact store is restrictive**: Only explicitly added/trusted agents have persistent records
+
 ## Key Storage
 
 All key files use bincode 1.x format:
@@ -118,6 +175,56 @@ The contacts file uses JSON (not bincode) for human readability and editability.
 
 The default unnamed daemon uses `~/.x0x` for identity keys. Named instances use matching identity directories such as `~/.x0x-alice`, keeping their machine and agent identities separate from the default instance.
 
+## Announcement Types
+
+x0x uses three distinct announcement types:
+
+### IdentityAnnouncement
+
+- **Purpose**: Binds AgentId to MachineId with optional UserId
+- **Signed by**: Machine key
+- **Fields**: agent_id, machine_id, user_id, machine_public_key, machine_signature, addresses, announced_at, nat_type, capabilities
+- **Topic**: `x0x.identity.announce.v1` + shard topic
+- **Rebroadcast**: Yes, epidemic flood with 20-second dedup
+
+### MachineAnnouncement
+
+- **Purpose**: Advertises machine capabilities and reachability
+- **Signed by**: Machine key
+- **Fields**: machine_id, machine_public_key, machine_signature, addresses, announced_at, nat_type, is_relay, is_coordinator, reachable_via, relay_candidates
+- **Topic**: `x0x.machine.announce.v1` + shard topic
+- **Rebroadcast**: Yes, with dedup
+
+### UserAnnouncement
+
+- **Purpose**: Binds UserId to multiple AgentCertificates
+- **Signed by**: User key
+- **Fields**: user_id, user_public_key, agent_certificates, agent_ids, user_signature, announced_at
+- **Topic**: `x0x.user.announce.v1` + shard topic
+- **Rebroadcast**: Yes, with dedup
+
+## Shard Topic Routing
+
+To scale gossip propagation, x0x uses shard topics derived from identity hashes:
+
+- **Agent shard**: `blake3("x0x/agent/shard/v1/" + agent_id)`
+- **Machine shard**: `blake3("x0x/machine/shard/v1/" + machine_id)`
+- **User shard**: `blake3("x0x/user/shard/v1/" + user_id)`
+
+The identity listener subscribes to both legacy broadcast topics and shard topics specific to the local agent/machine/user.
+
+## Consent Mechanism
+
+User identity disclosure is strictly opt-in:
+
+- `user.key` is NEVER auto-generated
+- The `announce_identity()` API requires `human_consent: true` to include `user_id`
+- A `user_identity_consented` AtomicBool makes consent "sticky" across heartbeats
+- Once given, subsequent heartbeats continue to include `user_id` until daemon restart
+- `agent.cert` is validated against current keys at announcement time, not just at creation
+
 ## Architecture Decision
 
 See [ADR 0007: Three-Layer Identity Model](./adr/0007-three-layer-identity-model.md) for the accepted decision and operational rules.
+
+See [ADR 0008: Trust Evaluation System](./adr/0008-trust-evaluation-system.md) for trust decision rules and machine pinning.
