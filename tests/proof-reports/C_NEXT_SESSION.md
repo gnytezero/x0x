@@ -74,7 +74,7 @@ In `src/bin/x0xd.rs`, the `/direct/send` REST endpoint returns `DmReceipt` (path
 **Release**:
 - Bump `Cargo.toml` version → `0.18.0`, SKILL.md to match.
 - `chore(release): 0.18.0` commit, tag `v0.18.0`, push.
-- CI runs ~20 min, publishes to crates.io + npm + PyPI + GH releases.
+- CI runs ~20 min, publishes to crates.io + GH releases.
 
 ## Quick-start for next session
 

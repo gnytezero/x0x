@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Removed (BREAKING)
+
+- **Dropped first-party Node.js (napi-rs) and Python (PyO3 / maturin) FFI
+  bindings.** x0x is now daemon-only outside Rust: applications run (or
+  connect to) `x0xd` and consume the local REST/WebSocket API instead of
+  importing a compiled `x0x` module. Concretely:
+  - `bindings/nodejs/`, `bindings/python/`, the root-level `python/` stub,
+    and `WASM_ROADMAP.md` have been deleted from the tree.
+  - `Cargo.toml` no longer lists the binding crates as workspace members.
+  - The `publish-npm` and `publish-pypi` jobs have been removed from
+    `.github/workflows/release.yml`; releases now publish to crates.io +
+    GitHub Releases only. The `npm install x0x` / `pip install agent-x0x`
+    install snippets have been removed from the auto-generated GitHub
+    Release notes.
+  - Existing npm `x0x@0.1.0` and PyPI `agent-x0x@0.2.0` artefacts remain
+    pinned to their last published version on the public registries; they
+    will receive no further updates.
+  - Migration: see [`docs/local-apps.md`](docs/local-apps.md) for examples
+    of consuming the local `x0xd` API from any language.
+
 ## [v0.19.2] - 2026-04-23
 
 **Note.** The `v0.19.1` tag was cut earlier today but never reached

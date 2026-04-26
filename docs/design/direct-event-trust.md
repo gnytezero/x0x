@@ -102,7 +102,6 @@ No changes to `src/direct.rs`, `src/contacts.rs`, or `src/trust.rs`.
 - SSE: additive JSON fields — existing consumers ignore extra keys.
 - WebSocket: additive fields on tagged JSON variant — same reasoning.
 - Library: `DirectMessage` struct unchanged. No breaking change.
-- Python/Node.js bindings: unaffected (they use Rust `Agent` API, not SSE).
 
 ## What This Does NOT Do
 

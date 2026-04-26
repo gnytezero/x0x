@@ -161,35 +161,6 @@ proptest! {
 }
 
 // ============================================================================
-// TASK 9: Cross-Language Interop Tests (Stubs)
-// ============================================================================
-
-#[test]
-#[ignore = "requires Node.js runtime and bindings from Phase 2.1"]
-fn test_rust_nodejs_interop() {
-    // TODO: Spawn Node.js process running x0x SDK
-    // TODO: Verify Rust and Node.js agents can communicate
-    // TODO: Test task list operations across languages
-}
-
-#[test]
-#[ignore = "requires Python runtime and bindings from Phase 2.2"]
-fn test_rust_python_interop() {
-    // TODO: Spawn Python process running x0x SDK
-    // TODO: Verify Rust and Python agents can communicate
-    // TODO: Test CRDT convergence across languages
-}
-
-#[test]
-#[ignore = "requires all three language SDKs"]
-fn test_three_language_interop() {
-    // TODO: Spawn Rust, Node.js, and Python agents
-    // TODO: All join same network
-    // TODO: Verify messages propagate across all three languages
-    // TODO: Verify CRDT operations converge correctly
-}
-
-// ============================================================================
 // TASK 10: Security Validation Tests
 // ============================================================================
 

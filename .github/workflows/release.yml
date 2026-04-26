@@ -453,15 +453,7 @@ jobs:
             cargo add x0x
             ```
 
-            **TypeScript/Node.js:**
-            ```bash
-            npm install x0x
-            ```
-
-            **Python:**
-            ```bash
-            pip install agent-x0x
-            ```
+            **Other languages:** x0x is daemon-only — run `x0xd` and consume the local REST/WebSocket API from any language. See [`docs/local-apps.md`](docs/local-apps.md) for examples.
 
             ### Platform Binaries
 
@@ -534,51 +526,3 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           cargo publish -p x0x || echo "x0x already published or publish failed"
-
-  # ============================================================
-  # Publish to npm (with provenance)
-  # ============================================================
-  publish-npm:
-    name: Publish to npm
-    needs: create-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          cd bindings/nodejs
-          npm publish --provenance --access public || echo "npm publish failed or already published"
-
-  # ============================================================
-  # Publish to PyPI (via maturin)
-  # ============================================================
-  publish-pypi:
-    name: Publish to PyPI
-    needs: create-release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build and publish
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          cd bindings/python
-          maturin publish || echo "PyPI publish failed or already published"

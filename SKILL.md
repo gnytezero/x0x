@@ -350,7 +350,7 @@ Claude / AI ──> x0xd REST API         x0xd REST API <── Claude / AI
 - **[Vision: Build Any Decentralized App](https://github.com/saorsa-labs/x0x/blob/main/docs/vision.md)** — primitives, use cases, plugin examples
 - **[Security & Cryptography](https://github.com/saorsa-labs/x0x/blob/main/docs/security.md)** — algorithms, RFCs, key pinning
 - **[Diagnostics](https://github.com/saorsa-labs/x0x/blob/main/docs/diagnostics.md)** — health, status, doctor
-- **[SDK Quickstart](https://github.com/saorsa-labs/x0x/blob/main/docs/sdk-quickstart.md)** — Rust, Python, Node.js library usage
+- **[SDK Quickstart](https://github.com/saorsa-labs/x0x/blob/main/docs/sdk-quickstart.md)** — Rust crate + daemon REST/WS for any language
 - **[Ecosystem](https://github.com/saorsa-labs/x0x/blob/main/docs/ecosystem.md)** — sibling projects (saorsa-webrtc, ant-quic, etc.)
 
 ## Contributing

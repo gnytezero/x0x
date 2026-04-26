@@ -123,8 +123,6 @@ test = false
 [workspace]
 members = [
     ".",
-    "bindings/nodejs",
-    "bindings/python",
     "tests/harness",
 ]
 

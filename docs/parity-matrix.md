@@ -9,16 +9,20 @@ other surface is a client of it.
 | 1 | REST API (`x0xd`) | HTTP/JSON + WS + SSE | `tests/api_coverage.rs`, `tests/daemon_api_integration.rs` |
 | 2 | CLI (`x0x`) | Wraps REST | `tests/parity_cli.rs` (every endpoint has a CLI command) |
 | 3 | Embedded HTML GUI (`src/gui/x0x-gui.html`) | Wraps REST via fetch | `tests/gui_smoke.rs`, `tests/gui_named_group_parity.rs`, `tests/e2e_gui_chrome.mjs` (this release) |
-| 4 | Python binding (`x0x` via PyO3) | Direct Rust FFI | `bindings/python/tests/` |
-| 5 | Node.js binding (`x0x` via napi-rs) | Direct Rust FFI | `bindings/nodejs/__test__/` |
-| 6 | `communitas-x0x-client` (Rust) | Wraps REST + WS + SSE | `communitas/communitas-x0x-client/tests/` |
-| 7 | `communitas-core` (Rust library) | Wraps `communitas-x0x-client` | `communitas/communitas-core/tests/` |
-| 8 | `communitas-ui-api` (Tauri / IPC) | JSON over Tauri bridge | `communitas/communitas-ui-api/tests/` |
-| 9 | `communitas-ui-service` (WebRTC signaling etc.) | Wraps `x0x-client` | `communitas/communitas-ui-service/tests/` |
-| 10 | `communitas-dioxus` (desktop GUI) | Uses `communitas-ui-service` | `communitas/communitas-dioxus/tests/e2e/` (this release) |
-| 11 | `communitas-kanban` (task view) | Uses `communitas-x0x-client` task lists | `communitas/communitas-kanban/tests/` |
-| 12 | `communitas-bench` (perf harness) | `communitas-x0x-client` | `communitas/communitas-bench/` |
-| 13 | `communitas-apple` (Swift app) | Wraps REST through `X0xClient` Swift lib | `communitas/communitas-apple/Tests/X0xClientTests/`, `communitas/communitas-apple/Tests/CommunitasUITests/` (this release) |
+| 4 | `communitas-x0x-client` (Rust) | Wraps REST + WS + SSE | `communitas/communitas-x0x-client/tests/` |
+| 5 | `communitas-core` (Rust library) | Wraps `communitas-x0x-client` | `communitas/communitas-core/tests/` |
+| 6 | `communitas-ui-api` (Tauri / IPC) | JSON over Tauri bridge | `communitas/communitas-ui-api/tests/` |
+| 7 | `communitas-ui-service` (WebRTC signaling etc.) | Wraps `x0x-client` | `communitas/communitas-ui-service/tests/` |
+| 8 | `communitas-dioxus` (desktop GUI) | Uses `communitas-ui-service` | `communitas/communitas-dioxus/tests/e2e/` (this release) |
+| 9 | `communitas-kanban` (task view) | Uses `communitas-x0x-client` task lists | `communitas/communitas-kanban/tests/` |
+| 10 | `communitas-bench` (perf harness) | `communitas-x0x-client` | `communitas/communitas-bench/` |
+| 11 | `communitas-apple` (Swift app) | Wraps REST through `X0xClient` Swift lib | `communitas/communitas-apple/Tests/X0xClientTests/`, `communitas/communitas-apple/Tests/CommunitasUITests/` (this release) |
+
+> **Note.** Previous releases shipped first-party Python (PyO3) and Node.js
+> (napi-rs) bindings; both were retired in favour of the daemon + REST model
+> so that there is exactly one supported surface per host. Non-Rust
+> applications consume `x0xd` over HTTP/WebSocket — see
+> [`docs/local-apps.md`](local-apps.md).
 
 ---
 

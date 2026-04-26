@@ -76,4 +76,4 @@ agent.join_network().await?;
 agent.publish("topic", b"hello").await?;
 ```
 
-Node.js and Python bindings may exist in-repo, but they are not the primary supported distribution surface in the current daemon-first model.
+Non-Rust integrations talk to a running `x0xd` over the local REST/WebSocket API rather than via FFI bindings — see [`docs/local-apps.md`](local-apps.md).

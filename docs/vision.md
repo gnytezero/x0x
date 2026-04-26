@@ -73,58 +73,28 @@ Any agent can create a capability and share it with the network:
 
 There is no app store. No approval process. No gatekeeper. Agents decide for themselves what to run, based on their own trust evaluation of the source. The trust system (`Blocked | Unknown | Known | Trusted`) gives each agent fine-grained control over what they accept.
 
-**Example: A compute-sharing plugin in Python:**
+**Example: a compute-sharing plugin (Python, talking to a local `x0xd`):**
 
 ```python
-from x0x import Agent
-import json, base64
+import json, base64, requests
+from pathlib import Path
 
-agent = Agent()
-await agent.join_network()
+data_dir = Path.home() / ".local/share/x0x"
+api = f"http://{(data_dir / 'api.port').read_text().strip()}"
+hdr = {"Authorization": f"Bearer {(data_dir / 'api-token').read_text().strip()}"}
 
 # Announce capability via gossip
-await agent.publish("plugins/compute", json.dumps({
-    "type": "gpu-hours",
-    "gpu": "A100",
-    "available_hours": 4,
-    "agent_id": str(agent.agent_id)
-}).encode())
+payload = base64.b64encode(json.dumps({
+    "type": "gpu-hours", "gpu": "A100", "available_hours": 4,
+}).encode()).decode()
+requests.post(f"{api}/publish", headers=hdr,
+              json={"topic": "plugins/compute", "payload": payload})
 
-# Listen for job requests via direct messaging
-while True:
-    msg = await agent.recv_direct()
-    job = json.loads(msg.payload)
-
-    if job["type"] == "compute_request":
-        result = run_job(job["code"], job["data"])
-        await agent.send_direct(msg.sender, json.dumps({
-            "type": "compute_result",
-            "result": base64.b64encode(result).decode()
-        }).encode())
+# Stream incoming direct messages over WebSocket; for each compute_request,
+# run the job and reply via POST /direct/send.
 ```
 
-The agent on the other end discovers this via gossip, connects, and sends work:
-
-```python
-# Discover compute providers
-rx = await agent.subscribe("plugins/compute")
-async for msg in rx:
-    provider = json.loads(msg.payload)
-    if provider["gpu"] == "A100":
-        target = AgentId.from_str(provider["agent_id"])
-        break
-
-# Connect and send work
-await agent.connect_to_agent(target)
-await agent.send_direct(target, json.dumps({
-    "type": "compute_request",
-    "code": "train_model.py",
-    "data": base64.b64encode(training_data).decode()
-}).encode())
-
-# Receive result
-result = await agent.recv_direct()
-```
+The agent on the other end discovers this via gossip, connects, and sends work using the same REST/WebSocket surface — see [`docs/local-apps.md`](local-apps.md) for the full integration pattern.
 
 No servers. No APIs. No accounts. Two agents, talking directly, doing useful work.
 

@@ -34,10 +34,10 @@ The ecosystem is a layered stack where each project has a single clear responsib
 ├─────────────────────────────────────────────────────────┤
 │                    AGENT LAYER                           │
 │                                                         │
-│  x0x (v0.16)                                            │
+│  x0x                                                    │
 │  Post-quantum encrypted gossip network for AI agents    │
-│  Rust crate + npm + PyPI + CLI + REST API + GUI         │
-│  33K LoC · 744 tests · 75+ REST endpoints               │
+│  Rust crate + daemon (`x0xd`) + CLI + REST API + GUI    │
+│  33K LoC · 1006 tests · 75+ REST endpoints              │
 │                                                         │
 │  Provides: pub/sub, direct messaging, presence/FOAF,    │
 │  CRDT task lists, MLS groups, file transfer, trust,     │
@@ -166,11 +166,9 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.16.0 |
 | LoC | ~33,600 |
 | License | MIT OR Apache-2.0 |
-| Published | crates.io, npm, PyPI |
-| Tests | 744 |
+| Published | crates.io |
 | Depends on | saorsa-pqc, saorsa-mls, ant-quic, all 11 saorsa-gossip crates |
 
 **What it provides**:
@@ -181,7 +179,7 @@ saorsa-pqc ◄── saorsa-mls
 - **Security**: MLS encrypted groups (RFC 9420), trust/contacts with whitelist-by-default
 - **Operations**: Self-update with ML-DSA-65 signed releases, file transfer with SHA-256 integrity
 
-**Surfaces**: Rust crate (`use x0x::Agent`), npm package (`import { Agent } from 'x0x'`), Python package (`from x0x import Agent`), CLI (`x0x`), daemon with REST/WS API (`x0xd`), embedded GUI.
+**Surfaces**: Rust crate (`use x0x::Agent`), CLI (`x0x`), daemon with REST/WS API (`x0xd`), embedded GUI. Non-Rust applications integrate by talking to `x0xd` over HTTP; there are no first-party Node.js or Python FFI bindings.
 
 **6 global bootstrap nodes**: NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo.
 

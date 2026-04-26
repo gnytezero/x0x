@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is x0x
 
-Agent-to-agent gossip network for AI systems. Built on `ant-quic` (QUIC transport with post-quantum cryptography and NAT traversal) and `saorsa-gossip` (epidemic broadcast, CRDT sync, pub/sub). Distributed as a Rust crate, npm package (napi-rs), and Python package (`agent-x0x` on PyPI, imported as `from x0x import ...`).
+Agent-to-agent gossip network for AI systems. Built on `ant-quic` (QUIC transport with post-quantum cryptography and NAT traversal) and `saorsa-gossip` (epidemic broadcast, CRDT sync, pub/sub). Distributed as a Rust crate (`x0x`) and a daemon binary (`x0xd`) with a local REST + WebSocket API; non-Rust applications integrate by talking to the daemon over HTTP rather than via FFI bindings.
 
 ## Build & Test Commands
 
@@ -177,17 +177,16 @@ x0xd [OPTIONS]
 
 Multi-instance example: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`
 
-## FFI Bindings
+## Non-Rust Integration
 
-- **Node.js** (`bindings/nodejs/`): napi-rs v3 with 7 platform packages + WASM fallback. Published as `x0x` on npm.
-- **Python** (`bindings/python/`): PyO3 + maturin. Published as `agent-x0x` on PyPI (name `x0x` was taken). Import as `from x0x import ...`.
+x0x is daemon-only outside the Rust ecosystem. There are no Node.js or Python FFI bindings — applications start (or connect to) `x0xd` and call the local REST/WebSocket API. See `docs/local-apps.md` for examples in any language.
 
 ## CI/CD
 
 Five workflows in `.github/workflows/`:
 - **ci.yml**: fmt, clippy, nextest, doc (all jobs symlink `ant-quic` and `saorsa-gossip` from `.deps/`)
 - **security.yml**: `cargo audit`
-- **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io/npm/PyPI
+- **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io
 - **build.yml**: PR validation
 - **sign-skill.yml**: GPG-signs `SKILL.md`
 

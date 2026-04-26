@@ -264,7 +264,7 @@ Without naming specific products, existing approaches to the problems x0x solves
 
 - Universal byte encoder for arbitrary-length identifiers (invite tokens, keys)
 - Multi-language dictionaries (starting with high-demand languages)
-- Mobile platform support (iOS, Android via existing FFI bindings)
+- Mobile platform support (iOS, Android — talking to a host-side `x0xd` over the local API, or via a future native FFI)
 - ~~Local mesh discovery (mDNS/DNS-SD for same-network agents)~~ — Shipped in v0.15.1
 - Word-encoded group invite tokens (8-12 words for dictatable invitations)
 - Autocomplete and fuzzy matching for partial word entry
