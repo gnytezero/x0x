@@ -224,14 +224,28 @@ async fn peer_health_snapshot_observable_for_live_peer() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["peer_id"], bob_machine);
 
-    // The handler currently emits `format!("{health:?}")` so we substring-match
-    // on the Debug shape. Documented in src/bin/x0xd.rs::peer_health_handler.
-    // If the wire shape is ever upgraded to structured JSON, replace with
-    // body["health"]["connected"] == true.
-    let health = body["health"].as_str().expect("health is a string");
+    // Structured snapshot is the supported wire shape (v0.19.7+). The
+    // `health` Debug string is still emitted for legacy clients but the
+    // assertion lives on `snapshot`.
+    let snapshot = &body["snapshot"];
+    assert_eq!(
+        snapshot["connected"], true,
+        "snapshot.connected should be true for live peer: {body}"
+    );
     assert!(
-        health.contains("connected: true"),
-        "expected `connected: true` in health Debug string, got: {health}"
+        snapshot["generation"].as_u64().is_some(),
+        "snapshot.generation should be present for live peer: {body}"
+    );
+    // close_reason is null on a live peer.
+    assert!(
+        snapshot["close_reason"].is_null(),
+        "snapshot.close_reason should be null on a live peer: {body}"
+    );
+
+    // Legacy field still present (back-compat).
+    assert!(
+        body["health"].is_string(),
+        "legacy `health` Debug string should still be emitted: {body}"
     );
 }
 

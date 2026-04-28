@@ -126,10 +126,10 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
    + x0x-client (`probe_peer`, `peer_health`, `connect_peer_events`) +
    GUI panels (live peer-events feed, probe button on each peer row) all
    wired and round-trip-tested via `tests/peer_lifecycle_integration.rs`.
-   **Known wart**: `/peers/:id/health` returns `format!("{health:?}")` — the
-   ant-quic `ConnectionHealth` Debug rendering. Functional today (substring
-   match on `connected: true` is stable), but a structured-JSON shape would
-   let clients act programmatically. Tracked for a future release.
+   v0.19.7 follow-up: `/peers/:id/health` now also emits a structured
+   `snapshot` object alongside the legacy `health` Debug string, so GUI
+   and `communitas-x0x-client::PeerHealthSnapshot` can act on
+   `connected`/`generation`/`idle_ms` programmatically.
 2. ~~**`send_with_receive_ack`**~~ — closed in v0.19.6. `POST /direct/send`
    accepts opt-in `require_ack_ms`; CLI exposes `--require-ack-ms`;
    `communitas-x0x-client::send_direct` accepts the option; GUI DM composer

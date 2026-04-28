@@ -11172,8 +11172,15 @@ async fn probe_peer_handler(
 /// GET /peers/:peer_id/health — ant-quic 0.27.1 `connection_health` snapshot.
 ///
 /// Returns the lifecycle state, generation, directional activity timestamps,
-/// and most-recent close reason for a peer. `ConnectionHealth`'s `Debug`
-/// rendering is stable enough to use as the wire format for now.
+/// and most-recent close reason for a peer. The response carries:
+///
+/// - `health`: opaque Debug rendering of `ConnectionHealth` (legacy, kept
+///   for backwards compatibility — older clients substring-matched this).
+/// - `snapshot`: structured object new clients should prefer:
+///   `{ connected, generation, reader_task_active, last_received_ms_ago,
+///   last_sent_ms_ago, idle_ms, close_reason }`. `Instant`-typed fields
+///   are converted to elapsed-millisecond deltas so the wire format
+///   stays calendar-agnostic.
 async fn peer_health_handler(
     State(state): State<Arc<AppState>>,
     Path(peer_hex): Path<String>,
@@ -11191,15 +11198,35 @@ async fn peer_health_handler(
             .into_response();
     };
     match network.connection_health(peer_id).await {
-        Some(health) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "peer_id": peer_hex,
-                "health": format!("{health:?}"),
-            })),
-        )
-            .into_response(),
+        Some(health) => {
+            let now = std::time::Instant::now();
+            let snapshot = serde_json::json!({
+                "connected": health.connected,
+                "generation": health.generation,
+                "reader_task_active": health.reader_task_active,
+                "last_received_ms_ago": health
+                    .last_received_at
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64),
+                "last_sent_ms_ago": health
+                    .last_sent_at
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64),
+                "idle_ms": health.idle_for.map(|d| d.as_millis() as u64),
+                "close_reason": health.close_reason.as_ref().map(|r| format!("{r:?}")),
+            });
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "peer_id": peer_hex,
+                    // `health` is the legacy Debug rendering retained for
+                    // backwards compatibility. New clients should consume
+                    // `snapshot` (structured fields).
+                    "health": format!("{health:?}"),
+                    "snapshot": snapshot,
+                })),
+            )
+                .into_response()
+        }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": "network node not running" })),

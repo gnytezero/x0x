@@ -2664,8 +2664,18 @@ let peerEventsSse=null;
 
 function peerHealthText(h){
   if(!h)return 'Unavailable';
-  if(h.ok)return h.health||'Healthy';
-  return h.error||'Unavailable';
+  if(!h.ok)return h.error||'Unavailable';
+  // Prefer structured snapshot (v0.19.7+); fall back to legacy `health`
+  // Debug string for daemons that haven't been upgraded yet.
+  const s=h.snapshot;
+  if(s&&typeof s==='object'){
+    const parts=[s.connected?'connected':'disconnected'];
+    if(s.generation!=null)parts.push('gen '+s.generation);
+    if(s.idle_ms!=null)parts.push('idle '+s.idle_ms+'ms');
+    if(s.close_reason)parts.push('closed: '+s.close_reason);
+    return parts.join(', ');
+  }
+  return h.health||'Healthy';
 }
 
 function probeText(p){
