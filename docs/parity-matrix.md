@@ -31,6 +31,18 @@ other surface is a client of it.
 Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wired ·
 `—` not applicable for this surface.
 
+**Per-column "tested" bar**:
+- **REST / CLI / GUI**: round-trip integration test against a live `x0xd`.
+- **`x0x-client` (Rust)**: round-trip integration test (REST + WS + SSE).
+- **Dioxus**: consumes `communitas-x0x-client` directly — inherits ✅
+  whenever the underlying client method has round-trip coverage. No
+  Dioxus-specific test layer; UI-driven Dioxus tests would belong in a
+  future WebDriver harness.
+- **Apple**: Swift X0xClient method exists *and* the wire-shape decoder
+  has a Swift unit test. End-to-end XCUITest coverage is a future
+  session's deliverable; the Rust side already proves the protocol
+  contract.
+
 ### Identity
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
@@ -51,9 +63,9 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Connect to agent (direct / coordinated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
-| Probe peer liveness (**0.27.2 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
-| Connection health snapshot (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
-| Peer lifecycle subscription (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
+| Probe peer liveness (**0.27.2 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
+| Connection health snapshot (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
+| Peer lifecycle subscription (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | Discover agents (cache / FOAF) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
 | `GET /diagnostics/connectivity` | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
 | `GET /diagnostics/gossip` (this release) | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
@@ -73,7 +85,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Send direct | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Receive direct (annotated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Epidemic rebroadcast on caps topic | ✅ | — | — | — | — | ✅ | — | — | — |
-| Send + receive-ACK (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
+| Send + receive-ACK (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | File transfer (offer/accept) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
 
 ### Groups
@@ -137,10 +149,23 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
    tested via `direct_send_with_require_ack_round_trips_to_live_peer`.
 3. ~~**`/diagnostics/gossip`**~~ — closed in v0.19.6. GUI panel renders the
    per-stream dispatcher stats; `communitas-x0x-client::gossip_stats` ships.
-4. **Communitas Dioxus & Apple** — broad identity/trust/kv surface is
-   "implemented" via the Rust client but test coverage is thin. XCUITest
-   target + Dioxus WebDriver harness (planned for the next session) start
-   closing those cells.
+4. **Communitas Apple — 0.27.x peer-lifecycle row** ✅ closed
+   2026-04-28. Swift `X0xSseStream` ships with `connectPeerEvents`;
+   `PeerHealth.snapshot`, `DirectSendResponse.requireAck`,
+   `PeerLifecycleEvent` decode tests live in
+   `Tests/X0xClientTests/X0xClientTests.swift` (11 new cases). Rust↔Swift
+   parity table extended with `RUST_SSE_TO_SWIFT` so future SSE methods
+   can't drift.
+5. **Communitas Apple — broad identity/trust/kv 🟡** still open.
+   Method-level parity is enforced by `swift_parity.rs`; round-trip
+   coverage requires a SwiftDaemonFixture + XCUITest pass. Tracked for
+   the next session — see `docs/next-session-communitas-parity.md`.
+6. **Communitas Dioxus 🟡** — Dioxus consumes `communitas-x0x-client`
+   directly, so client-layer parity transfers automatically. The
+   remaining 🟡s reflect the absence of a Dioxus-specific UI test layer.
+   Recommended scope-cut: keep these 🟡 until a WebDriver harness is
+   in place; do not chase per-cell coverage at the Dioxus level until
+   then.
 5. **Bench / kanban** — historical parity gaps; tracked but out of scope
    until usage warrants.
 
