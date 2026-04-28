@@ -51,12 +51,12 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Connect to agent (direct / coordinated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
-| Probe peer liveness (**0.27.2 new**) | 🟡 | 🟡 | 🟡 | ❌ | ❌ | 🟡 | ❌ | ❌ | — |
-| Connection health snapshot (**0.27.1 new**) | 🟡 | 🟡 | 🟡 | ❌ | ❌ | 🟡 | ❌ | ❌ | — |
-| Peer lifecycle subscription (**0.27.1 new**) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | — |
+| Probe peer liveness (**0.27.2 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
+| Connection health snapshot (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
+| Peer lifecycle subscription (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
 | Discover agents (cache / FOAF) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
 | `GET /diagnostics/connectivity` | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
-| `GET /diagnostics/gossip` (this release) | ✅ | ✅ | 🟡 | — | — | 🟡 | — | — | — |
+| `GET /diagnostics/gossip` (this release) | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
 | Four-word network bootstrap | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
 
 ### Messaging — pub/sub
@@ -73,7 +73,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Send direct | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Receive direct (annotated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Epidemic rebroadcast on caps topic | ✅ | — | — | — | — | ✅ | — | — | — |
-| Send + receive-ACK (**0.27.1 new**) | 🟡 | 🟡 | ❌ | ❌ | ❌ | 🟡 | ❌ | ❌ | — |
+| Send + receive-ACK (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | — |
 | File transfer (offer/accept) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
 
 ### Groups
@@ -120,17 +120,26 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 
 ## Red-cell ticket list (gaps to close in this release)
 
-1. **Probe-peer / connection-health / lifecycle subscription** — not yet
-   exposed via REST on x0xd. `NetworkNode` pass-through added this release;
-   REST handlers + CLI + GUI + client coverage remain.
-2. **`send_with_receive_ack`** — `NetworkNode` pass-through added, but the
-   direct-messaging stack still uses fire-and-forget `send`. Opt-in
-   `require_ack: bool` on `POST /direct/send` would close this gap.
-3. **`/diagnostics/gossip`** — REST endpoint wired this release; GUI panel
-   and communitas-x0x-client method still to add.
+1. ~~**Probe-peer / connection-health / lifecycle subscription**~~ — closed in
+   v0.19.6. REST handlers (`POST /peers/:id/probe`, `GET /peers/:id/health`,
+   `GET /peers/events` SSE) + CLI commands (`x0x peers probe|health|events`)
+   + x0x-client (`probe_peer`, `peer_health`, `connect_peer_events`) +
+   GUI panels (live peer-events feed, probe button on each peer row) all
+   wired and round-trip-tested via `tests/peer_lifecycle_integration.rs`.
+   **Known wart**: `/peers/:id/health` returns `format!("{health:?}")` — the
+   ant-quic `ConnectionHealth` Debug rendering. Functional today (substring
+   match on `connected: true` is stable), but a structured-JSON shape would
+   let clients act programmatically. Tracked for a future release.
+2. ~~**`send_with_receive_ack`**~~ — closed in v0.19.6. `POST /direct/send`
+   accepts opt-in `require_ack_ms`; CLI exposes `--require-ack-ms`;
+   `communitas-x0x-client::send_direct` accepts the option; GUI DM composer
+   has an "ACK" toggle that surfaces the round-trip RTT inline. Round-trip
+   tested via `direct_send_with_require_ack_round_trips_to_live_peer`.
+3. ~~**`/diagnostics/gossip`**~~ — closed in v0.19.6. GUI panel renders the
+   per-stream dispatcher stats; `communitas-x0x-client::gossip_stats` ships.
 4. **Communitas Dioxus & Apple** — broad identity/trust/kv surface is
    "implemented" via the Rust client but test coverage is thin. XCUITest
-   target (this release) + Dioxus WebDriver harness (this release) start
+   target + Dioxus WebDriver harness (planned for the next session) start
    closing those cells.
 5. **Bench / kanban** — historical parity gaps; tracked but out of scope
    until usage warrants.

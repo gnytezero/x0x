@@ -29,6 +29,24 @@ fn gui_html_is_valid() {
     );
 }
 
+/// Verify the GUI direct-send composer exposes the require_ack toggle.
+///
+/// Closes the parity-matrix red cell `Send + receive-ACK / GUI` by proving
+/// the composer (a) renders the checkbox and (b) wires it to
+/// `require_ack_ms` on the `/direct/send` body.
+#[test]
+fn gui_dm_composer_exposes_require_ack_toggle() {
+    let html = include_str!("../src/gui/x0x-gui.html");
+    assert!(
+        html.contains(r#"id="dm-require-ack""#),
+        "DM composer should include the require_ack checkbox (id=dm-require-ack)"
+    );
+    assert!(
+        html.contains("require_ack_ms"),
+        "sendDm() must include `require_ack_ms` in the /direct/send body when checked"
+    );
+}
+
 /// Verify that API paths called from the GUI exist in ENDPOINTS.
 ///
 /// Extracts `api("/path"...)` calls from the JavaScript and checks each

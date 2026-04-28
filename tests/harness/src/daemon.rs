@@ -36,9 +36,20 @@ impl DaemonFixture {
 
         let tempdir = TempDir::new().expect("temp dir");
         let config_path = tempdir.path().join("config.toml");
+        // Base keys; `bootstrap_peers` is suppressed when `extra_config`
+        // already supplies one to avoid TOML duplicate-key parse errors.
+        let extra_has_bootstrap = extra_config
+            .lines()
+            .any(|l| l.trim_start().starts_with("bootstrap_peers"));
+        let bootstrap_line = if extra_has_bootstrap {
+            ""
+        } else {
+            "bootstrap_peers = []\n"
+        };
         let mut config = format!(
-            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\nbootstrap_peers = []\ninstance_name = \"{}\"\n",
+            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\n{}instance_name = \"{}\"\n",
             tempdir.path().display(),
+            bootstrap_line,
             name,
         );
         if !extra_config.trim().is_empty() {

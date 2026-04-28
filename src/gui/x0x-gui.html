@@ -2409,6 +2409,9 @@ function renderDm(){
       <div id="mention-ac" class="mention-ac"></div>
       <button class="ghost" title="Emoji" onclick="toggleComposerEmoji()" style="font-size:16px;padding:6px">😀</button>
       <input id="dm-in" placeholder="Message…" oninput="onChatInput(event)" onkeydown="if(handleMentionKey(event))return;if(event.key==='Enter')sendDm()">
+      <label id="dm-require-ack-lbl" style="font-size:11px;color:var(--tx3);display:flex;align-items:center;gap:4px;padding:0 6px;white-space:nowrap" title="Confirm delivery: after send, probe the peer's receive pipeline (ant-quic 0.27.1 send_with_receive_ack). Surfaces the round-trip RTT inline.">
+        <input id="dm-require-ack" type="checkbox"> ACK
+      </label>
       <button class="pri" onclick="sendDm()">Send</button>
       <div id="composer-emoji" class="emoji-picker" style="bottom:100%;right:0;left:auto">
         <div class="ep-search"><input placeholder="Search emoji…" oninput="filterComposerEmoji(this)"></div>
@@ -2438,10 +2441,22 @@ async function sendDm(){
   const t=inp.value.trim();if(!t||!target)return;
   const name=LS.get('display_name','')||short(S.get('agentId'));
   const payload=u8encode(JSON.stringify({text:t,sender_name:name,ts:Date.now()}));
-  await api('/direct/send',{method:'POST',body:JSON.stringify({agent_id:target,payload})});
+  const ackBox=document.getElementById('dm-require-ack');
+  const body={agent_id:target,payload};
+  if(ackBox&&ackBox.checked)body.require_ack_ms=5000;
+  const resp=await api('/direct/send',{method:'POST',body:JSON.stringify(body)});
   const msg={text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),own:true};
   addDmMsg(target,msg);
   inp.value='';inp.focus();
+  if(body.require_ack_ms&&resp&&resp.require_ack){
+    const a=resp.require_ack;
+    if(a.ok){
+      const rtt=(a.rtt_ms!=null)?(a.rtt_ms+'ms'):((a.rtt_us!=null)?(a.rtt_us+'µs'):'?');
+      toast('Delivered — peer ACK '+rtt,'info');
+    }else{
+      toast('Delivery unconfirmed: '+(a.error||a.reason||'no ACK'),'warning');
+    }
+  }
 }
 
 function addDmMsg(agentId,msg){
