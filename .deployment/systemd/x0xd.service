@@ -1,0 +1,15 @@
+[Unit]
+Description=x0x Agent Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/x0x/x0xd --config /etc/x0x/config.toml
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/var/lib/x0x
+
+[Install]
+WantedBy=multi-user.target

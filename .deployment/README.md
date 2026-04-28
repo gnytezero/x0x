@@ -12,8 +12,8 @@ This directory contains configuration files and deployment scripts for running x
 | saorsa-3 | SFO, US | DigitalOcean | 147.182.234.192 | bootstrap-sfo.toml |
 | saorsa-6 | Helsinki, FI | Hetzner | 65.21.157.229 | bootstrap-helsinki.toml |
 | saorsa-7 | Nuremberg, DE | Hetzner | 116.203.101.172 | bootstrap-nuremberg.toml |
-| saorsa-8 | Singapore, SG | Vultr | 152.42.210.67 | bootstrap-singapore.toml |
-| saorsa-9 | Sydney, JP | Vultr | 170.64.176.102 | bootstrap-sydney.toml |
+| saorsa-8 | Singapore, SG | DigitalOcean | 152.42.210.67 | bootstrap-singapore.toml |
+| saorsa-9 | Sydney, AU | DigitalOcean | 170.64.176.102 | bootstrap-sydney.toml |
 
 ## Port Allocation
 
@@ -30,7 +30,7 @@ brew install zig  # macOS
 
 # Build for Linux
 cd ../..  # Go to project root
-cargo zigbuild --release --target x86_64-unknown-linux-gnu -p x0xd
+cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd
 ```
 
 2. **SSH access** to VPS nodes:
@@ -192,7 +192,9 @@ curl http://127.0.0.1:12600/metrics
   x0xd              # Binary (uploaded by deploy script)
 
 /etc/x0x/
-  bootstrap.toml             # Configuration (uploaded by deploy script)
+  config.toml                # Configuration (uploaded by deploy script)
+                             # Legacy bootstrap.toml from pre-2026-04 era
+                             # is removed by .deployment/harden-bootstrap-nodes.sh
 
 /var/lib/x0x/
   machine.key                # Machine identity (auto-generated)
@@ -275,6 +277,41 @@ After successful deployment:
 2. Monitor network formation in logs
 3. Test agent connections to bootstrap network
 4. Monitor metrics endpoints for network statistics
+
+## Hardening
+
+Run `harden-bootstrap-nodes.sh` periodically (or after any deploy) to
+keep the fleet "rock solid":
+
+```bash
+DRY_RUN=1 bash .deployment/harden-bootstrap-nodes.sh   # preview
+DRY_RUN=0 bash .deployment/harden-bootstrap-nodes.sh   # apply
+```
+
+What it does (idempotent):
+1. `systemctl enable x0xd` on every node — auto-start on boot.
+2. Removes leaked `/opt/x0x/.x0x-upgrade-*` working directories.
+   Auto-upgrade has a known leak (saorsa-3 had 216 stale dirs as of
+   2026-04-28). Tracked separately — fix is in `src/upgrade/apply.rs`.
+3. Removes legacy `/etc/x0x/bootstrap.toml{,.bak}` and
+   `x0xd-test.toml` from the pre-2026-04 era.
+4. Removes stale binaries (`/opt/x0x/x0x`, `x0xd-dhat-old`,
+   `x0xd.backup`, `x0xd.bak`).
+
+## Reproducible bring-up
+
+`systemd/x0xd.service` and `config/bootstrap-config.toml` mirror
+what's installed on the live fleet so a fresh node can be brought up
+identically.
+
+To promote a new node to canonical bootstrap (added to
+`x0x::network::DEFAULT_BOOTSTRAP_PEERS`):
+
+1. Open a PR adding its IPv4 + IPv6 to `src/network.rs`.
+2. Update the `bootstrap_peers` list in `config/bootstrap-config.toml`.
+3. Update `~/.claude/docs/infrastructure.md`.
+4. Re-tag x0x and roll the release out — the new IP becomes a
+   hardcoded entry point only after a binary upgrade across the network.
 
 ## Support
 
