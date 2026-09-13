@@ -621,8 +621,17 @@ mod tests {
         let mut stall = tokio::net::TcpStream::connect(handle.local_addr())
             .await
             .expect("connect to the api listener");
+        // #661 item 3: `Expect: 100-continue` makes the server's liveness on
+        // this request an OBSERVABLE protocol fact instead of a 200 ms guess:
+        // hyper sends the `100 Continue` interim response only once the
+        // handler starts reading the body, so reading it proves the request
+        // is in flight and the graceful-shutdown drain must wait for it.
+        // (The old fixed sleep could fire before the head was even accepted,
+        // letting the drain finish first and the refusal assert flake.)
         let head = format!(
-            "POST /publish HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nContent-Length: 65536\r\n\r\n",
+            "POST /publish HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\n\
+             content-type: application/json\r\nExpect: 100-continue\r\n\
+             Content-Length: 65536\r\n\r\n",
             handle.local_addr(),
         );
         stall
@@ -630,8 +639,37 @@ mod tests {
             .await
             .expect("send stalled request head");
         stall.flush().await.expect("flush stalled request head");
-        // Let the server accept the connection and start awaiting the body.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Read the interim response to its blank line: a single read() may
+        // legally short-read (TCP segment boundaries are not message
+        // boundaries), so accumulate until the terminating CRLF CRLF.
+        let mut interim = Vec::with_capacity(128);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0u8; 128];
+            loop {
+                let n = stall
+                    .read(&mut chunk)
+                    .await
+                    .expect("read the 100-continue interim response");
+                assert!(n > 0, "server closed the stall connection early");
+                interim.extend_from_slice(&chunk[..n]);
+                if interim.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                assert!(
+                    interim.len() <= 4096,
+                    "no end-of-headers terminator within 4 KiB: {}",
+                    String::from_utf8_lossy(&interim)
+                );
+            }
+        })
+        .await
+        .expect("server must answer the 100-continue probe within 10s");
+        let preamble = String::from_utf8_lossy(&interim);
+        assert!(
+            preamble.starts_with("HTTP/1.1 100"),
+            "expected the 100-continue interim response, got: {preamble}"
+        );
 
         // The overlap window: dropping the handle requests shutdown, and a
         // re-serve on the same data dir must be REFUSED while the first
@@ -715,6 +753,51 @@ mod tests {
             .shutdown_and_wait()
             .await
             .expect("identity dir == data dir must stop cleanly");
+    }
+
+    /// #661 item 2 (r2): the Agent keeps a second `Arc<Store>` in its
+    /// plain `history_handle` field, which `Agent::shutdown(&self)` cannot
+    /// clear — and the exclusive SQLite connection (`PRAGMA
+    /// locking_mode = EXCLUSIVE`) used to survive into generator teardown,
+    /// AFTER the supervisor's body locals (the instance locks) had already
+    /// dropped. The supervisor now drops its captured `AppState` as its
+    /// last statement, so with the drain complete the exclusive handle
+    /// closes BEFORE the lock releases. Observable contract: a caller that
+    /// `shutdown_and_wait`s and immediately re-opens finds the instance
+    /// lock free AND `history.db` openable on the FIRST try — no retry
+    /// window between "lock free" and "store closed".
+    #[tokio::test]
+    async fn shutdown_releases_the_exclusive_history_handle_with_the_instance_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = hermetic_serve_config(
+            dir.path(),
+            Some(dir.path().join("identity")),
+            "issue-661.exclusive-handle",
+        );
+        config.history.enabled = true;
+        let handle = serve_with_options(config, hermetic_serve_options())
+            .await
+            .expect("serve with history enabled");
+        let db_path = dir.path().join("history.db");
+        assert!(
+            db_path.exists(),
+            "the served daemon must have opened history.db"
+        );
+        handle.shutdown_and_wait().await.expect("clean shutdown");
+
+        // First try, no retry: the lock must be free AND the exclusive db
+        // openable the moment the caller regains control.
+        let lock = InstanceLock::acquire(dir.path())
+            .expect("instance lock free immediately after shutdown_and_wait");
+        let reopened = crate::history::Store::open(&db_path);
+        drop(lock);
+        match reopened {
+            Ok(_store) => {}
+            Err(err) => panic!(
+                "the exclusive history handle must be released with the \
+                 instance lock, not after it: {err}"
+            ),
+        }
     }
 
     /// #645 item 4: the Windows contention path (share-mode open) was only
