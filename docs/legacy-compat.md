@@ -120,3 +120,13 @@ baselines taken on 0.5.78 are not directly comparable, and the IWANT serve
 path still does not record publish origin — read `outbound_by_kind["eager"]`
 alongside `relay_bytes` when accounting relay egress.
 
+## 2026-09-13 (b) — meter producer premise moved to saorsa-gossip-pubsub 0.5.80
+
+saorsa-gossip 0.5.80 carries two cooling fixes root-caused from x0x#611
+(saorsa-gossip#62: the #32 cooling floor becomes a replacement gate, so a
+local CPU stall can no longer strand a topic at eager degree 1 for the 120 s
+cooldown; saorsa-gossip#63: Bulk-priority topics can self-recover from
+cooling via one bounded probe per cooldown expiry, which covers every x0x
+announce/discovery/caps/release lane). The #501 meter premise therefore moves
+from 0.5.79 to **0.5.80**, checksum `2f019ae3c17a73197ff7c48b5078caa2d03b669b7c0b724e30d2037e44e868b6`.
+

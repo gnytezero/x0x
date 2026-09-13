@@ -1616,9 +1616,9 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
         .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
         .collect::<Vec<_>>();
     if pinned.len() != 1
-        || pinned[0]["version"].as_str() != Some("0.5.79")
+        || pinned[0]["version"].as_str() != Some("0.5.80")
         || pinned[0]["checksum"].as_str()
-            != Some("2070b36d7e26e8fdebd3a0d84f7aae8f30bebb607e2fdcf3e916faf43da336dc")
+            != Some("2f019ae3c17a73197ff7c48b5078caa2d03b669b7c0b724e30d2037e44e868b6")
     {
         raw["outcome"] = json!("INCONCLUSIVE");
         raw["reason"] = json!("published meter producer pin unavailable");
