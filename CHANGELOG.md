@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.44.0] - 2026-09-13
+
 ### Changed
 
 - ant-quic pin bumped 0.27.51 -> 0.27.52: `shutdown()` now joins the accept
@@ -135,7 +137,7 @@ All notable changes to this project will be documented in this file.
   Total wall time stays within the original 45 s guard; the `#447` assertion
   is unchanged (closes #681).
 
-## [v0.43.0] - 2026-09-13
+## [0.44.0] - 2026-09-13
 
 ### Changed
 
