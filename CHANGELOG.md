@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Tests
+
+- `integration_real_home_provision_rename_restart_join_e2e` (hs_f2 restart e2e):
+  apply the same bounded announce-retry loop that #686 applied to its sibling
+  `integration_treekem_home_rename_restart_single_announce_end_to_end`. The
+  one-shot `announce_identity` + bare 45 s cache poll left no recovery path
+  when the owner's 5 s `ensure_blob` fetch window expired under load; the fix
+  polls in `BLOB_FETCH_TIMEOUT_SECS + 3 s` windows, emits
+  `DIAG hs_f2_restart phase=blob_fetch_window_missed action=retry_announce`
+  on a miss, and re-triggers `announce_identity` to spawn a fresh fetch.
+  Total wall time stays within the original 45 s guard; the `#447` assertion
+  is unchanged (closes #681).
+
 ## [v0.43.0] - 2026-09-13
 
 ### Changed
