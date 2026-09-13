@@ -3,6 +3,15 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+### Changed
+
+- ant-quic pin bumped 0.27.51 -> 0.27.52: `shutdown()` now joins the accept
+  workers and refuses late handshake registrations (ant-quic#286/#288), so a
+  handshake completing after the lifecycle sweep can no longer land in both
+  maps and keep the remote's `is_connected` true until its idle timeout.
+  This is the mechanism that blocked retiring the #684 settle-barrier
+  workaround (refs #692, #510).
 ### Fixed
 
 - **The exclusive history handle no longer outlives the instance lock at
