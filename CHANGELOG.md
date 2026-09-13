@@ -3,7 +3,6 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
 ### Fixed
 
 - **The exclusive history handle no longer outlives the instance lock at
@@ -31,6 +30,27 @@ All notable changes to this project will be documented in this file.
   blocking code cannot be cancelled — bounded by one pass and covered by
   the restart-side retry in `tests/f2_public_group_bootstrap_wiring.rs`.
 
+### Tests
+
+- The #510 settle barrier no longer panics when the transport fails to close
+  the stale connection within 5 s (#510, ant-quic#283 workaround). ant-quic's
+  shutdown does not close superseded lifecycle survivors, so `is_connected`
+  can remain true until the idle timeout. On expiry the barrier now calls
+  `joiner_net.disconnect(&old_owner_peer)` (reconnect-eligible, no tombstone)
+  to force the joiner's view clean and continues rather than panicking. The
+  strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
+  genuine never-reconnects regression still fails at the same place.
+
+- **The drain-held-lock test is no longer timing-shaped (#661 item 3).**
+  `reserve_during_drain_is_refused_until_the_supervisor_finishes`
+  (src/server/instance_lock.rs) used to sleep 200 ms hoping the server had
+  accepted a stalled request before asserting the re-serve refusal — under
+  load the sleep could fire first, letting the drain finish and the
+  assertion flake. The stall now sends `Expect: 100-continue` and reads the
+  server's `100 Continue` interim response, the protocol-level proof the
+  handler is in flight on the body, so the refusal assertion runs only once
+  the drain is deterministically pinned open. No sleep was widened.
+
 ### Docs
 
 - **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
@@ -42,6 +62,74 @@ All notable changes to this project will be documented in this file.
   plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
   already covers the full observable chain. Added an `invariant E` anchor comment to
   `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
+
+### CI
+
+- Pin nextest to 0.9.144 in all nine CI jobs across `ci.yml` (test, coverage,
+  parity) and `integration.yml` (proptest, integration-core, integration-groups,
+  integration-voice-datagram, integration-net, integration-timing). The floating
+  `taiki-e/install-action@nextest` shorthand was resolving to the latest release
+  at job-start time, meaning any new nextest release could silently change CI
+  behaviour. Each step now uses `install-action@v2` with `tool: nextest@0.9.144`
+  for a reproducible, auditable install (#673).
+- Add a Windows lib-test job (#661 item 1, the unfinished half of #645
+  bullet 4): `cargo test --lib` did not compile on Windows because the
+  ADR-0028 control test modules unconditionally import
+  `std::os::unix::fs::PermissionsExt`. The three control families whose
+  whole fixture fabric is unix-permission-shaped (roster replay, row-6
+  recovery, sidecar recovery) are now `#[cfg(unix)]` at module level;
+  inside `adr0028_direct_controls` only the seven save-failure controls
+  (plus their `SaveFailureGuard`) arm permissions, so those are gated at
+  test level and the rest of the module — and the disposition module —
+  stay cross-platform. The new `Test Suite (Windows)` job compiles the
+  full lib test suite on `windows-latest`, and the instance-lock family
+  runs there — so the Windows share-mode contention path is finally
+  executed in CI, not just linked by the Build matrix.
+
+## [v0.43.0] - 2026-09-13
+
+### Changed
+
+- ant-quic pin bumped 0.27.50 → 0.27.51: `disconnect()` no longer leaves a
+  stale connection observable to `open_bi()` (ant-quic#278/#279), one
+  `accept_bi` consumer per connection — the relay accept task that silently
+  dropped app streams is gone (ant-quic#280/#282), `shutdown()` closes
+  superseded lifecycle survivors before the drain (ant-quic#283/#285), and
+  the simultaneous-open tiebreaker liveness fixes (ant-quic#281). This fixes
+  the mechanism behind the #277 reliable-voice churn flake and behind the
+  #510 restart flake (refs #277, #510); retiring the #684 settle-barrier
+  workaround and the flake-list allowances is tracked in #692.
+- **The launchd loaded-policy readback now runs off the async runtime, and
+  the intent record names the matched launchd domain (#671, follow-ups to
+  #668).** The `plutil`/`launchctl print` subprocesses behind the
+  `X0X_SUPERVISED=1` upgrade-time readback used to run inline on the runtime
+  worker (`apply_upgrade_from_manifest` and the post-manual-apply restart are
+  async), so a slow `launchctl` could stall the daemon mid-upgrade. The
+  readback now runs via `tokio::task::spawn_blocking`
+  (`readback_launchd_policy_offloaded`); a join failure fails closed to
+  `NotGuaranteed` — the apply is refused, never green-lit by an unread
+  policy. `LaunchdPolicyReadback::Verified` and the
+  `upgrade-handoff.json` intent record now carry which per-user launchd
+  domain (`gui`/`user`) actually answered — the domains are disjoint, so
+  without this an operator's `launchctl print` follow-up from the recovery
+  doc could read "Could not find service" for a job verified in the other
+  domain; intent files written before the field existed still parse.
+  ADR-0061 §3 remains **NOT MET**: the versioned-template half and the
+  systemd-side readback are open (tracked in #690; the ADR itself is
+  immutable after acceptance, so its acceptance-time status table stands).
+
+**BREAKING — upgrade restart-contract API:** two methods became `async` and
+three public types gained fields.
+- `AutoApplyUpgrader::resolve_restart_plan(&self, binary_path)` and
+  `AutoApplyUpgrader::restart_current_binary(&self, target_version)` are now
+  `async` (the launchd readback runs on the blocking pool); callers must
+  `.await` them.
+- `LaunchdPolicyReadback::Verified` gained `domain: &'static str` (`"gui"` or
+  `"user"`): constructions and exhaustive matches must supply/handle it.
+- `RestartPlan` and `UpgradeHandoff` gained
+  `launchd_verified: Option<LaunchdVerifiedJob>`; struct-literal callers must
+  populate it. `UpgradeHandoff` keeps `#[serde(default)]` on the field, so
+  intent files written before this change still parse.
 
 ### Tests
 
@@ -74,16 +162,17 @@ All notable changes to this project will be documented in this file.
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
 
-- **The drain-held-lock test is no longer timing-shaped (#661 item 3).**
-  `reserve_during_drain_is_refused_until_the_supervisor_finishes`
-  (src/server/instance_lock.rs) used to sleep 200 ms hoping the server had
-  accepted a stalled request before asserting the re-serve refusal — under
-  load the sleep could fire first, letting the drain finish and the
-  assertion flake. The stall now sends `Expect: 100-continue` and reads the
-  server's `100 Continue` interim response, the protocol-level proof the
-  handler is in flight on the body, so the refusal assertion runs only once
-  the drain is deterministically pinned open. No sleep was widened.
+### Docs
 
+- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
+  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
+  anchors and test references. Invariant E is proved subsumed by invariant A
+  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
+  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
+  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
+  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
+  already covers the full observable chain. Added an `invariant E` anchor comment to
+  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
 
 ### CI
 
@@ -94,19 +183,6 @@ All notable changes to this project will be documented in this file.
   at job-start time, meaning any new nextest release could silently change CI
   behaviour. Each step now uses `install-action@v2` with `tool: nextest@0.9.144`
   for a reproducible, auditable install (#673).
-- Add a Windows lib-test job (#661 item 1, the unfinished half of #645
-  bullet 4): `cargo test --lib` did not compile on Windows because the
-  ADR-0028 control test modules unconditionally import
-  `std::os::unix::fs::PermissionsExt`. The three control families whose
-  whole fixture fabric is unix-permission-shaped (roster replay, row-6
-  recovery, sidecar recovery) are now `#[cfg(unix)]` at module level;
-  inside `adr0028_direct_controls` only the seven save-failure controls
-  (plus their `SaveFailureGuard`) arm permissions, so those are gated at
-  test level and the rest of the module — and the disposition module —
-  stay cross-platform. The new `Test Suite (Windows)` job compiles the
-  full lib test suite on `windows-latest`, and the instance-lock family
-  runs there — so the Windows share-mode contention path is finally
-  executed in CI, not just linked by the Build matrix.
 
 ## [v0.42.3] - 2026-09-12
 
