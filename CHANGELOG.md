@@ -137,7 +137,7 @@ All notable changes to this project will be documented in this file.
   Total wall time stays within the original 45 s guard; the `#447` assertion
   is unchanged (closes #681).
 
-## [0.44.0] - 2026-09-13
+## [v0.43.0] - 2026-09-13
 
 ### Changed
 
