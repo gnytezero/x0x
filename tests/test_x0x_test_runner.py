@@ -721,6 +721,136 @@ class X0xTestRunnerTests(unittest.TestCase):
         self.assertEqual([20.0], fallback_started)
         self.assertLessEqual(clock[0], self.runner_mod.RESULT_TOTAL_BUDGET_SECS)
 
+    def test_slow_result_does_not_starve_next_result_raw_window(self) -> None:
+        slow_entered = threading.Event()
+        fast_entered = threading.Event()
+        release = threading.Event()
+
+        class ConcurrentClient(FakeClient):
+            def direct_send(self, target_aid, payload, **kwargs):
+                if target_aid == "a" * 64:
+                    slow_entered.set()
+                    if not release.wait(timeout=2):
+                        raise TimeoutError("fixture release missing")
+                else:
+                    fast_entered.set()
+                return super().direct_send(target_aid, payload, **kwargs)
+
+        runner = self.runner_mod.TestRunner("nyc", ConcurrentClient())
+        runner._enqueue_result(
+            {"kind": "send_result", "request_id": "slow"}, "a" * 64,
+        )
+        workers = runner._start_publisher_workers()
+        self.assertTrue(slow_entered.wait(timeout=1))
+        fast_enqueued = time.monotonic()
+        runner._enqueue_result(
+            {"kind": "send_result", "request_id": "fast"}, "b" * 64,
+        )
+        self.assertTrue(fast_entered.wait(timeout=1))
+        self.assertLess(
+            time.monotonic() - fast_enqueued,
+            self.runner_mod.RESULT_RAW_BUDGET_SECS,
+        )
+        release.set()
+        runner._stop_publisher_workers(workers)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+
+    def test_run_starts_publisher_pool_once(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+
+        def announce_and_stop() -> None:
+            runner._stop.set()
+
+        with patch.object(runner, "_bootstrap"), \
+                patch.object(runner, "_control_listener_loop"), \
+                patch.object(runner, "_direct_listener_loop"), \
+                patch.object(runner, "_announce_ready", side_effect=announce_and_stop):
+            self.assertEqual(0, runner.run())
+
+        publisher_threads = [
+            thread for thread in threading.enumerate()
+            if thread.name.startswith("x0x-result-publisher-")
+        ]
+        self.assertEqual([], publisher_threads)
+
+    def test_publisher_parallelism_is_bounded(self) -> None:
+        lock = threading.Lock()
+        release = threading.Event()
+        four_entered = threading.Event()
+        active = 0
+        maximum = 0
+
+        class BlockingClient(FakeClient):
+            def direct_send(inner_self, target_aid, payload, **kwargs):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                    if active == self.runner_mod.RESULT_PUBLISHER_WORKERS:
+                        four_entered.set()
+                try:
+                    if not release.wait(timeout=2):
+                        raise TimeoutError("fixture release missing")
+                    return super().direct_send(target_aid, payload, **kwargs)
+                finally:
+                    with lock:
+                        active -= 1
+
+        runner = self.runner_mod.TestRunner("nyc", BlockingClient())
+        for index in range(self.runner_mod.RESULT_PUBLISHER_WORKERS * 2):
+            runner._enqueue_result(
+                {"kind": "send_result", "request_id": f"bounded-{index}"},
+                f"{index:064x}",
+            )
+        workers = runner._start_publisher_workers()
+        self.assertTrue(four_entered.wait(timeout=1))
+        threading.Event().wait(0.05)
+        self.assertEqual(self.runner_mod.RESULT_PUBLISHER_WORKERS, maximum)
+        self.assertEqual(self.runner_mod.RESULT_PUBLISHER_WORKERS, active)
+        release.set()
+        runner._stop_publisher_workers(workers)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+
+    def test_replay_stays_coalesced_during_concurrent_publication(self) -> None:
+        from unittest.mock import patch
+
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        class BlockingClient(FakeClient):
+            def direct_send(self, target_aid, payload, **kwargs):
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise TimeoutError("fixture release missing")
+                return super().direct_send(target_aid, payload, **kwargs)
+
+        runner = self.runner_mod.TestRunner("nyc", BlockingClient())
+        command = self._command("pool-replay", invite="one")
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, "a" * 64, command)
+            workers = runner._start_publisher_workers()
+            self.assertTrue(entered.wait(timeout=1))
+            self._direct_command(runner, "a" * 64, command)
+            self.assertEqual(["pool-replay"], calls)
+            release.set()
+            runner._stop_publisher_workers(workers)
+
+        replay_key = ("direct:" + ("a" * 64), "pool-replay")
+        self.assertFalse(runner._replay[replay_key]["delivery_pending"])
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+
     def test_expired_queued_result_skips_transport_and_releases_pin(self) -> None:
         from unittest.mock import patch
 

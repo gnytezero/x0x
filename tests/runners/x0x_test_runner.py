@@ -102,6 +102,7 @@ RESULT_QUEUE_MAX_AGE_SECS = 300
 RESULT_TOTAL_BUDGET_SECS = 30.0
 RESULT_RAW_BUDGET_SECS = 20.0
 RESULT_HTTP_TIMEOUT_SECS = 15.0
+RESULT_PUBLISHER_WORKERS = 4
 COMMAND_REPLAY_MAX_ENTRIES = 256
 COMMAND_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 COMMAND_REPLAY_TTL_SECS = 300
@@ -403,10 +404,10 @@ class TestRunner:
         threads = [
             threading.Thread(target=self._control_listener_loop, daemon=True),
             threading.Thread(target=self._direct_listener_loop, daemon=True),
-            threading.Thread(target=self._publisher_loop, daemon=True),
         ]
         for t in threads:
             t.start()
+        publisher_threads = self._start_publisher_workers()
 
         self._announce_ready()
 
@@ -416,6 +417,7 @@ class TestRunner:
         except KeyboardInterrupt:
             pass
         self._stop.set()
+        self._stop_publisher_workers(publisher_threads)
         return 0
 
     def _bootstrap(self) -> None:
@@ -481,6 +483,32 @@ class TestRunner:
         )
 
     # ─── outbound delivery (DM-first, pubsub fallback) ─────────────────
+    def _start_publisher_workers(self) -> List[threading.Thread]:
+        workers = [
+            threading.Thread(
+                target=self._publisher_loop,
+                name=f"x0x-result-publisher-{index + 1}",
+                daemon=True,
+            )
+            for index in range(RESULT_PUBLISHER_WORKERS)
+        ]
+        for worker in workers:
+            worker.start()
+        return workers
+
+    def _stop_publisher_workers(
+        self, workers: List[threading.Thread],
+    ) -> None:
+        self._stop.set()
+        for worker in workers:
+            worker.join(timeout=1.0)
+        while True:
+            try:
+                item = self._send_q.get_nowait()
+            except queue.Empty:
+                break
+            self._release_dropped_result(item)
+
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
             try:
