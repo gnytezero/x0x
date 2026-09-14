@@ -605,6 +605,51 @@ pub async fn group_store_create(client: &DaemonClient, group_id: &str, name: &st
     Ok(())
 }
 
+/// `x0x group store legacy imports` — enumerate exact local migration sources.
+pub async fn legacy_store_imports(client: &DaemonClient, group_id: &str, app: &str) -> Result<()> {
+    client
+        .run_get(&format!("/groups/{group_id}/stores/{app}/legacy-imports"))
+        .await
+}
+
+/// `x0x group store legacy download` — retrieve an unchanged source snapshot.
+pub async fn legacy_store_download(
+    client: &DaemonClient,
+    group_id: &str,
+    app: &str,
+    source_id: &str,
+) -> Result<()> {
+    client
+        .run_get(&format!(
+            "/groups/{group_id}/stores/{app}/legacy-imports/{source_id}"
+        ))
+        .await
+}
+
+/// `x0x group store legacy import` — endorse and merge one reviewed source.
+pub async fn legacy_store_import(
+    client: &DaemonClient,
+    group_id: &str,
+    app: &str,
+    source_id: &str,
+    source_digest: &str,
+    idempotency_key: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({
+        "source_digest": source_digest,
+        "idempotency_key": idempotency_key,
+    });
+    let response = client
+        .post(
+            &format!("/groups/{group_id}/stores/{app}/legacy-imports/{source_id}"),
+            &body,
+        )
+        .await?;
+    print_value(client.format(), &response);
+    Ok(())
+}
+
 pub async fn state(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_get(&format!("/groups/{group_id}/state")).await
 }

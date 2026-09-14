@@ -780,7 +780,9 @@ mod tests {
         let err = ctx
             .seal_authorized(&signing, KvMutationKind::Delta, &store_id, b"must-not-seal")
             .expect_err("removed member must fail atomic admission");
-        assert!(err.to_string().contains("not an active group member"));
+        assert!(err
+            .to_string()
+            .contains("refused by current member/write policy"));
     }
 
     #[test]
