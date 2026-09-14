@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### CI
+
+- **Coverage Gate no longer loses the ratchet on a red test pass (#607).** The
+  coverage run now uses `--no-fail-fast` (coverage job only) and captures the
+  test exit with `|| status=$?`, so the LCOV report and the per-crate ratchet
+  (`--fail-under-lines 65.7`, then `check-coverage-thresholds.py
+  --enforce-global`) are still attempted after a failing test pass; the job
+  still fails on test, report, or ratchet errors (first nonzero phase exit
+  wins). The exclusion comment's "~3x llvm-cov slowdown" rationale is replaced
+  by the per-binary reasons already listed below it (#607; #702 disputes the
+  blanket load attribution); the exclusions themselves and all thresholds are
+  unchanged. New `scripts/ci/test_coverage_gate.sh` drives the actual workflow
+  `run:` block (extracted from ci.yml, PATH-stub cargo/python3 + stub
+  nextest-isolated.sh) through success, test-failure, report-failure and
+  ratchet-failure controls, asserting phase order, exit codes and argument
+  preservation.
+
 ## [v0.45.0] - 2026-09-14
 
 ### Changed
