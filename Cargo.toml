@@ -44,17 +44,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "0.5.81"
-saorsa-gossip-crdt-sync = "0.5.81"
-saorsa-gossip-groups = "0.5.81"
-saorsa-gossip-identity = "0.5.81"
-saorsa-gossip-membership = "0.5.81"
-saorsa-gossip-presence = "0.5.81"
-saorsa-gossip-pubsub = "0.5.81"
-saorsa-gossip-rendezvous = "0.5.81"
-saorsa-gossip-runtime = "0.5.81"
-saorsa-gossip-transport = "0.5.81"
-saorsa-gossip-types = "0.5.81"
+saorsa-gossip-coordinator = "0.5.82"
+saorsa-gossip-crdt-sync = "0.5.82"
+saorsa-gossip-groups = "0.5.82"
+saorsa-gossip-identity = "0.5.82"
+saorsa-gossip-membership = "0.5.82"
+saorsa-gossip-presence = "0.5.82"
+saorsa-gossip-pubsub = "0.5.82"
+saorsa-gossip-rendezvous = "0.5.82"
+saorsa-gossip-runtime = "0.5.82"
+saorsa-gossip-transport = "0.5.82"
+saorsa-gossip-types = "0.5.82"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -96,7 +96,7 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true }
 # Voice adapters (saorsa-webrtc V1.1/V1.2): trait surfaces only — no
 # webrtc-rs, no codecs. `quic-native` matches x0x's transport philosophy.
 [dependencies.saorsa-webrtc-core]
-version = "0.5.0"
+version = "0.6.0"
 optional = true
 default-features = false
 features = ["quic-native"]
@@ -105,7 +105,7 @@ features = ["quic-native"]
 # apps get the codec matching the transport without a second dep to pin).
 # Default features = real Opus only; no video codecs.
 [dependencies.saorsa-webrtc-codecs]
-version = "0.5.0"
+version = "0.6.0"
 optional = true
 
 [features]
@@ -200,4 +200,3 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
-

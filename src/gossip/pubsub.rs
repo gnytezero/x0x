@@ -335,6 +335,18 @@ const VERSION_V3: u8 = 0x03;
 /// Domain and bounds of gossip #48's Signed KV inner verifier (ADR-0063).
 const MSG_V3_PREFIX: &[u8] = b"x0x-msg-v3";
 const MAX_V3_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+/// Largest application payload that fits a signed V3 envelope for `topic`.
+/// Callers that create indivisible state images use this to fail explicitly
+/// before publication rather than relying on a transport rejection.
+pub(crate) fn max_signed_v3_payload_bytes(topic: &str) -> Option<usize> {
+    let header = 1usize
+        .checked_add(32)?
+        .checked_add(2 + ML_DSA_65_PUBKEY_LEN)?
+        .checked_add(2 + ML_DSA_65_SIG_LEN)?
+        .checked_add(2 + topic.len())?;
+    MAX_V3_ENVELOPE_BYTES.checked_sub(header)
+}
 const ML_DSA_65_PUBKEY_LEN: usize = 1952;
 const ML_DSA_65_SIG_LEN: usize = 3309;
 
@@ -827,6 +839,34 @@ impl PubSubManager {
         let relay_fanout = super::relay_fanout::RelayFanout::new(Arc::clone(&subscribed_topic_ids));
         crate::storm_control::register_announce_validators(plumtree.as_ref(), &relay_fanout);
 
+        // #697: relay topic lifecycle. Relay topics enter via inbound frames
+        // (ensure_registered on the inbound path) and nothing reclaimed
+        // their validator/bucket state — measured ~7 topics/hour, linear,
+        // no plateau. One slow sweep evicts idle, unsubscribed topics and
+        // drops their sg composites; a sighted-again topic re-registers on
+        // its next inbound frame. The task holds only Weak handles and
+        // exits at the first tick after the manager (and with it the
+        // fanout and plumtree) drops — a strong capture would pin both
+        // Arcs forever.
+        {
+            let sweep_fanout = Arc::downgrade(&relay_fanout);
+            let sweep_plumtree = Arc::downgrade(&plumtree);
+            tokio::spawn(async move {
+                let mut sweep = tokio::time::interval(std::time::Duration::from_secs(
+                    super::relay_fanout::RELAY_TOPIC_EVICT_POLL_SECS,
+                ));
+                loop {
+                    sweep.tick().await;
+                    let (Some(fanout), Some(plumtree)) =
+                        (sweep_fanout.upgrade(), sweep_plumtree.upgrade())
+                    else {
+                        break; // manager dropped — stop sweeping
+                    };
+                    fanout.evict_idle_topics(plumtree.as_ref());
+                }
+            });
+        }
+
         Ok(Self {
             network,
             plumtree,
@@ -1230,7 +1270,7 @@ impl PubSubManager {
         // reads the live subscriber set above, so this is once per topic,
         // not per subscription).
         self.relay_fanout
-            .ensure_registered(&self.plumtree, topic_id);
+            .ensure_registered(self.plumtree.as_ref(), topic_id);
         // ADR-0034 / #397 (Leaf C0): a Leaf node REFUSES inbound frames —
         // including anti-entropy — for unsubscribed topics, so a topic that
         // was unsubscribed for a while has no passively-repaired state to
@@ -1601,7 +1641,7 @@ impl PubSubManager {
         // lookup per frame; the write path runs once per topic.
         if let Some(header) = &header {
             self.relay_fanout
-                .ensure_registered(&self.plumtree, header.topic);
+                .ensure_registered(self.plumtree.as_ref(), header.topic);
         }
         let _repair_scope = if header
             .as_ref()
@@ -1792,7 +1832,8 @@ impl PubSubManager {
     async fn initialize_topic_peers(&self, topic: TopicId) {
         // #674 C2/C3: the pre-subscribe warm path also creates the topic,
         // so the composite must exist before any inbound frame can admit.
-        self.relay_fanout.ensure_registered(&self.plumtree, topic);
+        self.relay_fanout
+            .ensure_registered(self.plumtree.as_ref(), topic);
         self.ensure_eager_ceiling().await;
         // Issue #206: plane-gated peer view (see refresh_topic_peers).
         let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;

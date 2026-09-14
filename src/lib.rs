@@ -16340,6 +16340,69 @@ impl Agent {
         })
     }
 
+    /// Open or restore a creator-anchored public group-signed store.
+    pub async fn open_public_group_kv_store_persistent(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        creator: identity::AgentId,
+        context: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
+        refresh: kv::sync::SecureRefreshFn,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        if name.is_empty() || context.group_id() != stable_group_id.as_bytes() {
+            return Err(kv_storage_err(
+                "invalid public group store binding".to_string(),
+            ));
+        }
+        let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
+        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        let mut store = match kv::sync::load_snapshot(&persist_path) {
+            Ok(Some(store)) => {
+                validate_group_kv_store_binding(
+                    &store,
+                    name,
+                    stable_group_id,
+                    creator,
+                    GroupStoreProtection::PublicSigned,
+                    None,
+                )?;
+                store
+            }
+            Ok(None) => kv::KvStore::new_group_signed(
+                store_id,
+                name.to_string(),
+                creator,
+                stable_group_id.as_bytes().to_vec(),
+                std::sync::Arc::clone(&context),
+            )
+            .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
+            Err(e) => {
+                return Err(kv_storage_err(format!(
+                    "public group snapshot is unreadable ({e}); refusing to start with amnesia"
+                )))
+            }
+        };
+        store
+            .set_secure_context(std::sync::Arc::clone(&context))
+            .map_err(|e| kv_storage_err(format!("group context re-attach failed: {e}")))?;
+        let (sync, peer_id) = self
+            .spawn_kv_sync_inner(
+                store,
+                &topic,
+                Some(persist_path),
+                Some(context),
+                Some(refresh),
+            )
+            .await?;
+        Ok(KvStoreHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+            owner_signing: None,
+        })
+    }
+
     /// Join an existing key-value store by topic, anchoring ownership on the
     /// trusted out-of-band `owner`.
     ///
@@ -16509,6 +16572,7 @@ pub(crate) fn validate_group_kv_store_binding(
     name: &str,
     stable_group_id: &str,
     creator: identity::AgentId,
+    protection: GroupStoreProtection,
     cached_member: Option<&identity::AgentId>,
 ) -> error::Result<()> {
     let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
@@ -16523,9 +16587,14 @@ pub(crate) fn validate_group_kv_store_binding(
             "group kv store ID or creator binding mismatch".into(),
         ));
     }
-    if !matches!(store.policy(), kv::AccessPolicy::Encrypted { group_id }
-        if group_id.as_slice() == stable_group_id.as_bytes())
-    {
+    let policy_matches = match (protection, store.policy()) {
+        (GroupStoreProtection::Encrypted, kv::AccessPolicy::Encrypted { group_id })
+        | (GroupStoreProtection::PublicSigned, kv::AccessPolicy::GroupSigned { group_id }) => {
+            group_id.as_slice() == stable_group_id.as_bytes()
+        }
+        _ => false,
+    };
+    if !policy_matches {
         return Err(kv_storage_err(
             "group kv store policy or group binding mismatch".into(),
         ));
@@ -16536,13 +16605,21 @@ pub(crate) fn validate_group_kv_store_binding(
                 "cached group kv store has no secure context".into(),
             ));
         };
-        if ctx.group_id() != stable_group_id.as_bytes() || !ctx.is_active_member(member) {
+        let member_is_valid =
+            protection == GroupStoreProtection::PublicSigned || ctx.is_active_member(member);
+        if ctx.group_id() != stable_group_id.as_bytes() || !member_is_valid {
             return Err(kv_storage_err(
                 "cached group kv store context is foreign or retired".into(),
             ));
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GroupStoreProtection {
+    Encrypted,
+    PublicSigned,
 }
 
 /// The actual persistent group opener's socket-free restore/reattach seam.
@@ -16565,7 +16642,14 @@ fn load_group_kv_store(
     let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
     let mut store = match kv::sync::load_snapshot(path) {
         Ok(Some(store)) => {
-            validate_group_kv_store_binding(&store, name, stable_group_id, creator, None)?;
+            validate_group_kv_store_binding(
+                &store,
+                name,
+                stable_group_id,
+                creator,
+                GroupStoreProtection::Encrypted,
+                None,
+            )?;
             store
         }
         Ok(None) => kv::KvStore::new_encrypted(
@@ -16636,14 +16720,26 @@ mod issue565_group_binding_tests {
         write_snapshot(&path, &store);
         let inert = kv::sync::load_snapshot(&path).unwrap().unwrap();
         assert!(inert.secure_context().is_none());
-        assert!(
-            validate_group_kv_store_binding(&inert, "Wiki", &group, owner, Some(&owner)).is_err()
-        );
+        assert!(validate_group_kv_store_binding(
+            &inert,
+            "Wiki",
+            &group,
+            owner,
+            GroupStoreProtection::Encrypted,
+            Some(&owner),
+        )
+        .is_err());
         let restored =
             load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).unwrap();
-        assert!(
-            validate_group_kv_store_binding(&restored, "Wiki", &group, owner, Some(&owner)).is_ok()
-        );
+        assert!(validate_group_kv_store_binding(
+            &restored,
+            "Wiki",
+            &group,
+            owner,
+            GroupStoreProtection::Encrypted,
+            Some(&owner),
+        )
+        .is_ok());
         assert!(load_group_kv_store(
             &path,
             "Wiki",
@@ -16657,8 +16753,15 @@ mod issue565_group_binding_tests {
         assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, foreign).is_err());
         ctx.invalidate();
         assert!(
-            validate_group_kv_store_binding(&restored, "Wiki", &group, owner, Some(&owner))
-                .is_err(),
+            validate_group_kv_store_binding(
+                &restored,
+                "Wiki",
+                &group,
+                owner,
+                GroupStoreProtection::Encrypted,
+                Some(&owner),
+            )
+            .is_err(),
             "retirement fences the cached store's shared context"
         );
         assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx).is_err());
@@ -16672,7 +16775,7 @@ mod issue565_group_binding_tests {
         let group = "ab".repeat(16);
         let ctx = context(&group, owner);
         let id = kv::encrypted::group_store_identity(&group, "Wiki").0;
-        for case in 0..4 {
+        for case in 0..5 {
             let store = match case {
                 0 => kv::KvStore::new_encrypted(
                     kv::encrypted::group_store_identity(&group, "Web").0,
@@ -16691,7 +16794,7 @@ mod issue565_group_binding_tests {
                 )
                 .unwrap(),
                 2 => kv::KvStore::new(id, "Wiki".into(), owner, kv::AccessPolicy::Signed).unwrap(),
-                _ => kv::KvStore::new_encrypted(
+                3 => kv::KvStore::new_encrypted(
                     id,
                     "Wiki".into(),
                     owner,
@@ -16699,10 +16802,25 @@ mod issue565_group_binding_tests {
                     context("foreign", owner),
                 )
                 .unwrap(),
+                _ => kv::KvStore::new_group_signed(
+                    id,
+                    "Wiki".into(),
+                    owner,
+                    group.as_bytes().to_vec(),
+                    ctx.clone(),
+                )
+                .unwrap(),
             };
             assert!(
-                validate_group_kv_store_binding(&store, "Wiki", &group, owner, Some(&owner))
-                    .is_err(),
+                validate_group_kv_store_binding(
+                    &store,
+                    "Wiki",
+                    &group,
+                    owner,
+                    GroupStoreProtection::Encrypted,
+                    Some(&owner),
+                )
+                .is_err(),
                 "cached case {case}"
             );
             write_snapshot(&path, &store);
@@ -16767,6 +16885,7 @@ impl KvStoreHandle {
         name: &str,
         stable_group_id: &str,
         creator: identity::AgentId,
+        protection: GroupStoreProtection,
     ) -> error::Result<()> {
         let (_, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
         if self.sync.topic() != topic {
@@ -16780,6 +16899,7 @@ impl KvStoreHandle {
             name,
             stable_group_id,
             creator,
+            protection,
             Some(&self.agent_id),
         )
     }
@@ -16796,6 +16916,11 @@ impl KvStoreHandle {
     /// replication is exclusively the sealed gossip path.
     pub async fn is_encrypted(&self) -> bool {
         self.sync.read().await.is_encrypted()
+    }
+
+    /// Whether this handle uses the authenticated public-group sync path.
+    pub async fn is_group_signed(&self) -> bool {
+        self.sync.read().await.is_group_signed()
     }
 
     /// True when this replica holds an owner-signed checkpoint (its own or
@@ -16976,6 +17101,13 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        self.sync
+            .authorize_local_write(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         // Durability gate: while the store is durability-degraded (a prior
         // snapshot write failed), refuse NEW local mutations until a retry
         // persist of the current state succeeds — otherwise unpersisted
@@ -17080,6 +17212,13 @@ impl KvStoreHandle {
     ///
     /// Returns an error if the store cannot be read.
     pub async fn get(&self, key: &str) -> error::Result<Option<KvEntrySnapshot>> {
+        self.sync
+            .authorize_local_read(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         let store = self.sync.read().await;
         Ok(store.get(key).map(|e| KvEntrySnapshot {
             key: e.key.clone(),
@@ -17110,6 +17249,13 @@ impl KvStoreHandle {
     /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
     /// to write under the store's access policy.
     pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+        self.sync
+            .authorize_local_write(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         // Durability gate — see put_with_delta.
         self.sync.ensure_durable().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -17169,10 +17315,10 @@ impl KvStoreHandle {
     ) -> error::Result<()> {
         {
             let mut store = self.sync.write().await;
-            if store.is_encrypted() {
+            if store.is_encrypted() || store.is_group_signed() {
                 return Err(error::IdentityError::Storage(std::io::Error::other(
-                    "kv direct delta rejected: encrypted stores accept only sealed \
-                     sync records, never plaintext direct deltas",
+                    "kv direct delta rejected: group stores accept only authenticated \
+                     group sync records, never plaintext direct deltas",
                 )));
             }
             store
@@ -17198,6 +17344,13 @@ impl KvStoreHandle {
     ///
     /// Returns an error if the store cannot be read.
     pub async fn keys(&self) -> error::Result<Vec<KvEntrySnapshot>> {
+        self.sync
+            .authorize_local_read(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         let store = self.sync.read().await;
         Ok(store
             .active_entries()

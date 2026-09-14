@@ -194,10 +194,10 @@ function modalErrorText() {
 "#;
 
 fn public_space_routes() -> &'static str {
-    // A signed_public space whose page store already exists.
+    // A signed_public space whose shared page store opens successfully.
     r#"
     ROUTES['GET /groups/sid1'] = { _http_ok: true, ok: true, policy: { confidentiality: 'signed_public' } };
-    ROUTES['GET /stores'] = { _http_ok: true, ok: true, stores: [{ id: 'x0x-channels-sid1' }] };
+    ROUTES['POST /groups/sid1/stores'] = { _http_ok: true, ok: true, id: 'x0x-channels-sid1' };
     "#
 }
 
