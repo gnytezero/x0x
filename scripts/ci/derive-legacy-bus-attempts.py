@@ -236,16 +236,21 @@ def derive(record, lock_bytes):
         if arm == "D5":
             require(BUS in after, "POSITIVE_BUS_ROW_ABSENT")
             # Endpoint peer_scores are retained diagnostics, not a send premise.
-        delta = deltas.get(BUS, {}).get("eager", {}).get("bytes", 0)
-        if (arm == "D5" and delta == 0) or (arm == "O5" and delta != 0):
-            oracle_failures.append(arm + "_EAGER_ORACLE")
+        bus_deltas = deltas.get(BUS, {})
+        eager_delta = bus_deltas.get("eager", {}).get("bytes", 0)
+        oracle_kinds = ("eager", "ihave") if arm == "D5" else KINDS
+        oracle_delta = sum(bus_deltas.get(kind, {}).get("bytes", 0) for kind in oracle_kinds)
+        if arm == "D5" and oracle_delta == 0:
+            oracle_failures.append("D5_DISSEMINATION_ORACLE")
+        elif arm == "O5" and oracle_delta != 0:
+            oracle_failures.append("O5_BUS_EGRESS_ORACLE")
         relay_delta = integer(b["participation"]["relay_bytes"]) - integer(a["participation"]["relay_bytes"])
         require(relay_delta >= 0, "RELAY_COUNTER_DECREASE")
         if relay_delta != 0:
             oracle_failures.append(arm + "_RELAY_CHANGED")
         result[arm] = {"elapsed_seconds": elapsed, "bus_row_present_t0": BUS in before,
-                       "bus_row_present_t1": BUS in after, "bus_eager_attempt_bytes": delta,
-                       "bus_eager_attempt_KiB_per_s": delta / elapsed / 1024,
+                       "bus_row_present_t1": BUS in after, "bus_eager_attempt_bytes": eager_delta,
+                       "bus_eager_attempt_KiB_per_s": eager_delta / elapsed / 1024,
                        "relay_delta": relay_delta, "all_topic_kind_deltas": deltas,
                        "row_count_t0": len(before), "row_count_t1": len(after)}
     return {"derivation": "FAIL" if oracle_failures else "CONSISTENT", "oracle_failures": oracle_failures,
