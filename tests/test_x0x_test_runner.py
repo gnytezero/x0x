@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import io
 import json
 import queue
 import sys
+import threading
+import time
 import unittest
+import urllib.error
 from pathlib import Path
 
 
@@ -39,6 +44,8 @@ class FakeClient:
         self.published: list[tuple[str, bytes]] = []
         self.subscribed: list[str] = []
         self.unsubscribed: list[str] = []
+        self.direct: list[tuple[str, bytes]] = []
+        self.direct_error_code: int | None = None
 
     def publish(self, topic: str, payload: bytes) -> None:
         self.published.append((topic, payload))
@@ -51,6 +58,15 @@ class FakeClient:
 
     def unsubscribe(self, subscription_id: str) -> dict[str, bool]:
         self.unsubscribed.append(subscription_id)
+        return {"ok": True}
+
+    def direct_send(self, target_aid: str, payload: bytes, **_kwargs) -> dict[str, bool]:
+        self.direct.append((target_aid, payload))
+        if self.direct_error_code is not None:
+            raise urllib.error.HTTPError(
+                "http://local/direct/send", self.direct_error_code,
+                "fake direct rejection", {}, io.BytesIO(b"{}"),
+            )
         return {"ok": True}
 
 
@@ -105,13 +121,79 @@ class X0xTestRunnerTests(unittest.TestCase):
             - ((self.runner_mod.RESULT_QUEUE_MAX_AGE_SECS + 1) * 1000)
         )
         runner._send_q.put_nowait(
-            ({"kind": "send_result", "request_id": "stale", "ts_ms": stale_ts}, None)
+            ({"kind": "send_result", "request_id": "stale", "ts_ms": stale_ts}, None, False)
         )
 
         runner._enqueue_result({"kind": "send_result", "request_id": "fresh"})
 
         queued = [runner._send_q.get_nowait()[0]["request_id"]]
         self.assertEqual(["fresh"], queued)
+
+    def test_result_dm_negotiates_chunks_and_preserves_legacy_behavior(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        anchor = "a" * 64
+        small = {"kind": "api_result", "request_id": "small"}
+        small_payload = json.dumps(small).encode()
+        self.assertTrue(runner._send_result_dm(anchor, small_payload, small))
+        self.assertEqual(1, len(client.direct))
+        self.assertTrue(client.direct[0][1].startswith(b"x0xtest|res|"))
+
+        large = {"kind": "api_result", "request_id": "large",
+                 "details": {"body": "x" * 60_000}}
+        large_payload = json.dumps(large).encode()
+        self.assertFalse(runner._send_result_dm(anchor, large_payload, large))
+        self.assertEqual(1, len(client.direct))
+
+        self.assertTrue(runner._send_result_dm(anchor, large_payload, large, True))
+        chunks = [wire for _, wire in client.direct[1:]]
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(wire.startswith(b"x0xtest|res2|") for wire in chunks))
+        self.assertTrue(all(len(wire) <= self.runner_mod.DM_MAX_BYTES for wire in chunks))
+
+    def test_chunk_413_falls_back_to_legacy_pubsub(self) -> None:
+        client = FakeClient()
+        client.direct_error_code = 413
+        runner = self.runner_mod.TestRunner("nyc", client)
+        anchor = "a" * 64
+        large = {"kind": "api_result", "request_id": "large-413",
+                 "details": {"body": "x" * 60_000}}
+        runner._enqueue_result(large, target_aid=anchor, result_chunks_v2=True)
+        publisher = threading.Thread(target=runner._publisher_loop)
+        publisher.start()
+        deadline = time.monotonic() + 2.0
+        while not client.published and time.monotonic() < deadline:
+            time.sleep(0.01)
+        runner._stop.set()
+        publisher.join(timeout=10.0)
+        self.assertFalse(publisher.is_alive())
+        self.assertGreaterEqual(len(client.direct), self.runner_mod.PUBLISH_RETRY_MAX)
+        self.assertEqual(self.runner_mod.LEGACY_RESULTS_TOPIC, client.published[0][0])
+
+    def test_chunk_negotiation_is_scoped_to_each_command(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        anchor = "a" * 64
+        base = {"action": "noop_ack", "anchor_aid": anchor,
+                "params": {"request_id": "r"}}
+        runner._dispatch_command(dict(base, command_id="v2", result_chunks_v2=True))
+        runner._dispatch_command(dict(base, command_id="v1"))
+        first = runner._send_q.get_nowait()
+        second = runner._send_q.get_nowait()
+        self.assertTrue(first[2])
+        self.assertFalse(second[2])
+
+    def test_runner_does_not_echo_chunked_result_dm(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        payload = json.dumps({"request_id": "r", "kind": "api_result"}).encode()
+        frame = self.runner_mod.frame_result(payload, "transfer", "r")[0]
+        runner._handle_direct_event(
+            "direct_message",
+            json.dumps({"sender": "a" * 64,
+                        "payload": base64.b64encode(frame).decode()}),
+        )
+        self.assertTrue(runner._send_q.empty())
 
     def test_no_pubsub_after_discover_unsubscribes_control_topics(self) -> None:
         client = FakeClient()

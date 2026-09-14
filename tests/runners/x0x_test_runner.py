@@ -11,6 +11,7 @@ Wire protocol — three DM payload prefixes:
 
     x0xtest|cmd|<base64-json>          orchestrator → runner
     x0xtest|res|<base64-json>          runner → orchestrator
+    x0xtest|res2|<base64-json-frame>   negotiated chunked result
     x0xtest|hop|<rid>|<digest>|
         <anchor_aid_hex>|<payload>     runner → runner test traffic;
                                        receiver DMs `res` back to
@@ -53,6 +54,16 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_LOCAL_TESTS_DIR = os.path.dirname(_SCRIPT_DIR)
+_INSTALLED_LIB_DIR = os.path.join(
+    os.path.dirname(_SCRIPT_DIR), "lib", "x0x-test-runner",
+)
+sys.path.insert(0, os.environ.get("X0X_RUNNER_LIB_DIR", _INSTALLED_LIB_DIR))
+sys.path.insert(0, _LOCAL_TESTS_DIR)
+sys.path.insert(0, _SCRIPT_DIR)
+from result_framing import DM_MAX_BYTES, frame_result
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 # Legacy topics retained so an older orchestrator that publishes on the
@@ -337,11 +348,11 @@ class TestRunner:
         self._stop = threading.Event()
         self._no_pubsub_after_discover = no_pubsub_after_discover
         self._pubsub_disabled_after_discover = False
-        # Outbound delivery is a (envelope, target_aid) tuple.
+        # Outbound delivery records per-command chunk negotiation.
         # target_aid=None means publish on the legacy results topic
         # (last-resort fallback for orchestrators that don't include
         # an anchor address).
-        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str]]]" = (
+        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool]]" = (
             queue.Queue(maxsize=RESULT_QUEUE_MAX)
         )
         self._agent_id: Optional[str] = None
@@ -445,19 +456,31 @@ class TestRunner:
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                envelope, target_aid = self._send_q.get(timeout=0.5)
+                envelope, target_aid, result_chunks_v2 = self._send_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             payload = json.dumps(envelope).encode("utf-8")
             if target_aid:
-                if self._send_result_dm(target_aid, payload, envelope):
+                v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
+                mode = "chunks_v2" if result_chunks_v2 and v1_bytes > DM_MAX_BYTES else "v1"
+                self.log.info(
+                    "result delivery kind=%s request_id=%s command_id=%s "
+                    "mode=%s json_bytes=%d dm_bytes=%d",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), mode, len(payload), v1_bytes,
+                )
+                if self._send_result_dm(
+                    target_aid, payload, envelope, result_chunks_v2,
+                ):
                     continue
                 # DM failed irretrievably — fall through to pubsub so the
                 # orchestrator at least sees the result on the legacy
                 # topic if it's still listening there.
                 self.log.warning(
-                    "DM result to %s… failed, falling back to pubsub",
-                    target_aid[:16],
+                    "result fallback kind=%s request_id=%s command_id=%s "
+                    "from_mode=%s json_bytes=%d",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), mode, len(payload),
                 )
             self._publish_result_legacy(payload, envelope)
 
@@ -466,12 +489,32 @@ class TestRunner:
         target_aid: str,
         payload: bytes,
         envelope: Dict[str, Any],
+        result_chunks_v2: bool = False,
     ) -> bool:
         # Phase-A result DMs use the raw-QUIC message ACK path so the control
         # plane stays independent of PlumTree. If raw delivery fails, the
         # runner still falls back to the legacy results topic so the
         # orchestrator can record the failure details.
         wire = b"x0xtest|res|" + base64.b64encode(payload)
+        if len(wire) <= DM_MAX_BYTES:
+            return self._send_result_wire(target_aid, wire)
+        if result_chunks_v2:
+            request_id = envelope.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                return False
+            transfer_id = f"{request_id}:{uuid.uuid4().hex}"
+            try:
+                frames = frame_result(payload, transfer_id, request_id)
+            except ValueError as exc:
+                self.log.warning("result cannot be chunked: %s", exc)
+                return False
+            return all(self._send_result_wire(target_aid, frame) for frame in frames)
+        # Older orchestrators cannot reassemble chunks. Let the publisher
+        # loop use the existing PubSub fallback without attempting an
+        # over-limit direct message.
+        return False
+
+    def _send_result_wire(self, target_aid: str, wire: bytes) -> bool:
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
             try:
                 self.client.direct_send(
@@ -484,6 +527,7 @@ class TestRunner:
                 )
                 return True
             except urllib.error.HTTPError as exc:
+                exc.close()
                 # 404 = recipient_key_unavailable; not transient.
                 if exc.code == 404:
                     self.log.debug(
@@ -537,6 +581,7 @@ class TestRunner:
         self,
         body: Dict[str, Any],
         target_aid: Optional[str] = None,
+        result_chunks_v2: bool = False,
     ) -> None:
         body.setdefault("node", self.node_name)
         body.setdefault("agent_id", self._agent_id)
@@ -547,14 +592,14 @@ class TestRunner:
             current_ms = now_ms()
             body["ts_ms"] = current_ms
         self._prune_stale_results(current_ms)
-        item = (body, target_aid)
+        item = (body, target_aid, result_chunks_v2)
         try:
             self._send_q.put_nowait(item)
             return
         except queue.Full:
             pass
         try:
-            dropped, _ = self._send_q.get_nowait()
+            dropped, _, _ = self._send_q.get_nowait()
             self.log.warning(
                 "dropping oldest queued result after result buffer filled: "
                 "kind=%s request_id=%s",
@@ -582,7 +627,7 @@ class TestRunner:
                 item = self._send_q.get_nowait()
             except queue.Empty:
                 break
-            envelope, _ = item
+            envelope, _, _ = item
             ts_ms = envelope.get("ts_ms")
             if isinstance(ts_ms, int) and ts_ms < cutoff_ms:
                 dropped += 1
@@ -731,8 +776,9 @@ class TestRunner:
         if marker == "cmd":
             self._handle_command_dm(parts[2:], sender_aid)
             return
-        if marker == "res":
-            # Other runner is replying to us — only the orchestrator
+        if marker in ("res", "res2"):
+            # Another runner is replying to the orchestrator. Never echo
+            # either result protocol from a runner.
             # cares; ignore on a runner.
             return
         if marker == "hop":
@@ -857,6 +903,7 @@ class TestRunner:
             cmd_id,
             (anchor_aid or "")[:16],
         )
+        result_chunks_v2 = cmd.get("result_chunks_v2") is True
         try:
             if action == "discover":
                 self._enqueue_result(
@@ -868,6 +915,7 @@ class TestRunner:
                         "details": {"node": self.node_name},
                     },
                     target_aid=anchor_aid,
+                    result_chunks_v2=result_chunks_v2,
                 )
                 if self._should_disable_pubsub_after_discover(cmd, params):
                     self._disable_pubsub_after_discover()
@@ -880,9 +928,10 @@ class TestRunner:
                         "outcome": "ok",
                     },
                     target_aid=anchor_aid,
+                    result_chunks_v2=result_chunks_v2,
                 )
             elif action == "send_dm":
-                self._do_send_dm(cmd_id, params, anchor_aid)
+                self._do_send_dm(cmd_id, params, anchor_aid, result_chunks_v2)
             elif action in (
                 "contact_add",
                 "contact_update",
@@ -900,7 +949,9 @@ class TestRunner:
                 "group_set_display_name",
                 "group_leave",
             ):
-                self._do_simple_action(action, cmd_id, params, anchor_aid)
+                self._do_simple_action(
+                    action, cmd_id, params, anchor_aid, result_chunks_v2,
+                )
             else:
                 self._enqueue_result(
                     {
@@ -910,6 +961,7 @@ class TestRunner:
                         "outcome": {"error": f"unknown action: {action}"},
                     },
                     target_aid=anchor_aid,
+                    result_chunks_v2=result_chunks_v2,
                 )
         except Exception as exc:
             self.log.exception("command failed: %s", exc)
@@ -921,6 +973,7 @@ class TestRunner:
                     "outcome": {"error": str(exc)},
                 },
                 target_aid=anchor_aid,
+                result_chunks_v2=result_chunks_v2,
             )
 
     def _should_disable_pubsub_after_discover(
@@ -961,6 +1014,7 @@ class TestRunner:
         cmd_id: Optional[str],
         params: Dict[str, Any],
         anchor_aid: Optional[str],
+        result_chunks_v2: bool,
     ) -> None:
         recipient = params.get("recipient_aid")
         payload_b64 = params.get("payload_b64", "")
@@ -975,6 +1029,7 @@ class TestRunner:
                     "outcome": {"error": "missing recipient_aid"},
                 },
                 target_aid=anchor_aid,
+                result_chunks_v2=result_chunks_v2,
             )
             return
         try:
@@ -988,6 +1043,7 @@ class TestRunner:
                     "outcome": {"error": f"bad payload base64: {exc}"},
                 },
                 target_aid=anchor_aid,
+                result_chunks_v2=result_chunks_v2,
             )
             return
         digest = params.get("digest_marker")
@@ -1041,6 +1097,7 @@ class TestRunner:
                         },
                     },
                     target_aid=anchor_aid,
+                    result_chunks_v2=result_chunks_v2,
                 )
                 return
             except urllib.error.HTTPError as exc:
@@ -1091,6 +1148,7 @@ class TestRunner:
                 "details": details,
             },
             target_aid=anchor_aid,
+            result_chunks_v2=result_chunks_v2,
         )
 
     # ─── Phase B: groups + contacts dispatch ───────────────────────────
@@ -1106,6 +1164,7 @@ class TestRunner:
         cmd_id: Optional[str],
         params: Dict[str, Any],
         anchor_aid: Optional[str],
+        result_chunks_v2: bool,
     ) -> None:
         request_id = params.get("request_id") or str(uuid.uuid4())
         try:
@@ -1119,6 +1178,7 @@ class TestRunner:
                     "details": response,
                 },
                 target_aid=anchor_aid,
+                result_chunks_v2=result_chunks_v2,
             )
         except urllib.error.HTTPError as exc:
             try:
@@ -1133,6 +1193,7 @@ class TestRunner:
                     "outcome": {"error": body, "http_status": exc.code},
                 },
                 target_aid=anchor_aid,
+                result_chunks_v2=result_chunks_v2,
             )
         except Exception as exc:
             self.log.exception("%s action failed: %s", action, exc)
@@ -1144,6 +1205,7 @@ class TestRunner:
                     "outcome": {"error": str(exc)},
                 },
                 target_aid=anchor_aid,
+                result_chunks_v2=result_chunks_v2,
             )
 
     def _invoke_simple(
