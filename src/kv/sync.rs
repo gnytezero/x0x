@@ -82,6 +82,18 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
 const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
 const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = 1024 * 1024;
 
+fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
+    let bytes = bincode::serialize(store)
+        .map_err(|e| KvError::Gossip(format!("retained group image serialization failed: {e}")))?;
+    if bytes.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
+        return Err(KvError::Gossip(format!(
+            "complete group history is {} bytes, above the {}-byte indivisible payload limit; paging is required",
+            bytes.len(), MAX_RETAINED_GROUP_IMAGE_BYTES
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
 /// replicas restarted together does not phase-lock its request (and thus
 /// full-state response) schedule. Mirrors the reconnect-backoff jitter in
@@ -519,7 +531,14 @@ impl KvStoreSync {
             KvMutationKind::Delta => bincode::deserialize::<KvStoreDelta>(mutation_payload)
                 .map_err(|e| KvError::Gossip(format!("bad signed delta: {e}")))
                 .and_then(|delta| {
-                    target.merge_delta(&delta, sender_peer, Some(&mutation.author_id))
+                    target
+                        .merge_delta_with_outcome(&delta, sender_peer, Some(&mutation.author_id))
+                        .and_then(|outcome| match outcome {
+                            crate::kv::store::MergeOutcome::Applied => Ok(()),
+                            crate::kv::store::MergeOutcome::Rejected => Err(KvError::Merge(
+                                "group-signed delta rejected by content admission".to_string(),
+                            )),
+                        })
                 }),
             KvMutationKind::RetainedState => {
                 if mutation_payload.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
@@ -631,6 +650,11 @@ impl KvStoreSync {
         if let Some(refresh) = refresh {
             refresh().await;
         }
+        if matches!(msg, KvSyncMessage::StateRequest { .. })
+            && !ctx.is_authorized_reader(&signing.agent_id)
+        {
+            return None;
+        }
         let payload = bincode::serialize(msg).ok()?;
         let record = ctx
             .seal_authorized(
@@ -695,6 +719,11 @@ impl KvStoreSync {
         if let Some(refresh) = refresh {
             refresh().await;
         }
+        if matches!(msg, KvSyncMessage::StateRequest { .. })
+            && !ctx.is_authorized_reader(&signing.agent_id)
+        {
+            return None;
+        }
         let payload = bincode::serialize(msg).ok()?;
         let payload = bind_public_payload(ctx.authorization_binding()?, &payload);
         let record = sign_mutation_with_snapshot(
@@ -728,6 +757,11 @@ impl KvStoreSync {
         if matches!(msg, KvSyncMessage::OwnerAnnounce { .. }) {
             return None;
         }
+        if matches!(msg, KvSyncMessage::StateRequest { .. })
+            && !ctx.is_authorized_reader(&mutation.author_id)
+        {
+            return None;
+        }
         if !matches!(msg, KvSyncMessage::StateRequest { .. })
             && !ctx.is_authorized_writer(&mutation.author_id)
         {
@@ -750,6 +784,39 @@ impl KvStoreSync {
                 degraded: std::sync::atomic::AtomicBool::new(false),
             }));
         }
+    }
+
+    /// Refresh and enforce the current group read policy before exposing
+    /// locally cached group content. Plain stores have no group context and
+    /// remain readable through their existing API.
+    pub(crate) async fn authorize_local_read(&self, reader: &AgentId) -> Result<()> {
+        if let Some(refresh) = self.secure_refresh.as_ref() {
+            refresh().await;
+        }
+        if let Some(ctx) = self.secure.as_ref() {
+            if !ctx.is_authorized_reader(reader) {
+                return Err(KvError::Unauthorized(
+                    "current group read policy denies access".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh and enforce the current group writer policy before a local
+    /// mutation changes in-memory or persisted state.
+    pub(crate) async fn authorize_local_write(&self, writer: &AgentId) -> Result<()> {
+        if let Some(refresh) = self.secure_refresh.as_ref() {
+            refresh().await;
+        }
+        if let Some(ctx) = self.secure.as_ref() {
+            if !ctx.is_authorized_writer(writer) {
+                return Err(KvError::Unauthorized(
+                    "current group writer policy denies mutation".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Clone the armed persistence context, if any.
@@ -1296,13 +1363,20 @@ impl KvStoreSync {
                             };
                             let full = (has_payload && !cooled_down && !responder_is_group_signed)
                                 .then(|| s.full_delta());
-                            let retained =
-                                (has_payload && !cooled_down && responder_is_group_signed)
-                                    .then(|| bincode::serialize(&*s))
-                                    .transpose()
-                                    .ok()
-                                    .flatten()
-                                    .filter(|bytes| bytes.len() <= MAX_RETAINED_GROUP_IMAGE_BYTES);
+                            let retained = if has_payload
+                                && !cooled_down
+                                && responder_is_group_signed
+                            {
+                                match serialize_retained_group_image(&s) {
+                                    Ok(bytes) => Some(bytes),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "cannot serve complete group history");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let served = (s.served_digest(), s.checkpoint_pairs().len() as u32);
                             (
                                 full,
@@ -2400,6 +2474,264 @@ mod tests {
                 .len()
                 > max_payload
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_group_signed_delta_cannot_import_owner_checkpoint_authority() {
+        let owner_keypair = crate::identity::AgentKeypair::generate().expect("owner keypair");
+        let owner = owner_keypair.agent_id();
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "de".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let context = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let id = store_id(3);
+        let group_id = group.stable_group_id().as_bytes().to_vec();
+        let mut source = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group_id.clone(),
+            context.clone(),
+        )
+        .expect("source");
+        source
+            .put(
+                "remote".to_string(),
+                b"replacement".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("remote put");
+        let pairs = source.checkpoint_pairs();
+        let checkpoint =
+            crate::kv::store::make_owner_checkpoint(crate::kv::store::OwnerCheckpointParams {
+                topic: "group/public/fenced",
+                store_id: &id,
+                secret_key: owner_keypair.secret_key(),
+                public_key: owner_keypair.public_key(),
+                policy: &AccessPolicy::Signed,
+                policy_version: u64::MAX,
+                checkpoint_seq: 1,
+                content_root: crate::kv::store::content_root(&id, source.name(), &pairs),
+                timestamp: 0,
+            })
+            .expect("genuine creator checkpoint");
+        let mut hostile = source.full_delta();
+        hostile.owner_checkpoint = Some(checkpoint);
+
+        let mut target = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group_id.clone(),
+            context.clone(),
+        )
+        .expect("target");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("concurrent put");
+        let target = Arc::new(RwLock::new(target));
+        let signing = Arc::new(AuthorSigning::from_keypair(&owner_keypair).expect("signing"));
+        let encoded = KvStoreSync::sign_publication(
+            &target,
+            &(context.clone() as SharedKvSecureContext),
+            None,
+            &signing,
+            KvMutationKind::Delta,
+            peer(1),
+            bincode::serialize(&hostile).expect("delta bytes"),
+        )
+        .await
+        .expect("authenticated group delta");
+
+        assert!(
+            !KvStoreSync::merge_group_signed_record(
+                &(context as SharedKvSecureContext),
+                None,
+                &target,
+                &id,
+                &encoded,
+            )
+            .await,
+            "non-content authority rejects the whole authenticated delta"
+        );
+        let target = target.read().await;
+        assert!(
+            target.get("concurrent").is_some(),
+            "concurrent content survives"
+        );
+        assert!(
+            target.get("remote").is_none(),
+            "replacement content is not imported"
+        );
+        assert_eq!(target.name(), "Wiki");
+        assert_eq!(target.owner(), Some(&owner));
+        assert!(matches!(
+            target.policy(),
+            AccessPolicy::GroupSigned { group_id: current } if current == &group_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_state_requests_follow_bound_current_read_policy() {
+        let owner = agent(1);
+        let outsider_keypair = crate::identity::AgentKeypair::generate().expect("outsider keypair");
+        let outsider_signing =
+            Arc::new(AuthorSigning::from_keypair(&outsider_keypair).expect("outsider signing"));
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "bc".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let context = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let shared = context.clone() as SharedKvSecureContext;
+        let id = store_id(5);
+        let request = KvSyncMessage::StateRequest { requester: peer(9) };
+        let public_bytes = KvStoreSync::sign_public_control_message(
+            &shared,
+            None,
+            &outsider_signing,
+            &id,
+            peer(9),
+            &request,
+        )
+        .await
+        .expect("public read permits a nonmember request");
+        assert!(
+            KvStoreSync::open_public_control_message(&shared, None, &id, &public_bytes)
+                .await
+                .is_some()
+        );
+
+        group.policy.read_access = crate::groups::GroupReadAccess::MembersOnly;
+        group.state_revision += 1;
+        context.update_from_group(&group);
+        assert!(
+            KvStoreSync::open_public_control_message(&shared, None, &id, &public_bytes)
+                .await
+                .is_none(),
+            "the signed payload is bound to the old read policy"
+        );
+        assert!(
+            KvStoreSync::sign_public_control_message(
+                &shared,
+                None,
+                &outsider_signing,
+                &id,
+                peer(9),
+                &request,
+            )
+            .await
+            .is_none(),
+            "a local nonmember cannot request members-only history"
+        );
+
+        // Bypass the local helper to model a malicious nonmember that signs
+        // a correctly bound current-policy request. Receive admission still
+        // rejects the author before the responder serves history.
+        let payload = bind_public_payload(
+            shared.authorization_binding().expect("binding"),
+            &bincode::serialize(&request).expect("request bytes"),
+        );
+        let record = sign_mutation_with_snapshot(
+            shared.group_id(),
+            shared.current_epoch(),
+            &outsider_signing,
+            KvMutationKind::Control,
+            &id,
+            &payload,
+        )
+        .expect("malicious signed request");
+        let bytes = encode_delta(peer(9), &record).expect("wire request");
+        assert!(
+            KvStoreSync::open_public_control_message(&shared, None, &id, &bytes)
+                .await
+                .is_none(),
+            "members-only receive rejects a current-policy nonmember"
+        );
+
+        group.add_member(
+            hex::encode(outsider_signing.agent_id.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        group.state_revision += 1;
+        context.update_from_group(&group);
+        assert!(shared.is_authorized_reader(&outsider_signing.agent_id));
+        assert!(!shared.is_authorized_writer(&outsider_signing.agent_id));
+        let member_request = KvStoreSync::sign_public_control_message(
+            &shared,
+            None,
+            &outsider_signing,
+            &id,
+            peer(9),
+            &request,
+        )
+        .await
+        .expect("members-only reader need not be a writer");
+        assert!(
+            KvStoreSync::open_public_control_message(&shared, None, &id, &member_request)
+                .await
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn oversized_group_history_reports_paging_required() {
+        let owner = agent(1);
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "fa".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let mut store = KvStore::new_group_signed(
+            store_id(4),
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            ctx,
+        )
+        .expect("store");
+        for index in 0..17 {
+            store
+                .put(
+                    format!("large-{index}"),
+                    vec![7; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(1),
+                )
+                .expect("large value");
+        }
+        let error = serialize_retained_group_image(&store).expect_err("must require paging");
+        assert!(error.to_string().contains("paging is required"), "{error}");
     }
 
     #[tokio::test]

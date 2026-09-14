@@ -16918,6 +16918,11 @@ impl KvStoreHandle {
         self.sync.read().await.is_encrypted()
     }
 
+    /// Whether this handle uses the authenticated public-group sync path.
+    pub async fn is_group_signed(&self) -> bool {
+        self.sync.read().await.is_group_signed()
+    }
+
     /// True when this replica holds an owner-signed checkpoint (its own or
     /// a relayed one) — surfaced so clients can tell whether a fresh
     /// encrypted-store joiner can already serve current state.
@@ -17096,6 +17101,13 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        self.sync
+            .authorize_local_write(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         // Durability gate: while the store is durability-degraded (a prior
         // snapshot write failed), refuse NEW local mutations until a retry
         // persist of the current state succeeds — otherwise unpersisted
@@ -17200,6 +17212,13 @@ impl KvStoreHandle {
     ///
     /// Returns an error if the store cannot be read.
     pub async fn get(&self, key: &str) -> error::Result<Option<KvEntrySnapshot>> {
+        self.sync
+            .authorize_local_read(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         let store = self.sync.read().await;
         Ok(store.get(key).map(|e| KvEntrySnapshot {
             key: e.key.clone(),
@@ -17230,6 +17249,13 @@ impl KvStoreHandle {
     /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
     /// to write under the store's access policy.
     pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+        self.sync
+            .authorize_local_write(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         // Durability gate — see put_with_delta.
         self.sync.ensure_durable().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -17289,10 +17315,10 @@ impl KvStoreHandle {
     ) -> error::Result<()> {
         {
             let mut store = self.sync.write().await;
-            if store.is_encrypted() {
+            if store.is_encrypted() || store.is_group_signed() {
                 return Err(error::IdentityError::Storage(std::io::Error::other(
-                    "kv direct delta rejected: encrypted stores accept only sealed \
-                     sync records, never plaintext direct deltas",
+                    "kv direct delta rejected: group stores accept only authenticated \
+                     group sync records, never plaintext direct deltas",
                 )));
             }
             store
@@ -17318,6 +17344,13 @@ impl KvStoreHandle {
     ///
     /// Returns an error if the store cannot be read.
     pub async fn keys(&self) -> error::Result<Vec<KvEntrySnapshot>> {
+        self.sync
+            .authorize_local_read(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
         let store = self.sync.read().await;
         Ok(store
             .active_entries()

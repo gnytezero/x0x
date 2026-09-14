@@ -2013,6 +2013,25 @@ impl KvStore {
                 .merge_delta_self_keyed(delta, peer_id, writer)
                 .map(|()| MergeOutcome::Applied);
         }
+        // GroupSigned authority is anchored exclusively in the canonical
+        // group roster and policy attached through `secure`. A signed delta
+        // from a current writer may mutate content, but it must never relay
+        // the ordinary owner-checkpoint/name/allowlist authority used by
+        // owner-anchored stores. In particular, checkpoint adoption is a
+        // full replacement and copies `cp.policy`; allowing it here would
+        // discard concurrent group writes and could downgrade GroupSigned.
+        if matches!(self.policy, AccessPolicy::GroupSigned { .. })
+            && (delta.owner_checkpoint.is_some()
+                || delta.name_update.is_some()
+                || delta.allowlist_additions.is_some()
+                || delta.allowlist_removals.is_some())
+        {
+            tracing::warn!(
+                "rejected group-signed delta carrying non-content authority for store {}",
+                self.id
+            );
+            return Ok(MergeOutcome::Rejected);
+        }
         // Authoritative full-snapshot checkpoint adoption (cold-recovery path):
         // if the checkpoint's content root matches the relayed entry set, adopt
         // as owner-proven independent of the relayer. An incremental delta's
@@ -2533,6 +2552,11 @@ impl KvStore {
     pub fn merge(&mut self, other: &KvStore) -> Result<()> {
         if self.id != other.id {
             return Err(KvError::StoreIdMismatch);
+        }
+        if self.is_group_signed() || other.is_group_signed() {
+            return Err(KvError::Merge(
+                "group-signed stores require an authenticated retained-image merge".to_string(),
+            ));
         }
 
         // AppendOnly: run the merge on a trial clone and verify the freeze
@@ -3853,6 +3877,42 @@ mod tests {
             target.policy(),
             AccessPolicy::GroupSigned { group_id } if group_id == &group
         ));
+    }
+
+    #[test]
+    fn generic_merge_rejects_group_signed_state_without_endorser() {
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let id = store_id(9);
+        let group = vec![7u8; 16];
+        let mut target =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group.clone(), ctx.clone())
+                .expect("target");
+        target
+            .put(
+                "local".to_string(),
+                b"keep".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("local");
+        let mut hostile = KvStore::new_group_signed(id, "Renamed".to_string(), owner, group, ctx)
+            .expect("hostile");
+        hostile
+            .put(
+                "remote".to_string(),
+                b"inject".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("remote");
+        hostile.allowed_writers.insert(agent(9));
+
+        assert!(target.merge(&hostile).is_err());
+        assert!(target.get("local").is_some());
+        assert!(target.get("remote").is_none());
+        assert_eq!(target.name(), "Wiki");
+        assert!(!target.allowed_writers.contains(&agent(9)));
     }
 
     #[test]
