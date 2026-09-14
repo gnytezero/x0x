@@ -1140,11 +1140,12 @@ fn lt_err(context: &str, e: impl std::fmt::Display) -> LinkTransportError {
 #[async_trait]
 impl LinkTransport for X0xLinkTransport {
     async fn start(&mut self) -> Result<(), LinkTransportError> {
-        // Typed setup path is [`Self::start_lane`]; the trait surface maps
-        // the typed error into the upstream stringly enum.
-        self.start_lane()
-            .await
-            .map_err(|e| LinkTransportError::IoError(e.to_string()))
+        self.start_lane().await.map_err(|error| match error {
+            VoiceLaneError::SessionConflict => {
+                LinkTransportError::SessionConflict(error.to_string())
+            }
+            setup @ VoiceLaneError::Setup(_) => LinkTransportError::IoError(setup.to_string()),
+        })
     }
 
     async fn stop(&mut self) -> Result<(), LinkTransportError> {

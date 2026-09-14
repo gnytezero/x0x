@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use saorsa_webrtc_core::link_transport::{LinkTransport, StreamType};
+use saorsa_webrtc_core::link_transport::{LinkTransport, LinkTransportError, StreamType};
 use saorsa_webrtc_core::signaling::{SignalingMessage, SignalingTransport};
 use tempfile::TempDir;
 use x0x::network::NetworkConfig;
@@ -440,11 +440,9 @@ async fn connect_acl_denies_unlisted_datagram_lane() {
 
 /// Single-acceptor rule (Codex review finding 2): exactly ONE consumer
 /// may register `WebRtcV1` per agent, so a second concurrent call on the
-/// same agent cannot start today. It must fail FAST and TYPED
-/// (`VoiceLaneError::SessionConflict`) — never silently steal or share
-/// the acceptor — and `stop()` must release the acceptor so a later
-/// session starts cleanly (self-heal). The shared daemon-level demux
-/// that would make concurrent calls WORK is the recorded follow-up.
+/// same agent cannot start today. The trait must return a typed conflict,
+/// leave the first session able to carry a frame, and release the acceptor
+/// on stop so the refused transport can start afterward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "two-agent loopback acceptor-conflict proof; binds UDP. Integration tier."]
 async fn second_concurrent_call_fails_typed_and_stop_self_heals() {
@@ -453,33 +451,50 @@ async fn second_concurrent_call_fails_typed_and_stop_self_heals() {
         return;
     };
 
+    let mut receiver = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id());
+    receiver.start().await.expect("receiver starts");
+
     let mut first = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
     first
-        .start_lane()
+        .start()
         .await
-        .expect("first session claims the WebRtcV1 acceptor");
+        .expect("first session claims the acceptor");
 
     // A second concurrent call on the SAME agent (any remote) hits the
     // single-acceptor rule: typed rejection, not a stringly error and
     // not a silent takeover.
     let mut second = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
-    match second.start_lane().await {
-        Err(x0x::voice::VoiceLaneError::SessionConflict) => {}
+    match second.start().await {
+        Err(LinkTransportError::SessionConflict(message)) => {
+            assert!(message.contains("acceptor"), "conflict keeps context");
+        }
         other => panic!("expected SessionConflict, got: {other:?}"),
     }
-    // The failed start must not wedge the transport: `running` was
-    // reset, so a retry after the conflict is cleared succeeds below.
+
+    // Refusing the second session must not damage the first. Exercise its
+    // real stream path and verify the peer receives the same frame.
+    let payload = b"first-session-still-usable";
+    let peer = first.default_peer().expect("first has default peer");
+    first
+        .send(&peer, StreamType::Data, payload)
+        .await
+        .expect("first session sends after conflict");
+    let (_, stream_type, received) =
+        tokio::time::timeout(Duration::from_secs(10), receiver.receive())
+            .await
+            .expect("receiver gets first-session frame within deadline")
+            .expect("receiver remains healthy");
+    assert_eq!(stream_type, StreamType::Data);
+    assert_eq!(received, payload);
 
     first
         .stop()
         .await
         .expect("first session stops (releases acceptor)");
 
-    second
-        .start_lane()
-        .await
-        .expect("acceptor released by stop; second session now starts");
+    second.start().await.expect("released session restarts");
     let _ = second.stop().await;
+    let _ = receiver.stop().await;
 
     alice.shutdown().await;
     bob.shutdown().await;
