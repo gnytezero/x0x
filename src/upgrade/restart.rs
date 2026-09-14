@@ -722,71 +722,6 @@ fn show_property<'a>(show: &'a str, key: &str) -> Option<&'a str> {
         .map(|l| &l[key.len() + 1..])
 }
 
-/// Tokenize one raw systemd command-line (the `argv[]=` rendering of
-/// `systemctl show -p ExecStart`) into its argument list, preserving
-/// argument boundaries per `man systemd.service` (COMMAND LINES): tokens
-/// are whitespace-separated; double quotes keep whitespace inside a token;
-/// backslash escapes the next character.
-///
-/// Conservative by contract: returns `None` for anything it cannot decode
-/// with certainty (unterminated quote, trailing backslash, quoting in the
-/// middle of a token).
-///
-/// `%` is passed through (#690): `%`-specifier expansion (`%%` → `%`)
-/// happens at unit LOAD time and `systemctl show` serializes the stored
-/// post-expansion argv verbatim — the exact array systemd spawns — so a
-/// literal `%` in a decoded token is plain data, exactly comparable to
-/// the running argv.
-///
-/// `$` goes through [`simulate_spawn_expansion`], which reproduces the
-/// deterministic half of systemd's spawn-time word expansion: `$$`
-/// collapses and mid-word `$` stays literal, while unresolved
-/// substitutions refuse. The exact-boundary comparison in the readback
-/// remains the fail-closed gate — any divergence refuses.
-#[cfg(any(test, target_os = "linux"))]
-fn parse_systemd_argv_tokens(raw: &str) -> Option<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut quoted_token = false;
-    let mut chars = raw.trim().chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some(escaped) => current.push(escaped),
-                None => return None, // trailing backslash
-            },
-            '"' => {
-                if in_quotes || current.is_empty() {
-                    in_quotes = !in_quotes;
-                    quoted_token = true;
-                } else {
-                    // `"a"b` — quoting glued onto a token this parser
-                    // cannot reproduce faithfully.
-                    return None;
-                }
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if !current.is_empty() || quoted_token {
-                    tokens.push(std::mem::take(&mut current));
-                    quoted_token = false;
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if in_quotes {
-        return None; // unterminated quote
-    }
-    if !current.is_empty() || quoted_token {
-        tokens.push(current);
-    }
-    if tokens.is_empty() {
-        return None;
-    }
-    tokens.iter().map(|t| simulate_spawn_expansion(t)).collect()
-}
-
 /// Apply the deterministic half of systemd's spawn-time word expansion
 /// (`replace_env_argv`, flags=0 — braceless mid-word expansion disabled)
 /// to one shown `argv[]` token, so it can be compared against the running
@@ -829,34 +764,133 @@ fn simulate_spawn_expansion(token: &str) -> Option<String> {
     Some(out)
 }
 
-/// `ExecStart={ path=/x/y ; argv[]=a b ; … }` → `(path, argv_tokens)`.
+/// Structured `ExecStart` evidence collected over D-Bus via `busctl
+/// --json=short` — the authoritative argument-boundary source (#729).
 ///
-/// The `path=` field is taken VERBATIM, unlike the argv tokens: systemd
-/// never environment-expands the executable path — load-time expansion is
-/// `%`-specifiers only, and the execve target is the raw stored path — so
-/// a `$` in the shown path is literal filename data. The argv[0] the
-/// readback binds is either the implicit copy of the path (spawn-identity
-/// only for single-`$` paths) or, for any `$` shape, the `@` override's
-/// `$$`-escaped copy, which spawn-collapses back to the literal path.
+/// The `argv[]=` text `systemctl show` renders is space-joined WITHOUT
+/// quoting argument boundaries: a literal executable path containing
+/// spaces (e.g. `probe % $ ${FOO} $$ space`) is indistinguishable there
+/// from separate arguments, so the readback can neither verify nor safely
+/// refuse on that rendering. The D-Bus property
+/// `org.freedesktop.systemd1.Service.ExecStart` (type `a(sasbttttuii)`,
+/// verified on the fleet host, systemd 255) carries the real stored argv
+/// array — each element its own JSON string. `busctl --json=short`
+/// renders each property reply as `{"type":…,"data":…}`.
+///
+/// `main_pid` and `invocation_id` come from the SAME resolved unit object
+/// (`MainPID` type `u`, `InvocationID` type `ay`, 16 bytes), re-binding the
+/// structured snapshot to THIS process so the textual `systemctl show`
+/// pass and the structured pass cannot straddle a restart unnoticed.
 #[cfg(any(test, target_os = "linux"))]
-fn parse_exec_start(value: &str) -> Option<(String, Vec<String>)> {
-    let path = value
-        .split("path=")
-        .nth(1)?
-        .split(" ; ")
-        .next()?
-        .trim()
-        .to_string();
-    let argv_raw = value.split("argv[]=").nth(1)?.split(" ; ").next()?.trim();
-    let tokens = parse_systemd_argv_tokens(argv_raw)?;
-    Some((path, tokens))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BusctlExecStart {
+    /// Executable path, verbatim (never `$`-expanded by systemd).
+    pub(crate) path: String,
+    /// The stored argv array, boundaries authoritative.
+    pub(crate) argv: Vec<String>,
+    /// Unit `MainPID` at the structured read.
+    pub(crate) main_pid: u32,
+    /// Unit `InvocationID` at the structured read (16 bytes).
+    pub(crate) invocation_id: Option<[u8; 16]>,
 }
 
-/// The decision core of [`readback_systemd_policy`]: resolve the unit from
-/// the cgroup read, query the correct manager's LOADED policy, and verify —
-/// for THIS exact running instance — the PID binding (`MainPID`), the
-/// invocation binding (`InvocationID`), the executable/argv binding
-/// (`ExecStart`, compared by canonical absolute path through
+/// `{"type":EXPECTED,"data":…}` — busctl's per-property JSON reply shape.
+#[cfg(any(test, target_os = "linux"))]
+fn busctl_json_typed<'a>(
+    json: &'a serde_json::Value,
+    expected: &str,
+) -> Option<&'a serde_json::Value> {
+    (json.get("type").and_then(serde_json::Value::as_str) == Some(expected))
+        .then(|| json.get("data"))?
+}
+
+/// `{"type":"o","data":["<unit object path>"]}`.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_busctl_object_path_json(json: &serde_json::Value) -> Option<String> {
+    busctl_json_typed(json, "o")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .filter(|p| !p.is_empty() && !p.contains('"'))
+        .map(str::to_string)
+}
+
+/// `{"type":"u","data":<pid>}` — `data` is a bare number, not an array.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_busctl_u32_json(json: &serde_json::Value) -> Option<u32> {
+    busctl_json_typed(json, "u")?
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+/// `{"type":"ay","data":[16 bytes]}` → the invocation id.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_busctl_invocation_json(json: &serde_json::Value) -> Option<[u8; 16]> {
+    let data = busctl_json_typed(json, "ay")?.as_array()?;
+    if data.len() != 16 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (slot, b) in out.iter_mut().zip(data.iter()) {
+        *slot = u8::try_from(b.as_u64()?).ok()?;
+    }
+    Some(out)
+}
+
+/// `{"type":"a(sasbttttuii)","data":[[path,[argv…],bool,…]]}` →
+/// `(path, argv)` with authoritative argument boundaries.
+///
+/// Fail-closed by contract: `None` unless the type string is exactly the
+/// verified `ExecStart` shape, exactly ONE command struct is present
+/// (multiple `ExecStart=` lines are legacy and ambiguous for this
+/// readback), the struct has its full 10 fields, and every argv element is
+/// a JSON string. An empty command list (unit not started) also refuses.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_busctl_exec_start_json(json: &serde_json::Value) -> Option<(String, Vec<String>)> {
+    let commands = busctl_json_typed(json, "a(sasbttttuii)")?.as_array()?;
+    if commands.len() != 1 {
+        return None;
+    }
+    let entry = commands.first()?.as_array()?;
+    if entry.len() != 10 {
+        return None;
+    }
+    let path = entry.first()?.as_str()?.to_string();
+    let argv: Vec<String> = entry
+        .get(1)?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    if path.is_empty() || argv.is_empty() {
+        return None;
+    }
+    Some((path, argv))
+}
+
+/// Lowercase hex of the invocation id bytes, comparable to the
+/// `INVOCATION_ID` environment variable systemd sets (32 hex chars).
+#[cfg(any(test, target_os = "linux"))]
+fn invocation_id_hex(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_invocation_id_hex(value: &str) -> Option<[u8; 16]> {
+    let value = value.trim();
+    if value.len() != 32 || !value.is_ascii() {
+        return None;
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
 /// `same_executable` and by exact argv boundaries), and a `Restart=`
 /// policy that respawns after exit 0.
 ///
@@ -870,6 +904,12 @@ fn parse_exec_start(value: &str) -> Option<(String, Vec<String>)> {
 #[cfg(any(test, target_os = "linux"))]
 type SystemctlShow<'a> = dyn FnMut(bool, &str) -> Result<Option<String>, String> + 'a;
 
+/// Structured `ExecStart` lookup injected into
+/// [`readback_systemd_policy_in`]: given the manager kind and unit name,
+/// return the busctl/D-Bus structured snapshot or an error string (every
+/// error fails closed).
+#[cfg(any(test, target_os = "linux"))]
+type BusctlExecStartLookup<'a> = dyn FnMut(bool, &str) -> Result<BusctlExecStart, String> + 'a;
 #[cfg(any(test, target_os = "linux"))]
 type SameExecutable<'a> = dyn Fn(&str, &Path) -> bool + 'a;
 
@@ -887,6 +927,7 @@ struct SystemdReadbackInput<'a> {
 fn readback_systemd_policy_in(
     input: SystemdReadbackInput<'_>,
     show: &mut SystemctlShow<'_>,
+    exec_start_lookup: &mut BusctlExecStartLookup<'_>,
     same_executable: &SameExecutable<'_>,
 ) -> SystemdPolicyReadback {
     let SystemdReadbackInput {
@@ -910,7 +951,7 @@ fn readback_systemd_policy_in(
             return refuse(format!(
                 "systemctl show reported no loaded unit `{unit}` ({} manager)",
                 if user_manager { "user" } else { "system" }
-            ))
+            ));
         }
         Err(e) => return refuse(format!("`systemctl show {unit}` failed: {e}")),
     };
@@ -928,45 +969,93 @@ fn readback_systemd_policy_in(
         ));
     }
 
-    // Invocation binding: when systemd gave us an invocation id, the loaded
-    // unit's must match it.
+    // Invocation binding: the textual and later structured reads must name
+    // the same invocation even when the environment marker is unavailable.
+    // When systemd supplied this process an INVOCATION_ID, it must agree too.
+    let Some(textual_invocation) =
+        show_property(&show_output, "InvocationID").and_then(parse_invocation_id_hex)
+    else {
+        return refuse(format!(
+            "unit `{unit}` reports an absent or malformed InvocationID"
+        ));
+    };
     if let Some(invocation) = invocation_id {
-        match show_property(&show_output, "InvocationID") {
-            Some(loaded) if loaded.trim() == invocation => {}
-            other => {
-                return refuse(format!(
-                    "unit `{unit}` reports InvocationID {} but this process runs under {}",
-                    other.unwrap_or("<absent>"),
-                    invocation
-                ))
-            }
+        if parse_invocation_id_hex(invocation) != Some(textual_invocation) {
+            return refuse(format!(
+                "unit `{unit}` InvocationID does not match this process environment"
+            ));
         }
     }
 
-    // Executable/argv binding: canonical-absolute-path identity for the
-    // executable (never basename equality) and exact argv boundaries —
-    // unparseable or ambiguous ExecStart quoting fails closed.
-    let exec = show_property(&show_output, "ExecStart").and_then(parse_exec_start);
-    let exec_ok = exec.is_some_and(|(loaded_path, tokens)| {
+    // Executable/argv binding — STRUCTURED (#729): the `argv[]=` text
+    // `systemctl show` renders is space-joined WITHOUT argument quoting, so
+    // a literal path containing spaces is indistinguishable from separate
+    // arguments there. The authoritative boundaries come from the D-Bus
+    // `ExecStart` array over busctl JSON, looked up on the same unit in the
+    // same manager and re-bound to THIS process (MainPID + InvocationID in
+    // the structured snapshot). Any busctl failure, unsupported shape, or
+    // binding mismatch fails closed — never a textual-boundary guess.
+    let BusctlExecStart {
+        path: loaded_path,
+        argv: raw_tokens,
+        main_pid: structured_pid,
+        invocation_id: structured_invocation,
+    } = match exec_start_lookup(user_manager, &unit) {
+        Ok(v) => v,
+        Err(e) => {
+            return refuse(format!(
+                "structured ExecStart readback failed for unit `{unit}`: {e}; argument \
+                 boundaries cannot be proven"
+            ));
+        }
+    };
+    if structured_pid != pid {
+        return refuse(format!(
+            "unit `{unit}` reports MainPID {structured_pid} in the structured snapshot, \
+             not this process ({pid})"
+        ));
+    }
+    if structured_invocation != Some(textual_invocation) {
+        return refuse(format!(
+            "unit `{unit}` reports different InvocationIDs in the textual and structured snapshots"
+        ));
+    }
+
+    // Spawn-time `$` simulation on the authoritative tokens: `$$` collapses,
+    // mid-word `$` stays literal, unresolved substitutions refuse.
+    let Some(tokens) = raw_tokens
+        .iter()
+        .map(|t| simulate_spawn_expansion(t))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return refuse(format!(
+            "unit `{unit}` ExecStart contains an unresolved `$` substitution; the \
+             spawned argv is not derivable"
+        ));
+    };
+    let exec_ok = {
         if !same_executable(&loaded_path, executable) {
-            return false;
+            false
+        } else {
+            // argv[0] in the stored array: either the path itself or an
+            // `argv[0]=` override (`@`-prefixed `$$`-escaped copy), which
+            // must still be this executable.
+            let first = tokens.first().map(String::as_str).unwrap_or_default();
+            if first != loaded_path && !same_executable(first, executable) {
+                false
+            } else {
+                tokens.len() == argv.len()
+                    && tokens
+                        .iter()
+                        .zip(argv.iter())
+                        .skip(1)
+                        .all(|(loaded, ours)| loaded == ours)
+            }
         }
-        // argv[0] in the loaded line: either the path itself or an
-        // `argv[0]=` override, which must still be this executable.
-        let first = tokens.first().map(String::as_str).unwrap_or_default();
-        if first != loaded_path && !same_executable(first, executable) {
-            return false;
-        }
-        tokens.len() == argv.len()
-            && tokens
-                .iter()
-                .zip(argv.iter())
-                .skip(1)
-                .all(|(loaded, ours)| loaded == ours)
-    });
+    };
     if !exec_ok {
         return refuse(format!(
-            "unit `{unit}` does not run this executable/argv (ExecStart {})",
+            "unit `{unit}` does not run this executable/argv (systemctl ExecStart {})",
             show_property(&show_output, "ExecStart").unwrap_or("<absent>")
         ));
     }
@@ -1033,7 +1122,7 @@ fn readback_systemd_policy_in(
                 "RestartPreventExitStatus was not reported for the unit; whether exit 0 \
                  is restart-prevented cannot be proven"
                     .to_string(),
-            )
+            );
         }
         Some(v) if v.trim().is_empty() => {}
         Some(v) => {
@@ -1044,13 +1133,13 @@ fn readback_systemd_policy_in(
                             "RestartPreventExitStatus lists `{token}`, which covers the \
                              clean exit status and prevents the restart regardless of \
                              Restart={restart}"
-                        ))
+                        ));
                     }
                     PreventCoverage::Unparseable => {
                         return refuse(format!(
                             "RestartPreventExitStatus entry `{token}` cannot be parsed; \
                              coverage of the clean exit status cannot be proven"
-                        ))
+                        ));
                     }
                     PreventCoverage::CleanExitNotCovered => {}
                 }
@@ -1139,14 +1228,14 @@ fn readback_systemd_policy_in(
                      a restart now could hit the start-rate limit and leave the service \
                      down (man systemd.service)"
                         .to_string(),
-                )
+                );
             }
             None => {
                 return refuse(
                     "the monotonic clock is unavailable; whether the start-rate window \
                      has aged out cannot be proven"
                         .to_string(),
-                )
+                );
             }
         }
     }
@@ -1512,8 +1601,34 @@ fn poll_read_once(fd: i32, buf: &mut Vec<u8>, cap: usize, until: Instant) -> Pol
 /// property payload and error messages never include the `Environment=`
 /// line (it may carry deployment secrets — only the parsed template
 /// version ever leaves the readback).
+#[cfg(any(test, target_os = "linux"))]
+fn remaining_readback_bound(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(now)?;
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 #[cfg(target_os = "linux")]
-fn run_systemctl_show(user_manager: bool, unit: &str) -> Result<Option<String>, String> {
+fn collect_child_before_readback_deadline(
+    mut child: std::process::Child,
+    deadline: Instant,
+    command: &str,
+) -> Result<Option<String>, String> {
+    let Some(bound) = remaining_readback_bound(deadline, Instant::now()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "systemd readback deadline expired before {command} collection"
+        ));
+    };
+    collect_child_output_bounded(child, bound, SYSTEMCTL_OUTPUT_CAP)
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl_show(
+    user_manager: bool,
+    unit: &str,
+    deadline: Instant,
+) -> Result<Option<String>, String> {
     let mut cmd = std::process::Command::new("systemctl");
     if user_manager {
         cmd.arg("--user");
@@ -1530,7 +1645,121 @@ fn run_systemctl_show(user_manager: bool, unit: &str) -> Result<Option<String>, 
     let child = cmd
         .spawn()
         .map_err(|e| format!("cannot run systemctl: {e}"))?;
-    collect_child_output_bounded(child, SYSTEMCTL_SHOW_BOUND, SYSTEMCTL_OUTPUT_CAP)
+    collect_child_before_readback_deadline(child, deadline, "systemctl")
+}
+
+/// Run one `busctl [--user] --json=short <subcommand> …` under the same
+/// wall-clock bound and output cap as the systemctl probes, and parse the
+/// reply as one JSON value. `Ok(None)` (nonzero exit / bound expiry) and
+/// spawn/parse failures are errors — every structured lookup fails closed.
+#[cfg(target_os = "linux")]
+fn run_busctl_json(
+    user_manager: bool,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    let mut cmd = std::process::Command::new("busctl");
+    if user_manager {
+        cmd.arg("--user");
+    }
+    cmd.arg("--json=short")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot run busctl ({e}); structured readback is unavailable"))?;
+    let out = match collect_child_before_readback_deadline(child, deadline, "busctl") {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err("busctl exited nonzero or timed out".to_string()),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_str(out.trim()).map_err(|e| format!("busctl JSON reply is malformed: {e}"))
+}
+
+/// Structured `ExecStart` snapshot via busctl (verified shapes, systemd
+/// 255 fleet host): resolve the unit object by name (`Manager.GetUnit` →
+/// `{"type":"o",…}`), then read `Service.ExecStart`
+/// (`a(sasbttttuii)`, argv array with authoritative boundaries),
+/// `Service.MainPID` (`u`), and `Unit.InvocationID` (`ay`, 16 bytes) off
+/// the SAME object so the snapshot is bound to this exact invocation.
+#[cfg(target_os = "linux")]
+fn run_busctl_exec_start(
+    user_manager: bool,
+    unit: &str,
+    pid: u32,
+    deadline: Instant,
+) -> Result<BusctlExecStart, String> {
+    let unit_json = run_busctl_json(
+        user_manager,
+        &[
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "GetUnit",
+            "s",
+            unit,
+        ],
+        deadline,
+    )
+    .map_err(|e| format!("GetUnit {unit}: {e}"))?;
+    let object_path = parse_busctl_object_path_json(&unit_json)
+        .ok_or_else(|| format!("GetUnit {unit}: reply is not a unit object path"))?;
+    let exec_json = run_busctl_json(
+        user_manager,
+        &[
+            "get-property",
+            "org.freedesktop.systemd1",
+            &object_path,
+            "org.freedesktop.systemd1.Service",
+            "ExecStart",
+        ],
+        deadline,
+    )
+    .map_err(|e| format!("ExecStart on `{object_path}`: {e}"))?;
+    let (path, argv) = parse_busctl_exec_start_json(&exec_json)
+        .ok_or_else(|| format!("ExecStart on `{object_path}`: unexpected payload shape"))?;
+    let pid_json = run_busctl_json(
+        user_manager,
+        &[
+            "get-property",
+            "org.freedesktop.systemd1",
+            &object_path,
+            "org.freedesktop.systemd1.Service",
+            "MainPID",
+        ],
+        deadline,
+    )
+    .map_err(|e| format!("MainPID on `{object_path}`: {e}"))?;
+    let main_pid = parse_busctl_u32_json(&pid_json)
+        .ok_or_else(|| format!("MainPID on `{object_path}`: unexpected payload shape"))?;
+    let inv_json = run_busctl_json(
+        user_manager,
+        &[
+            "get-property",
+            "org.freedesktop.systemd1",
+            &object_path,
+            "org.freedesktop.systemd1.Unit",
+            "InvocationID",
+        ],
+        deadline,
+    )
+    .map_err(|e| format!("InvocationID on `{object_path}`: {e}"))?;
+    let invocation_id = parse_busctl_invocation_json(&inv_json)
+        .ok_or_else(|| format!("InvocationID on `{object_path}`: unexpected payload shape"))?;
+    if main_pid != pid {
+        return Err(format!(
+            "MainPID {main_pid} does not match this process ({pid}) in the structured snapshot"
+        ));
+    }
+    Ok(BusctlExecStart {
+        path,
+        argv,
+        main_pid,
+        invocation_id: Some(invocation_id),
+    })
 }
 
 /// Linux `CLOCK_MONOTONIC` microseconds, matching systemd's
@@ -1575,22 +1804,25 @@ pub fn readback_systemd_policy(
         Err(e) => {
             return SystemdPolicyReadback::NotGuaranteed {
                 detail: format!("cannot read /proc/self/cgroup: {e}"),
-            }
+            };
         }
     };
     let invocation = std::env::var("INVOCATION_ID")
         .ok()
         .filter(|v| !v.is_empty());
+    let pid = std::process::id();
+    let deadline = Instant::now() + SYSTEMCTL_SHOW_BOUND;
     readback_systemd_policy_in(
         SystemdReadbackInput {
             cgroup: &cgroup,
-            pid: std::process::id(),
+            pid,
             invocation_id: invocation.as_deref(),
             executable,
             argv,
             monotonic_now_us: monotonic_now_us(),
         },
-        &mut run_systemctl_show,
+        &mut |user_manager, unit| run_systemctl_show(user_manager, unit, deadline),
+        &mut |user_manager, unit| run_busctl_exec_start(user_manager, unit, pid, deadline),
         &same_executable_canonical,
     )
 }
@@ -3912,6 +4144,11 @@ mod tests {
         monotonic_now: Option<u64>,
     ) -> SystemdPolicyReadback {
         let exec = Path::new("/opt/x0x/x0xd");
+        let show_text = match &show_output {
+            Ok(Some(text)) => text.clone(),
+            _ => String::new(),
+        };
+        let structured = structured_from_show(&show_text, pid, invocation);
         readback_systemd_policy_in(
             SystemdReadbackInput {
                 cgroup,
@@ -3922,8 +4159,60 @@ mod tests {
                 monotonic_now_us: monotonic_now,
             },
             &mut |_user, _unit| show_output.clone(),
+            &mut move |_user, _unit| Ok(structured.clone()),
             &|loaded, ours| loaded == "/opt/x0x/x0xd" && ours == Path::new("/opt/x0x/x0xd"),
         )
+    }
+
+    /// Decode a 32-char lowercase hex id into the `ay` bytes busctl reports.
+    fn inv_bytes(hex: &str) -> Option<[u8; 16]> {
+        let hex = hex.trim();
+        if hex.len() != 32 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(out)
+    }
+
+    /// Test-fixture bridge: derive the structured snapshot the way the
+    /// fixture's `systemctl show` ExecStart line renders it — argv
+    /// boundaries are the whitespace-split `argv[]=` tokens (fixtures never
+    /// put a space inside a single argument except where a test explicitly
+    /// injects the stored `$$`-escaped forms). Production boundaries come
+    /// from the busctl JSON array, not this split.
+    fn structured_from_show(show: &str, pid: u32, invocation: Option<&str>) -> BusctlExecStart {
+        let line = show
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap_or("");
+        let path = line
+            .split("path=")
+            .nth(1)
+            .unwrap_or("")
+            .split(" ; ")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let argv: Vec<String> = line
+            .split("argv[]=")
+            .nth(1)
+            .unwrap_or("")
+            .split(" ; ")
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        BusctlExecStart {
+            path,
+            argv,
+            main_pid: pid,
+            invocation_id: invocation.and_then(inv_bytes),
+        }
     }
 
     const SYSTEM_CGROUP: &str = "0::/system.slice/x0xd.service";
@@ -3994,66 +4283,158 @@ mod tests {
     }
 
     #[test]
-    fn systemd_argv_tokenizer_passes_load_expanded_percent_through() {
-        // `systemctl show` renders the post-load, specifier-EXPANDED argv:
-        // a literal `%` in a decoded token is data (written `%%` in the
-        // unit file by the autostart renderer, expanded at load by
-        // config_parse_exec), not syntax to interpret or refuse (#690).
+    fn systemd_argv_expansion_passes_load_expanded_percent_through() {
+        // The stored structured argv is the post-load, specifier-EXPANDED
+        // array: a literal `%` in a token is data (written `%%` in the unit
+        // file, expanded at load), not syntax to interpret or refuse (#690).
         assert_eq!(
-            parse_systemd_argv_tokens("/opt/x0x%prod/x0xd --name 100%"),
-            Some(vec![
-                "/opt/x0x%prod/x0xd".to_string(),
-                "--name".to_string(),
-                "100%".to_string(),
-            ])
+            simulate_spawn_expansion("/opt/x0x%prod/x0xd").as_deref(),
+            Some("/opt/x0x%prod/x0xd")
         );
+        assert_eq!(simulate_spawn_expansion("100%").as_deref(), Some("100%"));
     }
 
     #[test]
-    fn systemd_argv_tokenizer_decodes_literal_dollar_escapes() {
+    fn systemd_argv_expansion_decodes_literal_dollar_escapes() {
         // Spawn-time expansion collapses `$$` → one literal `$`, pairwise,
-        // left-to-right.
+        // left-to-right; braceless mid-word `$` stays literal.
+        assert_eq!(simulate_spawn_expansion("$$FOO").as_deref(), Some("$FOO"));
+        assert_eq!(simulate_spawn_expansion("$$$$").as_deref(), Some("$$"));
         assert_eq!(
-            parse_systemd_argv_tokens("/opt/x0xd --name $$FOO"),
-            Some(vec![
-                "/opt/x0xd".to_string(),
-                "--name".to_string(),
-                "$FOO".to_string(),
-            ])
+            simulate_spawn_expansion("pre$$mid$$end").as_deref(),
+            Some("pre$mid$end")
         );
-        // Pairs collapse wherever they appear, including inside quotes.
         assert_eq!(
-            parse_systemd_argv_tokens("pre$$mid$$end \"$$$$\""),
-            Some(vec!["pre$mid$end".to_string(), "$$".to_string(),])
+            simulate_spawn_expansion("/opt/x0x$prod/x0xd").as_deref(),
+            Some("/opt/x0x$prod/x0xd")
         );
-    }
-
-    #[test]
-    fn systemd_argv_tokenizer_keeps_midword_and_trailing_dollar_literal() {
-        // Braceless mid-word expansion is disabled for ExecStart words, so
-        // a `$` that is not `${`, `$$`, or a whole-word `$NAME` is literal
-        // data — even valid-name-shaped (`python$literal` stays literal).
+        assert_eq!(simulate_spawn_expansion("100$").as_deref(), Some("100$"));
         assert_eq!(
-            parse_systemd_argv_tokens("/opt/x0x$prod/x0xd --pre$FOO 100$"),
-            Some(vec![
-                "/opt/x0x$prod/x0xd".to_string(),
-                "--pre$FOO".to_string(),
-                "100$".to_string(),
-            ])
+            simulate_spawn_expansion("--pre$FOO").as_deref(),
+            Some("--pre$FOO")
         );
     }
 
     #[test]
-    fn systemd_argv_tokenizer_refuses_unresolved_dollar_substitutions() {
+    fn systemd_argv_expansion_refuses_unresolved_dollar_substitutions() {
         // Whole-word `$NAME` substitutes and word-splits (invalid names
         // and a lone `$` are DROPPED entirely — env-util.c bad-variables
         // path); `${…` substitutes inline. None of those forms are
-        // derivable from the shown text.
-        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd $FOO"), None);
-        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd $1abc"), None);
-        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd $"), None);
-        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd ${FOO}"), None);
-        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd pre${FOO}post"), None);
+        // derivable from the stored tokens.
+        assert_eq!(simulate_spawn_expansion("$FOO"), None);
+        assert_eq!(simulate_spawn_expansion("$1abc"), None);
+        assert_eq!(simulate_spawn_expansion("$"), None);
+        assert_eq!(simulate_spawn_expansion("${FOO}"), None);
+        assert_eq!(simulate_spawn_expansion("pre${FOO}post"), None);
+    }
+
+    #[test]
+    fn busctl_json_parsers_decode_verified_fleet_shapes() {
+        // Exact reply shapes captured on the systemd 255 fleet host
+        // (omp-reports/recovery-20260914/pr729-ci/structured-property-probe).
+        let exec: serde_json::Value = serde_json::from_str(
+            r#"{"type":"a(sasbttttuii)","data":[["/opt/x0x/x0xd",["/opt/x0x/x0xd","--config","/etc/x0x/config.toml"],false,0,0,0,0,0,0,0]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_busctl_exec_start_json(&exec),
+            Some((
+                "/opt/x0x/x0xd".to_string(),
+                vec![
+                    "/opt/x0x/x0xd".to_string(),
+                    "--config".to_string(),
+                    "/etc/x0x/config.toml".to_string(),
+                ]
+            ))
+        );
+        let unit: serde_json::Value = serde_json::from_str(
+            r#"{"type":"o","data":["/org/freedesktop/systemd1/unit/x0xd_2eservice"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_busctl_object_path_json(&unit),
+            Some("/org/freedesktop/systemd1/unit/x0xd_2eservice".to_string())
+        );
+        let pid: serde_json::Value = serde_json::from_str(r#"{"type":"u","data":53053}"#).unwrap();
+        assert_eq!(parse_busctl_u32_json(&pid), Some(53053));
+        let inv: serde_json::Value = serde_json::from_str(
+            r#"{"type":"ay","data":[181,209,172,98,218,141,64,146,183,72,249,232,104,46,162,46]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_busctl_invocation_json(&inv).map(|b| invocation_id_hex(&b)),
+            Some("b5d1ac62da8d4092b748f9e8682ea22e".to_string())
+        );
+    }
+
+    #[test]
+    fn busctl_exec_start_parser_preserves_argument_boundaries() {
+        // A literal path containing spaces is ONE argv element — the very
+        // case the space-joined `argv[]=` text rendering cannot express.
+        let path = "/srv/probe % $ ${FOO} $$ space";
+        let stored: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"type":"a(sasbttttuii)","data":[["{path}",["{path}","--artifact","/tmp/positive"],false,0,0,0,0,0,0,0]]}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            parse_busctl_exec_start_json(&stored),
+            Some((
+                path.to_string(),
+                vec![
+                    path.to_string(),
+                    "--artifact".to_string(),
+                    "/tmp/positive".to_string()
+                ]
+            ))
+        );
+        // `["a b"]` (one argument with a space) and `["a","b"]` (two) are
+        // distinct structured payloads — never conflated.
+        let mk = |argv_json: &str| {
+            serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"type":"a(sasbttttuii)","data":[["/x/y",{argv_json},false,0,0,0,0,0,0,0]]}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            parse_busctl_exec_start_json(&mk(r#"["a b"]"#)),
+            Some(("/x/y".to_string(), vec!["a b".to_string()]))
+        );
+        assert_eq!(
+            parse_busctl_exec_start_json(&mk(r#"["a","b"]"#)),
+            Some(("/x/y".to_string(), vec!["a".to_string(), "b".to_string()]))
+        );
+    }
+
+    #[test]
+    fn busctl_exec_start_parser_fails_closed_on_malformed_payloads() {
+        let ok = r#"{"type":"a(sasbttttuii)","data":[["/x/y",["/x/y"],false,0,0,0,0,0,0,0]]}"#;
+        let parse = |body: &str| {
+            parse_busctl_exec_start_json(&serde_json::from_str::<serde_json::Value>(body).unwrap())
+        };
+        assert!(parse(ok).is_some());
+        // Wrong type string (e.g. the ExecStartEx `sasasttttuii` shape).
+        assert!(parse(
+            r#"{"type":"a(sasasttttuii)","data":[["/x/y",["/x/y"],"ignore",0,0,0,0,0,0,0]]}"#
+        )
+        .is_none());
+        // Zero commands (unit not started) or two commands (legacy
+        // multiple ExecStart lines) — both ambiguous, refuse.
+        assert!(parse(r#"{"type":"a(sasbttttuii)","data":[]}"#).is_none());
+        assert!(parse(r#"{"type":"a(sasbttttuii)","data":[["/a",["/a"],false,0,0,0,0,0,0,0],["/b",["/b"],false,0,0,0,0,0,0,0]]}"#).is_none());
+        // Wrong struct arity, non-string argv element, empty argv, missing data.
+        assert!(
+            parse(r#"{"type":"a(sasbttttuii)","data":[["/x/y",["/x/y"],false,0,0,0,0,0,0]]}"#)
+                .is_none()
+        );
+        assert!(
+            parse(r#"{"type":"a(sasbttttuii)","data":[["/x/y",[7],false,0,0,0,0,0,0,0]]}"#)
+                .is_none()
+        );
+        assert!(
+            parse(r#"{"type":"a(sasbttttuii)","data":[["/x/y",[],false,0,0,0,0,0,0,0]]}"#)
+                .is_none()
+        );
+        assert!(parse(r#"{"type":"a(sasbttttuii)"}"#).is_none());
     }
 
     #[test]
@@ -4063,17 +4444,25 @@ mod tests {
         // `%` in path and argv) must VERIFY, not refuse.
         let exec = "/opt/x0x%prod/x0xd";
         let argv = real_fixture_argv(exec);
-        let out = healthy_show(4242, "inv-1", exec, "always");
+        let out = healthy_show(4242, "aa01aa01aa01aa01aa01aa01aa01aa01", exec, "always");
+        let structured_out = out.clone();
         let verdict = readback_systemd_policy_in(
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
-                invocation_id: Some("inv-1"),
+                invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new(exec),
                 argv: &argv,
                 monotonic_now_us: Some(101_000_000),
             },
             &mut |_user, _unit| Ok(Some(out.clone())),
+            &mut move |_user, _unit| {
+                Ok(structured_from_show(
+                    &structured_out,
+                    4242,
+                    Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+                ))
+            },
             &|loaded, ours| loaded == exec && ours == Path::new(exec),
         );
         match verdict {
@@ -4086,8 +4475,13 @@ mod tests {
     fn systemd_readback_verifies_literal_dollar_argument() {
         // A literal-`$` argument renders as `$$FOO`; show renders the raw
         // `$$FOO` and the process runs `$FOO` — decoding `$$` must VERIFY.
-        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
-            .replace("--name testnet", "--name $$FOO");
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        )
+        .replace("--name testnet", "--name $$FOO");
         let argv = vec![
             "/opt/x0x/x0xd".to_string(),
             "--name".to_string(),
@@ -4096,7 +4490,7 @@ mod tests {
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &argv,
             Ok(Some(out)),
             Some(101_000_000),
@@ -4108,11 +4502,222 @@ mod tests {
     }
 
     #[test]
+    fn systemd_readback_verifies_literal_space_path_via_structured_exec_start() {
+        // PR729 CI failure (job 104162455639): running argv[0] IS the
+        // literal `probe % $ ${FOO} $$ space` path, but the `argv[]=`
+        // text renders it space-joined without boundaries. The structured
+        // busctl snapshot stores the `$$`-escaped forms systemd spawned
+        // from; boundaries are authoritative, so the readback VERIFIES.
+        let running = "/srv/probe % $ ${FOO} $$ space";
+        let stored = "/srv/probe % $$ $${FOO} $$$$ space";
+        let argv = vec![
+            running.to_string(),
+            "--artifact".to_string(),
+            "/tmp/positive".to_string(),
+        ];
+        let out = healthy_show(4242, "aa01aa01aa01aa01aa01aa01aa01aa01", running, "always");
+        let structured = BusctlExecStart {
+            path: running.to_string(),
+            argv: vec![
+                stored.to_string(),
+                "--artifact".to_string(),
+                "/tmp/positive".to_string(),
+            ],
+            main_pid: 4242,
+            invocation_id: inv_bytes("aa01aa01aa01aa01aa01aa01aa01aa01"),
+        };
+        let verdict = readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: SYSTEM_CGROUP,
+                pid: 4242,
+                invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+                executable: Path::new(running),
+                argv: &argv,
+                monotonic_now_us: Some(101_000_000),
+            },
+            &mut |_user, _unit| Ok(Some(out.clone())),
+            &mut move |_user, _unit| Ok(structured.clone()),
+            &|loaded, ours| loaded == running && ours == Path::new(running),
+        );
+        match verdict {
+            SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
+            other => panic!("expected Verified for literal space path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn systemd_readback_structured_boundaries_are_exact() {
+        // One stored argument `a b` is NOT the running pair `a`,`b` — the
+        // space-joined text renderings are identical, the structured
+        // arrays are not. Never infer boundaries by joining.
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        );
+        let structured = BusctlExecStart {
+            path: "/opt/x0x/x0xd".to_string(),
+            argv: vec![
+                "/opt/x0x/x0xd".to_string(),
+                "a b".to_string(),
+                "testnet".to_string(),
+            ],
+            main_pid: 4242,
+            invocation_id: inv_bytes("aa01aa01aa01aa01aa01aa01aa01aa01"),
+        };
+        let verdict = readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: SYSTEM_CGROUP,
+                pid: 4242,
+                invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+                executable: Path::new("/opt/x0x/x0xd"),
+                argv: &[
+                    "/opt/x0x/x0xd".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                    "testnet".to_string(),
+                ],
+                monotonic_now_us: Some(101_000_000),
+            },
+            &mut |_user, _unit| Ok(Some(out.clone())),
+            &mut move |_user, _unit| Ok(structured.clone()),
+            &|loaded, ours| loaded == "/opt/x0x/x0xd" && ours == Path::new("/opt/x0x/x0xd"),
+        );
+        assert!(
+            matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("does not run this executable/argv")),
+            "stored [`a b`] must not verify against running [`a`,`b`]"
+        );
+    }
+
+    #[test]
+    fn systemd_readback_fails_closed_on_structured_lookup_problems() {
+        let argv = real_fixture_argv("/opt/x0x/x0xd");
+        let healthy = || {
+            healthy_show(
+                4242,
+                "aa01aa01aa01aa01aa01aa01aa01aa01",
+                "/opt/x0x/x0xd",
+                "always",
+            )
+        };
+        let mk = |structured: Result<BusctlExecStart, String>| {
+            readback_systemd_policy_in(
+                SystemdReadbackInput {
+                    cgroup: SYSTEM_CGROUP,
+                    pid: 4242,
+                    invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+                    executable: Path::new("/opt/x0x/x0xd"),
+                    argv: &argv,
+                    monotonic_now_us: Some(101_000_000),
+                },
+                &mut |_user, _unit| Ok(Some(healthy())),
+                &mut move |_user, _unit| structured.clone(),
+                &|loaded, ours| loaded == "/opt/x0x/x0xd" && ours == Path::new("/opt/x0x/x0xd"),
+            )
+        };
+        // busctl itself failed (missing binary, timeout, malformed reply).
+        let v = mk(Err("cannot run busctl (No such file or directory)".into()));
+        assert!(
+            matches!(&v, SystemdPolicyReadback::NotGuaranteed { detail } if detail.contains("structured ExecStart readback failed") && detail.contains("busctl")),
+            "{v:?}"
+        );
+        // Structured MainPID does not bind to this process.
+        let v = mk(Ok(BusctlExecStart {
+            path: "/opt/x0x/x0xd".to_string(),
+            argv: real_fixture_argv("/opt/x0x/x0xd"),
+            main_pid: 9999,
+            invocation_id: inv_bytes("aa01aa01aa01aa01aa01aa01aa01aa01"),
+        }));
+        assert!(
+            matches!(&v, SystemdPolicyReadback::NotGuaranteed { detail } if detail.contains("MainPID 9999")),
+            "{v:?}"
+        );
+        // Structured InvocationID does not bind to this invocation.
+        let v = mk(Ok(BusctlExecStart {
+            path: "/opt/x0x/x0xd".to_string(),
+            argv: real_fixture_argv("/opt/x0x/x0xd"),
+            main_pid: 4242,
+            invocation_id: inv_bytes("bb02bb02bb02bb02bb02bb02bb02bb02"),
+        }));
+        assert!(
+            matches!(&v, SystemdPolicyReadback::NotGuaranteed { detail } if detail.contains("InvocationID")),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn systemd_readback_cross_checks_invocation_without_environment_marker() {
+        let argv = real_fixture_argv("/opt/x0x/x0xd");
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        );
+        let structured = BusctlExecStart {
+            path: "/opt/x0x/x0xd".to_string(),
+            argv: argv.clone(),
+            main_pid: 4242,
+            invocation_id: inv_bytes("bb02bb02bb02bb02bb02bb02bb02bb02"),
+        };
+        let verdict = readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: SYSTEM_CGROUP,
+                pid: 4242,
+                invocation_id: None,
+                executable: Path::new("/opt/x0x/x0xd"),
+                argv: &argv,
+                monotonic_now_us: Some(101_000_000),
+            },
+            &mut |_user, _unit| Ok(Some(out.clone())),
+            &mut move |_user, _unit| Ok(structured.clone()),
+            &|loaded, ours| loaded == "/opt/x0x/x0xd" && ours == Path::new("/opt/x0x/x0xd"),
+        );
+        assert!(
+            matches!(&verdict, SystemdPolicyReadback::NotGuaranteed { detail } if detail.contains("textual and structured")),
+            "cross-call invocation mismatch must fail without an environment marker: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn invocation_id_parser_rejects_non_ascii_without_panicking() {
+        let malformed = format!("{}éa", "a".repeat(29));
+        assert_eq!(malformed.len(), 32);
+        assert_eq!(parse_invocation_id_hex(&malformed), None);
+    }
+
+    #[test]
+    fn systemd_readback_deadline_remainder_never_refills() {
+        let start = Instant::now();
+        let readback_bound = Duration::from_secs(5);
+        let deadline = start + readback_bound;
+        assert_eq!(
+            remaining_readback_bound(deadline, start),
+            Some(readback_bound)
+        );
+        assert_eq!(
+            remaining_readback_bound(deadline, start + Duration::from_secs(3)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(remaining_readback_bound(deadline, deadline), None);
+        assert_eq!(
+            remaining_readback_bound(deadline, deadline + Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[test]
     fn systemd_readback_refuses_unresolved_variable_argument() {
         // A single-`$` `$FOO` shows raw while the process runs the
         // variable's value — an unresolved substitution, refused.
-        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
-            .replace("--name testnet", "--name $FOO");
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        )
+        .replace("--name testnet", "--name $FOO");
         let argv = vec![
             "/opt/x0x/x0xd".to_string(),
             "--name".to_string(),
@@ -4121,16 +4726,15 @@ mod tests {
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &argv,
             Ok(Some(out)),
             Some(101_000_000),
         );
         match verdict {
-            SystemdPolicyReadback::NotGuaranteed { detail } => assert!(
-                detail.contains("does not run this executable/argv"),
-                "{detail}"
-            ),
+            SystemdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(detail.contains("unresolved `$` substitution"), "{detail}")
+            }
             other => panic!("expected NotGuaranteed for unresolved $FOO, got {other:?}"),
         }
     }
@@ -4148,19 +4752,27 @@ mod tests {
             "/opt/p$$literal/x0xd",
         ] {
             let escaped = path.replace('$', "$$");
-            let out = healthy_show(4242, "inv-1", path, "always")
+            let out = healthy_show(4242, "aa01aa01aa01aa01aa01aa01aa01aa01", path, "always")
                 .replace(&format!("argv[]={path} "), &format!("argv[]={escaped} "));
+            let structured_out = out.clone();
             let argv = real_fixture_argv(path);
             let verdict = readback_systemd_policy_in(
                 SystemdReadbackInput {
                     cgroup: SYSTEM_CGROUP,
                     pid: 4242,
-                    invocation_id: Some("inv-1"),
+                    invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                     executable: Path::new(path),
                     argv: &argv,
                     monotonic_now_us: Some(101_000_000),
                 },
                 &mut |_user, _unit| Ok(Some(out.clone())),
+                &mut move |_user, _unit| {
+                    Ok(structured_from_show(
+                        &structured_out,
+                        4242,
+                        Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+                    ))
+                },
                 &|loaded, ours| loaded == path && ours == Path::new(path),
             );
             match verdict {
@@ -4174,11 +4786,16 @@ mod tests {
 
     #[test]
     fn systemd_readback_resolves_user_manager_from_cgroup() {
-        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always");
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        );
         let verdict = run_readback(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x0xd.service",
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(out)),
             Some(101_000_000),
@@ -4194,11 +4811,16 @@ mod tests {
 
     #[test]
     fn systemd_readback_rejects_wrong_pid_and_invocation() {
-        let out = healthy_show(9999, "inv-1", "/opt/x0x/x0xd", "always");
+        let out = healthy_show(
+            9999,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        );
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(out)),
             Some(101_000_000),
@@ -4207,11 +4829,16 @@ mod tests {
             matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("MainPID 9999"))
         );
 
-        let out = healthy_show(4242, "inv-OTHER", "/opt/x0x/x0xd", "always");
+        let out = healthy_show(
+            4242,
+            "bb02bb02bb02bb02bb02bb02bb02bb02",
+            "/opt/x0x/x0xd",
+            "always",
+        );
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(out)),
             Some(101_000_000),
@@ -4225,11 +4852,16 @@ mod tests {
     fn systemd_readback_rejects_wrong_executable_by_canonical_identity() {
         // Different directory, same basename: basename equality would
         // accept; canonical identity must not.
-        let out = healthy_show(4242, "inv-1", "/other/dir/x0xd", "always");
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/other/dir/x0xd",
+            "always",
+        );
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/other/dir/x0xd"),
             Ok(Some(out)),
             Some(101_000_000),
@@ -4239,11 +4871,16 @@ mod tests {
         );
 
         // Argv boundary: a different argument list must not pass.
-        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always");
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        );
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &[
                 "/opt/x0x/x0xd".to_string(),
                 "--name".to_string(),
@@ -4261,11 +4898,16 @@ mod tests {
     #[test]
     fn systemd_readback_rejects_clean_exit_unsafe_policies() {
         for restart in ["on-failure", "no", "on-abnormal", "on-watchdog", ""] {
-            let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", restart);
+            let out = healthy_show(
+                4242,
+                "aa01aa01aa01aa01aa01aa01aa01aa01",
+                "/opt/x0x/x0xd",
+                restart,
+            );
             let verdict = run_readback(
                 SYSTEM_CGROUP,
                 4242,
-                Some("inv-1"),
+                Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 &real_fixture_argv("/opt/x0x/x0xd"),
                 Ok(Some(out)),
                 Some(101_000_000),
@@ -4280,14 +4922,20 @@ mod tests {
     #[test]
     fn systemd_readback_rejects_restart_prevent_exit_status_covering_zero() {
         for prevent in ["0", "0-3", "0 5", "SIGTERM 0", "garbage"] {
-            let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always").replace(
+            let out = healthy_show(
+                4242,
+                "aa01aa01aa01aa01aa01aa01aa01aa01",
+                "/opt/x0x/x0xd",
+                "always",
+            )
+            .replace(
                 "RestartPreventExitStatus=\n",
                 &format!("RestartPreventExitStatus={prevent}\n"),
             );
             let verdict = run_readback(
                 SYSTEM_CGROUP,
                 4242,
-                Some("inv-1"),
+                Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 &real_fixture_argv("/opt/x0x/x0xd"),
                 Ok(Some(out)),
                 Some(101_000_000),
@@ -4299,14 +4947,20 @@ mod tests {
         }
         // A non-zero, non-zero-covering, parseable list passes; SIGTERM does
         // not cover a clean exit.
-        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always").replace(
+        let out = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        )
+        .replace(
             "RestartPreventExitStatus=\n",
             "RestartPreventExitStatus=5 SIGTERM\n",
         );
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(out)),
             Some(101_000_000),
@@ -4316,15 +4970,20 @@ mod tests {
 
     #[test]
     fn systemd_readback_rejects_missing_restart_prevent_property() {
-        let out: String = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
-            .lines()
-            .filter(|l| !l.starts_with("RestartPreventExitStatus="))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let out: String = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        )
+        .lines()
+        .filter(|l| !l.starts_with("RestartPreventExitStatus="))
+        .collect::<Vec<_>>()
+        .join("\n");
         let verdict = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(out)),
             Some(101_000_000),
@@ -4338,13 +4997,18 @@ mod tests {
     #[test]
     fn systemd_readback_rejects_remain_after_exit_and_oneshot() {
         for (prop, value) in [("RemainAfterExit", "yes"), ("Type", "oneshot")] {
-            let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
-                .replace(&format!("{prop}=no\n"), &format!("{prop}={value}\n"))
-                .replace(&format!("{prop}=simple\n"), &format!("{prop}={value}\n"));
+            let out = healthy_show(
+                4242,
+                "aa01aa01aa01aa01aa01aa01aa01aa01",
+                "/opt/x0x/x0xd",
+                "always",
+            )
+            .replace(&format!("{prop}=no\n"), &format!("{prop}={value}\n"))
+            .replace(&format!("{prop}=simple\n"), &format!("{prop}={value}\n"));
             let verdict = run_readback(
                 SYSTEM_CGROUP,
                 4242,
-                Some("inv-1"),
+                Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 &real_fixture_argv("/opt/x0x/x0xd"),
                 Ok(Some(out)),
                 Some(101_000_000),
@@ -4359,22 +5023,27 @@ mod tests {
     #[test]
     fn systemd_readback_start_rate_limit_table() {
         let mk = |interval: &str, burst: &str, active: &str| {
-            healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
-                .replace(
-                    "StartLimitIntervalUSec=10s\n",
-                    &format!("StartLimitIntervalUSec={interval}\n"),
-                )
-                .replace("StartLimitBurst=5\n", &format!("StartLimitBurst={burst}\n"))
-                .replace(
-                    "ActiveEnterTimestampMonotonic=1000000\n",
-                    &format!("ActiveEnterTimestampMonotonic={active}\n"),
-                )
+            healthy_show(
+                4242,
+                "aa01aa01aa01aa01aa01aa01aa01aa01",
+                "/opt/x0x/x0xd",
+                "always",
+            )
+            .replace(
+                "StartLimitIntervalUSec=10s\n",
+                &format!("StartLimitIntervalUSec={interval}\n"),
+            )
+            .replace("StartLimitBurst=5\n", &format!("StartLimitBurst={burst}\n"))
+            .replace(
+                "ActiveEnterTimestampMonotonic=1000000\n",
+                &format!("ActiveEnterTimestampMonotonic={active}\n"),
+            )
         };
         // Disabled (interval 0): passes without any clock.
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(mk("0", "5", "1000000"))),
             None,
@@ -4387,7 +5056,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(mk("10s", "0", "1000000"))),
             None,
@@ -4400,7 +5069,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(mk("10s", "5", "1000000"))),
             Some(21_000_000),
@@ -4414,7 +5083,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(mk("10s", "5", "1000000"))),
             Some(3_000_000),
@@ -4427,7 +5096,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(mk("10s", "5", "1000000"))),
             None,
@@ -4440,7 +5109,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(mk("infinity", "5", "1000000"))),
             Some(21_000_000),
@@ -4450,15 +5119,20 @@ mod tests {
             "infinity refuses"
         );
         // Absent interval property.
-        let out: String = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
-            .lines()
-            .filter(|l| !l.starts_with("StartLimitIntervalUSec="))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let out: String = healthy_show(
+            4242,
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            "/opt/x0x/x0xd",
+            "always",
+        )
+        .lines()
+        .filter(|l| !l.starts_with("StartLimitIntervalUSec="))
+        .collect::<Vec<_>>()
+        .join("\n");
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &real_fixture_argv("/opt/x0x/x0xd"),
             Ok(Some(out)),
             Some(21_000_000),
@@ -4475,7 +5149,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &argv,
             Err("spawn failed".into()),
             Some(101_000_000),
@@ -4486,7 +5160,7 @@ mod tests {
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &argv,
             Ok(None),
             Some(101_000_000),
@@ -4497,9 +5171,14 @@ mod tests {
         let v = run_readback(
             "0::/system.slice/foo.scope",
             4242,
-            Some("inv-1"),
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
             &argv,
-            Ok(Some(healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always"))),
+            Ok(Some(healthy_show(
+                4242,
+                "aa01aa01aa01aa01aa01aa01aa01aa01",
+                "/opt/x0x/x0xd",
+                "always",
+            ))),
             Some(101_000_000),
         );
         assert!(
