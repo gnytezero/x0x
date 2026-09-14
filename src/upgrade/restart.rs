@@ -870,7 +870,7 @@ fn parse_busctl_exec_start_json(json: &serde_json::Value) -> Option<(String, Vec
 
 /// Lowercase hex of the invocation id bytes, comparable to the
 /// `INVOCATION_ID` environment variable systemd sets (32 hex chars).
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 fn invocation_id_hex(bytes: &[u8; 16]) -> String {
     let mut out = String::with_capacity(32);
     for b in bytes {
