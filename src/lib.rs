@@ -16197,7 +16197,7 @@ impl Agent {
         topic: &str,
         persist_path: Option<std::path::PathBuf>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
-        self.spawn_kv_sync_inner(store, topic, persist_path, None, None)
+        self.spawn_kv_sync_inner(store, topic, persist_path, None, None, None)
             .await
     }
 
@@ -16215,6 +16215,7 @@ impl Agent {
         persist_path: Option<std::path::PathBuf>,
         secure: Option<std::sync::Arc<dyn kv::encrypted::KvSecureContext>>,
         secure_refresh: Option<kv::sync::SecureRefreshFn>,
+        treekem_secure: Option<kv::SharedTreeKemKvProtector>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
@@ -16232,6 +16233,13 @@ impl Agent {
         .map_err(|e| kv_storage_err(format!("kv store sync creation failed: {e}")))?;
         if let Some(secure) = secure {
             sync.set_secure_context(secure, secure_refresh);
+            let signing =
+                kv::encrypted::AuthorSigning::from_keypair(self.identity().agent_keypair())
+                    .map_err(|e| kv_storage_err(format!("kv author signing setup failed: {e}")))?;
+            sync.set_author_signing(signing);
+        }
+        if let Some(treekem) = treekem_secure {
+            sync.set_treekem_context(treekem);
             let signing =
                 kv::encrypted::AuthorSigning::from_keypair(self.identity().agent_keypair())
                     .map_err(|e| kv_storage_err(format!("kv author signing setup failed: {e}")))?;
@@ -16318,6 +16326,7 @@ impl Agent {
                 Some(persist_path),
                 Some(secure),
                 Some(secure_refresh),
+                None,
             )
             .await?;
 
@@ -16337,6 +16346,81 @@ impl Agent {
             agent_id: self.agent_id(),
             peer_id,
             owner_signing,
+        })
+    }
+
+    /// Open or restore a group store protected by the live real-TreeKEM
+    /// ratchet. The synchronous context is authorization-only; every wire
+    /// record goes through `protector`, which advances and persists the
+    /// ratchet before returning.
+    pub async fn open_treekem_group_kv_store_persistent(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        creator: identity::AgentId,
+        authorization: std::sync::Arc<groups::TreeKemKvAuthorizationContext>,
+        protector: kv::SharedTreeKemKvProtector,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        if name.is_empty() {
+            return Err(kv_storage_err(
+                "invalid TreeKEM group store binding".to_string(),
+            ));
+        }
+        let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
+        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        let secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext> = authorization;
+        if secure.group_id() != stable_group_id.as_bytes()
+            || !secure.is_active_member(&self.agent_id())
+        {
+            return Err(kv_storage_err(
+                "TreeKEM group store requires a matching current-member context".to_string(),
+            ));
+        }
+        let mut store = match kv::sync::load_snapshot(&persist_path) {
+            Ok(Some(store)) => {
+                validate_group_kv_store_binding(
+                    &store,
+                    name,
+                    stable_group_id,
+                    creator,
+                    GroupStoreProtection::TreeKemEncrypted,
+                    None,
+                )?;
+                store
+            }
+            Ok(None) => kv::KvStore::new_treekem_encrypted(
+                store_id,
+                name.to_string(),
+                creator,
+                stable_group_id.as_bytes().to_vec(),
+                std::sync::Arc::clone(&secure),
+            )
+            .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
+            Err(error) => {
+                return Err(kv_storage_err(format!(
+                    "TreeKEM group snapshot is unreadable: {error}"
+                )))
+            }
+        };
+        store
+            .set_secure_context(std::sync::Arc::clone(&secure))
+            .map_err(|e| kv_storage_err(format!("TreeKEM authorization reattach failed: {e}")))?;
+        let (sync, peer_id) = self
+            .spawn_kv_sync_inner(
+                store,
+                &topic,
+                Some(persist_path),
+                None,
+                None,
+                Some(protector),
+            )
+            .await?;
+        Ok(KvStoreHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+            owner_signing: None,
         })
     }
 
@@ -16393,6 +16477,7 @@ impl Agent {
                 Some(persist_path),
                 Some(context),
                 Some(refresh),
+                None,
             )
             .await?;
         Ok(KvStoreHandle {
@@ -16589,6 +16674,10 @@ pub(crate) fn validate_group_kv_store_binding(
     }
     let policy_matches = match (protection, store.policy()) {
         (GroupStoreProtection::Encrypted, kv::AccessPolicy::Encrypted { group_id })
+        | (
+            GroupStoreProtection::TreeKemEncrypted,
+            kv::AccessPolicy::TreeKemEncrypted { group_id },
+        )
         | (GroupStoreProtection::PublicSigned, kv::AccessPolicy::GroupSigned { group_id }) => {
             group_id.as_slice() == stable_group_id.as_bytes()
         }
@@ -16619,6 +16708,7 @@ pub(crate) fn validate_group_kv_store_binding(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GroupStoreProtection {
     Encrypted,
+    TreeKemEncrypted,
     PublicSigned,
 }
 

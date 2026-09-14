@@ -348,6 +348,96 @@ pub struct GssKvSecureContext {
     state: Arc<std::sync::RwLock<GssState>>,
 }
 
+/// Synchronous authorization view attached to an encrypted store whose wire
+/// protection is provided by the daemon's async real-TreeKEM adapter.
+#[derive(Debug, Clone)]
+pub struct TreeKemKvAuthorizationContext {
+    state: Arc<std::sync::RwLock<GssState>>,
+}
+
+impl TreeKemKvAuthorizationContext {
+    #[must_use]
+    pub fn from_group(info: &GroupInfo) -> Option<Self> {
+        (info.policy.confidentiality == GroupConfidentiality::MlsEncrypted
+            && info.secure_plane == crate::mls::SecureGroupPlane::TreeKem
+            && !info.withdrawn
+            && !info.is_fork_quarantined())
+        .then(|| Self {
+            state: Arc::new(std::sync::RwLock::new(GssState::from_group(info))),
+        })
+    }
+
+    pub fn update_from_group(&self, info: &GroupInfo) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if info.withdrawn
+            || info.is_fork_quarantined()
+            || info.secure_plane != crate::mls::SecureGroupPlane::TreeKem
+        {
+            state.active_members.clear();
+            state.member_roles.clear();
+            return;
+        }
+        *state = GssState::from_group(info);
+    }
+}
+
+impl KvSecureContext for TreeKemKvAuthorizationContext {
+    fn group_id(&self) -> Vec<u8> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stable_group_id
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .secret_epoch
+    }
+
+    fn seal(&self, _: &KvStoreId, _: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
+        Err(KvError::SecureRecord(
+            "TreeKEM authorization context cannot seal records".to_string(),
+        ))
+    }
+
+    fn open(&self, _: &KvStoreId, _: u64, _: &[u8; 24], _: &[u8]) -> Result<Vec<u8>> {
+        Err(KvError::SecureRecord(
+            "TreeKEM authorization context cannot open records".to_string(),
+        ))
+    }
+
+    fn is_active_member(&self, agent: &AgentId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_members
+            .contains(agent)
+    }
+
+    fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authorizes_writer(agent)
+    }
+
+    fn invalidate(&self) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_members.clear();
+        state.member_roles.clear();
+    }
+}
+
 impl GssKvSecureContext {
     /// Build from the group's current security state.
     ///

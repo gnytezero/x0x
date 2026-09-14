@@ -721,6 +721,345 @@ struct GssGroupStoreBinding {
     topic: String,
 }
 
+/// Live TreeKEM adapter for one deterministic group store.
+///
+/// The group mutex covers crypto and the durable snapshot write. A failed
+/// write restores the pre-operation ratchet before releasing the mutex, so a
+/// record is never acknowledged or published from state that only existed in
+/// memory.
+struct TreeKemGroupStoreProtector {
+    state: Arc<AppState>,
+    group_key: String,
+    stable_group_id: String,
+    authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
+    invalid: std::sync::atomic::AtomicBool,
+}
+
+impl TreeKemGroupStoreProtector {
+    fn new(
+        state: &Arc<AppState>,
+        binding: &GssGroupStoreBinding,
+        authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
+    ) -> Self {
+        Self {
+            state: Arc::clone(state),
+            group_key: binding.group_key.clone(),
+            stable_group_id: binding.stable_group_id.clone(),
+            authorization,
+            invalid: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn current_info(&self) -> x0x::kv::Result<x0x::groups::GroupInfo> {
+        if self.invalid.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM group store is retired".to_string(),
+            ));
+        }
+        let groups = self.state.named_groups.read().await;
+        let info = groups.get(&self.group_key).cloned().ok_or_else(|| {
+            x0x::kv::KvError::Unauthorized("TreeKEM group is unavailable".to_string())
+        })?;
+        if info.withdrawn
+            || info.is_fork_quarantined()
+            || info.stable_group_id() != self.stable_group_id
+            || info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted
+            || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM group binding is no longer eligible".to_string(),
+            ));
+        }
+        self.authorization.update_from_group(&info);
+        Ok(info)
+    }
+
+    fn permits(info: &x0x::groups::GroupInfo, agent: &AgentId, writer: bool) -> bool {
+        let Some(member) = info.members_v2.get(&hex::encode(agent.as_bytes())) else {
+            return false;
+        };
+        if !member.is_active() {
+            return false;
+        }
+        if !writer {
+            return true;
+        }
+        match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly => true,
+            x0x::groups::GroupWriteAccess::AdminOnly => {
+                member.role.at_least(x0x::groups::GroupRole::Admin)
+            }
+            x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+        }
+    }
+
+    fn authorization_binding(info: &x0x::groups::GroupInfo) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.kv.treekem-roster-policy.v1");
+        hasher.update(info.stable_group_id().as_bytes());
+        hasher.update(&info.state_revision.to_le_bytes());
+        hasher.update(x0x::groups::compute_roster_root(&info.members_v2).as_bytes());
+        if let Some(binding) = info.security_binding.as_deref() {
+            hasher.update(binding.as_bytes());
+        }
+        hasher.update(&[match info.policy.read_access {
+            x0x::groups::GroupReadAccess::Public => 0,
+            x0x::groups::GroupReadAccess::MembersOnly => 1,
+        }]);
+        hasher.update(&[match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly => 0,
+            x0x::groups::GroupWriteAccess::ModeratedPublic => 1,
+            x0x::groups::GroupWriteAccess::AdminOnly => 2,
+        }]);
+        *hasher.finalize().as_bytes()
+    }
+
+    async fn live_group(
+        &self,
+    ) -> x0x::kv::Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
+        self.state
+            .treekem_groups
+            .read()
+            .await
+            .get(&self.group_key)
+            .cloned()
+            .ok_or_else(|| {
+                x0x::kv::KvError::SecureRecord("live TreeKEM ratchet is unavailable".to_string())
+            })
+    }
+
+    fn map_crypto_error(error: impl std::fmt::Display) -> x0x::kv::KvError {
+        x0x::kv::KvError::SecureRecord(format!("TreeKEM group-store crypto failed: {error}"))
+    }
+
+    async fn rollback(
+        &self,
+        info: &x0x::groups::GroupInfo,
+        snapshot: &[u8],
+        group: &mut x0x::mls::TreeKemMlsGroup,
+    ) {
+        match super::named_groups::restore_local_treekem_group_from_snapshot(
+            &self.state,
+            info,
+            snapshot,
+        ) {
+            Ok(restored) => *group = restored,
+            Err(error) => {
+                self.invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!("failed to rollback TreeKEM store ratchet: {error}");
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
+    fn group_id(&self) -> Vec<u8> {
+        self.stable_group_id.as_bytes().to_vec()
+    }
+
+    async fn seal_record(
+        &self,
+        signing: &x0x::kv::AuthorSigning,
+        kind: x0x::kv::KvMutationKind,
+        store_id: &x0x::kv::KvStoreId,
+        payload: &[u8],
+        reader_only: bool,
+    ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
+        let membership =
+            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let _membership_guard = membership.lock().await;
+        let live = self.live_group().await?;
+        let mut group = live.lock().await;
+        // Re-read authority only after acquiring the ratchet mutex. Membership
+        // commits use the same mutex, so this snapshot cannot predate a commit
+        // that won while this operation was waiting.
+        let info = self.current_info().await?;
+        let reader_admission = kind == x0x::kv::KvMutationKind::Control && reader_only;
+        if !Self::permits(&info, &signing.agent_id, !reader_admission) {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM mutation author is not currently authorized".to_string(),
+            ));
+        }
+        let rollback = group.to_snapshot_bytes().map_err(Self::map_crypto_error)?;
+        let epoch = group.epoch();
+        let inner = x0x::kv::treekem::sign_inner_mutation(
+            signing,
+            kind,
+            payload,
+            x0x::kv::treekem::TreeKemInnerBinding {
+                group_id: self.group_id(),
+                epoch,
+                store_id,
+                authorization_binding: Self::authorization_binding(&info),
+                reader_only,
+            },
+        )?;
+        let ciphertext = match group.encrypt_message(&inner) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => {
+                self.rollback(&info, &rollback, &mut group).await;
+                return Err(Self::map_crypto_error(error));
+            }
+        };
+        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
+            &self.state,
+            &self.group_key,
+            &group,
+        )
+        .await
+        {
+            self.rollback(&info, &rollback, &mut group).await;
+            return Err(x0x::kv::KvError::Gossip(format!(
+                "persist TreeKEM send ratchet: {error}"
+            )));
+        }
+        Ok(x0x::kv::TreeKemKvStoreRecordV1 {
+            version: 1,
+            group_id: self.group_id(),
+            store_id: *store_id.as_bytes(),
+            epoch,
+            reader_only,
+            ciphertext,
+        })
+    }
+
+    async fn open_record(
+        &self,
+        store_id: &x0x::kv::KvStoreId,
+        record: &x0x::kv::TreeKemKvStoreRecordV1,
+    ) -> x0x::kv::Result<x0x::kv::treekem::OpenedTreeKemKvRecord> {
+        if record.version != 1
+            || record.group_id != self.group_id()
+            || record.store_id != *store_id.as_bytes()
+        {
+            return Err(x0x::kv::KvError::SecureRecord(
+                "TreeKEM record binding mismatch".to_string(),
+            ));
+        }
+        let membership =
+            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let _membership_guard = membership.lock().await;
+        let live = self.live_group().await?;
+        let mut group = live.lock().await;
+        let info = self.current_info().await?;
+        if record.epoch != group.epoch() {
+            return Err(x0x::kv::KvError::SecureRecord(
+                "TreeKEM record epoch is stale or ahead".to_string(),
+            ));
+        }
+        let rollback = group.to_snapshot_bytes().map_err(Self::map_crypto_error)?;
+        let plaintext = match group.decrypt_message(&record.ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                self.rollback(&info, &rollback, &mut group).await;
+                return Err(Self::map_crypto_error(error));
+            }
+        };
+        let opened = match x0x::kv::treekem::open_inner_mutation(
+            self.stable_group_id.as_bytes(),
+            record.epoch,
+            store_id,
+            &plaintext,
+            Self::authorization_binding(&info),
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.rollback(&info, &rollback, &mut group).await;
+                return Err(error);
+            }
+        };
+        if opened.reader_only != record.reader_only
+            || opened.reader_only && opened.mutation.kind != x0x::kv::KvMutationKind::Control
+            || !Self::permits(&info, &opened.mutation.author_id, !opened.reader_only)
+        {
+            self.rollback(&info, &rollback, &mut group).await;
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM mutation author is not currently authorized".to_string(),
+            ));
+        }
+        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
+            &self.state,
+            &self.group_key,
+            &group,
+        )
+        .await
+        {
+            self.rollback(&info, &rollback, &mut group).await;
+            return Err(x0x::kv::KvError::Gossip(format!(
+                "persist TreeKEM receive ratchet: {error}"
+            )));
+        }
+        Ok(opened)
+    }
+
+    async fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+        self.current_info()
+            .await
+            .is_ok_and(|info| Self::permits(&info, agent, false))
+    }
+
+    async fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+        self.current_info()
+            .await
+            .is_ok_and(|info| Self::permits(&info, agent, true))
+    }
+
+    async fn merge_main_record(
+        &self,
+        opened: x0x::kv::treekem::OpenedTreeKemKvRecord,
+        sender_peer: saorsa_gossip_types::PeerId,
+        store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
+        retained_image: Option<Vec<u8>>,
+    ) -> x0x::kv::Result<()> {
+        if opened.reader_only || opened.mutation.kind == x0x::kv::KvMutationKind::Control {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "read-side TreeKEM record cannot mutate a store".to_string(),
+            ));
+        }
+        let membership =
+            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let _membership_guard = membership.lock().await;
+        let info = self.current_info().await?;
+        if opened.authorization_binding != Self::authorization_binding(&info)
+            || !Self::permits(&info, &opened.mutation.author_id, true)
+        {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM record authority changed before merge".to_string(),
+            ));
+        }
+        let mut target = store.write().await;
+        match opened.mutation.kind {
+            x0x::kv::KvMutationKind::Delta | x0x::kv::KvMutationKind::FullState => {
+                let delta: x0x::kv::KvStoreDelta =
+                    bincode::deserialize(&opened.mutation.payload)
+                        .map_err(|e| x0x::kv::KvError::Gossip(format!("bad TreeKEM delta: {e}")))?;
+                target.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+            }
+            x0x::kv::KvMutationKind::RetainedState => {
+                let image: x0x::kv::KvStore =
+                    bincode::deserialize(retained_image.as_deref().ok_or_else(|| {
+                        x0x::kv::KvError::Gossip(
+                            "complete TreeKEM retained image required".to_string(),
+                        )
+                    })?)
+                    .map_err(|e| x0x::kv::KvError::Gossip(format!("bad retained image: {e}")))?;
+                target.merge_group_retained_image(&image, opened.mutation.author_id)
+            }
+            x0x::kv::KvMutationKind::Control => Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM control record on main topic".to_string(),
+            )),
+        }
+    }
+
+    fn invalidate(&self) {
+        self.invalid
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.authorization.invalidate();
+    }
+}
+
 fn find_store_group<'a>(
     groups: &'a std::collections::HashMap<String, x0x::groups::GroupInfo>,
     id: &str,
@@ -782,6 +1121,40 @@ fn resolve_gss_group_store(
     }
     let (group_key, info) = find_store_group(groups, id)?;
     validate_gss_store_group(info, caller)?;
+    let stable_group_id = info.stable_group_id().to_string();
+    let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
+    Ok(GssGroupStoreBinding {
+        group_key: group_key.clone(),
+        stable_group_id,
+        creator: info.creator,
+        name: name.to_string(),
+        store_id,
+        topic,
+    })
+}
+
+fn resolve_treekem_group_store(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    id: &str,
+    name: &str,
+    caller: &AgentId,
+) -> Result<GssGroupStoreBinding, GroupStoreResponse> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("store name must not be empty"));
+    }
+    let (group_key, info) = find_store_group(groups, id)?;
+    if info.withdrawn || info.is_fork_quarantined() {
+        return Err(api_error(StatusCode::CONFLICT, "group is unavailable"));
+    }
+    if !info.has_active_member(&hex::encode(caller.as_bytes())) {
+        return Err(forbidden("not a member"));
+    }
+    if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted
+        || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+    {
+        return Err(bad_request("store requires a real-TreeKEM encrypted group"));
+    }
     let stable_group_id = info.stable_group_id().to_string();
     let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
     Ok(GssGroupStoreBinding {
@@ -1057,6 +1430,80 @@ async fn open_bound_gss_store(
     Ok((handle, secure, true))
 }
 
+async fn open_bound_treekem_store(
+    state: &Arc<AppState>,
+    expected: &GssGroupStoreBinding,
+) -> Result<(x0x::KvStoreHandle, u64, bool), GroupStoreResponse> {
+    let authorization = {
+        let groups = state.named_groups.read().await;
+        let current = resolve_treekem_group_store(
+            &groups,
+            &expected.group_key,
+            &expected.name,
+            &state.agent.agent_id(),
+        )?;
+        if &current != expected {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "TreeKEM group store binding changed during open",
+            ));
+        }
+        let info = groups
+            .get(&current.group_key)
+            .ok_or_else(|| not_found("group not found"))?;
+        let authorization = x0x::groups::TreeKemKvAuthorizationContext::from_group(info)
+            .ok_or_else(|| api_error(StatusCode::CONFLICT, "TreeKEM group unavailable"))?;
+        Arc::new(authorization)
+    };
+    let live = state
+        .treekem_groups
+        .read()
+        .await
+        .get(&expected.group_key)
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "TreeKEM ratchet unavailable"))?;
+    let epoch = live.lock().await.epoch();
+    let cached = { state.kv_stores.read().await.get(&expected.topic).cloned() };
+    if let Some(handle) = cached {
+        if handle
+            .validate_group_binding(
+                &expected.name,
+                &expected.stable_group_id,
+                expected.creator,
+                x0x::GroupStoreProtection::TreeKemEncrypted,
+            )
+            .await
+            .is_ok()
+        {
+            return Ok((handle, epoch, false));
+        }
+        handle.retire();
+        state.kv_stores.write().await.remove(&expected.topic);
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "cached TreeKEM group store binding mismatch",
+        ));
+    }
+    let protector: x0x::kv::SharedTreeKemKvProtector = Arc::new(TreeKemGroupStoreProtector::new(
+        state,
+        expected,
+        Arc::clone(&authorization),
+    ));
+    let handle = state
+        .agent
+        .open_treekem_group_kv_store_persistent(
+            &expected.name,
+            &expected.stable_group_id,
+            expected.creator,
+            authorization,
+            protector,
+            &state.kv_store_state_dir,
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok((handle, epoch, true))
+}
+
 async fn open_bound_public_store(
     state: &Arc<AppState>,
     expected: &GssGroupStoreBinding,
@@ -1184,21 +1631,40 @@ pub(in crate::server) async fn create_group_kv_store(
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<CreateGroupStoreRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (binding, public) = {
+    #[derive(Clone, Copy)]
+    enum StorePlane {
+        Gss,
+        TreeKem,
+        Public,
+    }
+    let (binding, plane) = {
         let groups = state.named_groups.read().await;
-        let is_public = match find_store_group(&groups, &id) {
-            Ok((_, info)) => {
-                info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+        let plane = match find_store_group(&groups, &id) {
+            Ok((_, info))
+                if info.policy.confidentiality
+                    == x0x::groups::GroupConfidentiality::SignedPublic =>
+            {
+                StorePlane::Public
             }
+            Ok((_, info)) if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem => {
+                StorePlane::TreeKem
+            }
+            Ok(_) => StorePlane::Gss,
             Err(response) => return response,
         };
-        let resolved = if is_public {
-            resolve_public_group_store(&groups, &id, &req.name, &state.agent.agent_id())
-        } else {
-            resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+        let resolved = match plane {
+            StorePlane::Public => {
+                resolve_public_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+            }
+            StorePlane::TreeKem => {
+                resolve_treekem_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+            }
+            StorePlane::Gss => {
+                resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+            }
         };
         match resolved {
-            Ok(binding) => (binding, is_public),
+            Ok(binding) => (binding, plane),
             Err(response) => return response,
         }
     };
@@ -1215,16 +1681,19 @@ pub(in crate::server) async fn create_group_kv_store(
     // Use the same alias-canonicalizing mutex as all group membership writers.
     let membership = super::named_groups::group_membership_lock(&state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
-    let (handle, epoch, created) = if public {
-        match open_bound_public_store(&state, &binding).await {
+    let (handle, epoch, created) = match plane {
+        StorePlane::Public => match open_bound_public_store(&state, &binding).await {
             Ok((handle, context, created)) => (handle, context.current_epoch(), created),
             Err(response) => return response,
-        }
-    } else {
-        match open_bound_gss_store(&state, &binding).await {
+        },
+        StorePlane::TreeKem => match open_bound_treekem_store(&state, &binding).await {
+            Ok(opened) => opened,
+            Err(response) => return response,
+        },
+        StorePlane::Gss => match open_bound_gss_store(&state, &binding).await {
             Ok((handle, context, created)) => (handle, context.current_epoch(), created),
             Err(response) => return response,
-        }
+        },
     };
     if created {
         state
@@ -1235,7 +1704,7 @@ pub(in crate::server) async fn create_group_kv_store(
         let mut extra = serde_json::Map::new();
         extra.insert(
             "policy".into(),
-            serde_json::Value::String(if public {
+            serde_json::Value::String(if matches!(plane, StorePlane::Public) {
                 "group_signed".into()
             } else {
                 "encrypted".into()
@@ -1249,6 +1718,15 @@ pub(in crate::server) async fn create_group_kv_store(
             "stable_group_id".into(),
             serde_json::Value::String(binding.stable_group_id.clone()),
         );
+        if !matches!(plane, StorePlane::Public) {
+            extra.insert(
+                "secure_plane".into(),
+                serde_json::Value::String(match plane {
+                    StorePlane::TreeKem => "treekem".into(),
+                    StorePlane::Gss | StorePlane::Public => "gss".into(),
+                }),
+            );
+        }
         if let Err(e) = crdt_subscriptions::record(
             &state,
             crdt_subscriptions::CrdtSubscriptionEntry {
@@ -1283,7 +1761,11 @@ pub(in crate::server) async fn create_group_kv_store(
                 &binding.store_id,
                 &binding.stable_group_id,
                 epoch,
-                if public { "group_signed" } else { "encrypted" },
+                if matches!(plane, StorePlane::Public) {
+                    "group_signed"
+                } else {
+                    "encrypted"
+                },
             )
             .await,
         ),
@@ -1295,7 +1777,14 @@ fn validate_gss_store_manifest(
     entry: &crdt_subscriptions::CrdtSubscriptionEntry,
     binding: &GssGroupStoreBinding,
     expected_policy: &str,
+    expected_secure_plane: Option<&str>,
 ) -> Result<(), GroupStoreResponse> {
+    let recorded_plane = entry.extra.get("secure_plane").and_then(|v| v.as_str());
+    let plane_matches = match expected_secure_plane {
+        Some("gss") => recorded_plane.is_none() || recorded_plane == Some("gss"),
+        Some(expected) => recorded_plane == Some(expected),
+        None => recorded_plane.is_none(),
+    };
     if entry.id != binding.topic
         || entry.topic != binding.topic
         || entry.name != binding.name
@@ -1308,6 +1797,7 @@ fn validate_gss_store_manifest(
             .and_then(|owner| parse_agent_id_hex(owner).ok())
             != Some(binding.creator)
         || entry.extra.get("policy").and_then(|v| v.as_str()) != Some(expected_policy)
+        || !plane_matches
     {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -1330,23 +1820,52 @@ pub(in crate::server) async fn restore_bound_gss_store(
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("encrypted store manifest has no stable group ID"))?;
     let public = entry.extra.get("policy").and_then(|v| v.as_str()) == Some("group_signed");
-    let binding = {
+    let (binding, treekem) = {
         let groups = state.named_groups.read().await;
         if public {
-            resolve_public_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+            (
+                resolve_public_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?,
+                false,
+            )
         } else {
-            resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+            let (_, info) = find_store_group(&groups, stable)?;
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                (
+                    resolve_treekem_group_store(
+                        &groups,
+                        stable,
+                        &entry.name,
+                        &state.agent.agent_id(),
+                    )?,
+                    true,
+                )
+            } else {
+                (
+                    resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?,
+                    false,
+                )
+            }
         }
     };
     validate_gss_store_manifest(
         entry,
         &binding,
         if public { "group_signed" } else { "encrypted" },
+        if public {
+            None
+        } else if treekem {
+            Some("treekem")
+        } else {
+            Some("gss")
+        },
     )?;
     let membership = super::named_groups::group_membership_lock(state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
     let (handle, created) = if public {
         let (handle, _, created) = open_bound_public_store(state, &binding).await?;
+        (handle, created)
+    } else if treekem {
+        let (handle, _, created) = open_bound_treekem_store(state, &binding).await?;
         (handle, created)
     } else {
         let (handle, _, created) = open_bound_gss_store(state, &binding).await?;
@@ -1555,7 +2074,7 @@ mod tests {
                 ),
             ]),
         };
-        assert!(validate_gss_store_manifest(&good, &binding, "encrypted").is_ok());
+        assert!(validate_gss_store_manifest(&good, &binding, "encrypted", Some("gss")).is_ok());
         let mut hex_binding = binding.clone();
         hex_binding.creator = AgentId([0xab; 32]);
         let mut upper_owner = good.clone();
@@ -1564,7 +2083,8 @@ mod tests {
             serde_json::Value::String("AB".repeat(32)),
         );
         assert!(
-            validate_gss_store_manifest(&upper_owner, &hex_binding, "encrypted").is_ok(),
+            validate_gss_store_manifest(&upper_owner, &hex_binding, "encrypted", Some("gss"))
+                .is_ok(),
             "preserve parsed owner-ID spelling compatibility"
         );
         for case in 0..6 {
@@ -1592,7 +2112,7 @@ mod tests {
                 _ => entry.name = " Wiki ".into(),
             }
             assert!(
-                validate_gss_store_manifest(&entry, &binding, "encrypted").is_err(),
+                validate_gss_store_manifest(&entry, &binding, "encrypted", Some("gss")).is_err(),
                 "case {case}"
             );
         }
@@ -1652,6 +2172,262 @@ mod tests {
             .write()
             .await
             .insert(group_key.to_string(), info);
+    }
+
+    async fn seed_treekem_group(state: &AppState, group_key: &str) {
+        let group_id = hex::decode(group_key).expect("hex group id");
+        let creator = state.agent.agent_id();
+        let seed = crate::server::routes::named_groups::agent_treekem_seed(
+            state.agent.as_ref(),
+            &group_id,
+        );
+        let live =
+            x0x::mls::TreeKemMlsGroup::create(group_id, creator, &seed).expect("TreeKEM group");
+        let mut info = GroupInfo::new(
+            "treekem".to_string(),
+            String::new(),
+            creator,
+            group_key.to_string(),
+        );
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        info.secret_epoch = live.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", live.epoch()));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.to_string(), info);
+        state.treekem_groups.write().await.insert(
+            group_key.to_string(),
+            Arc::new(tokio::sync::Mutex::new(live)),
+        );
+    }
+
+    #[tokio::test]
+    async fn treekem_non_owner_endorses_retained_history_and_revocation_fences_merge() {
+        use x0x::kv::TreeKemKvProtector;
+
+        let (writer_state, _writer_dir) = encrypted_store_test_state().await;
+        let (reader_state, _reader_dir) = encrypted_store_test_state().await;
+        let owner = AgentId([77; 32]);
+        let writer = writer_state.agent.agent_id();
+        let reader = reader_state.agent.agent_id();
+        let group_key = "45".repeat(16);
+        let group_id = hex::decode(&group_key).expect("group id");
+        let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            writer_state.agent.as_ref(),
+            &group_id,
+        );
+        let reader_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            reader_state.agent.as_ref(),
+            &group_id,
+        );
+        let mut owner_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id, owner, &[77; 32]).expect("owner group");
+        let writer_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(reader, &reader_seed).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances for reader");
+        let reader_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+
+        let mut info = GroupInfo::new(
+            "private".to_string(),
+            String::new(),
+            owner,
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        info.policy.write_access = x0x::groups::GroupWriteAccess::AdminOnly;
+        info.add_member(
+            hex::encode(writer.as_bytes()),
+            x0x::groups::GroupRole::Admin,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        info.add_member(
+            hex::encode(reader.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        info.secret_epoch = writer_group.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", writer_group.epoch()));
+        info.recompute_state_hash();
+        writer_state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        reader_state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        writer_state.treekem_groups.write().await.insert(
+            group_key.clone(),
+            Arc::new(tokio::sync::Mutex::new(writer_group)),
+        );
+        reader_state.treekem_groups.write().await.insert(
+            group_key.clone(),
+            Arc::new(tokio::sync::Mutex::new(reader_group)),
+        );
+        let writer_binding = {
+            let groups = writer_state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &group_key, "Home", &writer)
+                .expect("writer binding")
+        };
+        let reader_binding = {
+            let groups = reader_state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &group_key, "Home", &reader)
+                .expect("reader binding")
+        };
+        assert_eq!(writer_binding.store_id, reader_binding.store_id);
+        let writer_auth = Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(&info).expect("writer auth"),
+        );
+        let reader_auth = Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(&info).expect("reader auth"),
+        );
+        let writer_protector = TreeKemGroupStoreProtector::new(
+            &writer_state,
+            &writer_binding,
+            Arc::clone(&writer_auth),
+        );
+        let reader_protector = TreeKemGroupStoreProtector::new(
+            &reader_state,
+            &reader_binding,
+            Arc::clone(&reader_auth),
+        );
+        assert!(reader_protector.is_authorized_reader(&reader).await);
+        assert!(!reader_protector.is_authorized_writer(&reader).await);
+
+        let group_id = group_key.as_bytes().to_vec();
+        let mut source = x0x::kv::KvStore::new_treekem_encrypted(
+            writer_binding.store_id,
+            "Home".to_string(),
+            owner,
+            group_id.clone(),
+            writer_auth,
+        )
+        .expect("source store");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                saorsa_gossip_types::PeerId::new([1; 32]),
+            )
+            .expect("seed removed key");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    saorsa_gossip_types::PeerId::new([1; 32]),
+                )
+                .expect("large retained value");
+        }
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_auth)
+            .expect("reader context");
+        source.remove("removed").expect("retained tombstone");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                saorsa_gossip_types::PeerId::new([2; 32]),
+            )
+            .expect("concurrent reader state");
+        let retained = bincode::serialize(&source).expect("retained image");
+        assert!(retained.len() > 1024 * 1024, "history requires paging");
+        let signing =
+            x0x::kv::AuthorSigning::from_keypair(writer_state.agent.identity().agent_keypair())
+                .expect("writer signing");
+        let record = writer_protector
+            .seal_record(
+                &signing,
+                x0x::kv::KvMutationKind::RetainedState,
+                &writer_binding.store_id,
+                b"paged-image-complete",
+                false,
+            )
+            .await
+            .expect("non-owner writer endorsement");
+        let opened = reader_protector
+            .open_record(&reader_binding.store_id, &record)
+            .await
+            .expect("reader opens endorsed history");
+        let target = Arc::new(tokio::sync::RwLock::new(target));
+        reader_protector
+            .merge_main_record(
+                opened,
+                saorsa_gossip_types::PeerId::new([1; 32]),
+                &target,
+                Some(retained),
+            )
+            .await
+            .expect("current writer retained merge");
+        let merged = target.read().await;
+        assert!(merged.get("removed").is_none());
+        assert_eq!(
+            merged.get("concurrent").expect("concurrent").value,
+            b"local"
+        );
+        assert_eq!(merged.last_history_endorser(), Some(&writer));
+        drop(merged);
+
+        let stale_record = writer_protector
+            .seal_record(
+                &signing,
+                x0x::kv::KvMutationKind::RetainedState,
+                &writer_binding.store_id,
+                b"paged-image-complete",
+                false,
+            )
+            .await
+            .expect("record before removal");
+        let stale_opened = reader_protector
+            .open_record(&reader_binding.store_id, &stale_record)
+            .await
+            .expect("opened before removal");
+        {
+            let mut groups = reader_state.named_groups.write().await;
+            groups
+                .get_mut(&group_key)
+                .expect("reader group")
+                .remove_member(&hex::encode(writer.as_bytes()), None);
+        }
+        assert!(reader_protector
+            .merge_main_record(
+                stale_opened,
+                saorsa_gossip_types::PeerId::new([1; 32]),
+                &target,
+                Some(bincode::serialize(&source).expect("stale image")),
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1911,33 +2687,65 @@ mod tests {
         assert_eq!(code, StatusCode::CREATED, "{resp:?}");
         assert_eq!(resp.0["policy"], "group_signed");
 
-        // TreeKEM-plane group -> 400 (v1 encrypted stores are GSS-backed).
+        // TreeKEM-plane group uses the distinct mutable-ratchet backend.
         let treekem_key = "12".repeat(16);
-        {
-            let mut info = GroupInfo::new(
-                "treekem".to_string(),
-                String::new(),
-                state.agent.agent_id(),
-                treekem_key.clone(),
-            );
-            info.migrate_from_v1();
-            info.secure_plane = SecureGroupPlane::TreeKem;
-            state
-                .named_groups
-                .write()
-                .await
-                .insert(treekem_key.clone(), info);
-        }
+        seed_treekem_group(&state, &treekem_key).await;
         let (code, resp) = create_group_kv_store(
-            State(state),
-            Path(treekem_key),
+            State(Arc::clone(&state)),
+            Path(treekem_key.clone()),
             Extension(owner_actor.clone()),
             Json(CreateGroupStoreRequest {
                 name: "n".to_string(),
             }),
         )
         .await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "{resp:?}");
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        assert_eq!(resp.0["policy"], "encrypted");
+        let topic = resp.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("TreeKEM handle");
+        handle
+            .validate_group_binding(
+                "n",
+                &treekem_key,
+                state.agent.agent_id(),
+                x0x::GroupStoreProtection::TreeKemEncrypted,
+            )
+            .await
+            .expect("distinct TreeKEM binding");
+        handle
+            .put_with_delta("k".into(), b"v".to_vec(), "text/plain".into())
+            .await
+            .expect("TreeKEM store write");
+        assert_eq!(
+            handle.get("k").await.expect("read").expect("stored").value,
+            b"v"
+        );
+        handle.retire();
+        state.kv_stores.write().await.remove(&topic);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &treekem_key, "n", &state.agent.agent_id())
+                .expect("restart binding")
+        };
+        let (restored, _, _) = open_bound_treekem_store(&state, &binding)
+            .await
+            .expect("restore TreeKEM store snapshot");
+        assert_eq!(
+            restored
+                .get("k")
+                .await
+                .expect("restored read")
+                .expect("restored value")
+                .value,
+            b"v",
+            "restart must retain the durable store image"
+        );
         let _ = GssKvSecureContext::from_group; // keep backend import referenced
         let _ = GroupPolicy::default();
     }

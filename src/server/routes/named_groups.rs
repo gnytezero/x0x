@@ -5097,7 +5097,7 @@ async fn rebind_restore_live_group(state: &AppState, group_id: &str) {
     }
 }
 
-fn restore_local_treekem_group_from_snapshot(
+pub(super) fn restore_local_treekem_group_from_snapshot(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
     snapshot: &[u8],
@@ -23530,7 +23530,7 @@ pub(in crate::server) async fn secure_open_envelope_adversarial(
 /// ML-DSA secret key and the group's id bytes (ADR-0012). Centralised so the
 /// create path and the restore path always agree on the seed (and therefore on
 /// the re-derived identity / leaf).
-fn agent_treekem_seed(agent: &Agent, group_id_bytes: &[u8]) -> [u8; 32] {
+pub(super) fn agent_treekem_seed(agent: &Agent, group_id_bytes: &[u8]) -> [u8; 32] {
     let (_public, secret) = agent.identity().agent_keypair().to_bytes();
     x0x::mls::treekem::derive_identity_seed(&secret, group_id_bytes)
 }
@@ -23635,7 +23635,7 @@ async fn persist_treekem_snapshot_bytes(
 }
 
 /// Persist a TreeKEM snapshot bound to the currently durable named-group state.
-async fn persist_treekem_snapshot_bound(
+pub(super) async fn persist_treekem_snapshot_bound(
     state: &AppState,
     group_id_hex: &str,
     group: &x0x::mls::TreeKemMlsGroup,
