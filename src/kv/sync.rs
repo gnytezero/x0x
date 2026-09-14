@@ -502,6 +502,7 @@ impl KvStoreSync {
         refresh: Option<&SecureRefreshFn>,
         store: &Arc<RwLock<KvStore>>,
         store_id: &KvStoreId,
+        local_peer: PeerId,
         payload: &[u8],
     ) -> bool {
         if let Some(refresh) = refresh {
@@ -551,7 +552,7 @@ impl KvStoreSync {
                     bincode::deserialize::<KvStore>(mutation_payload)
                         .map_err(|e| KvError::Gossip(format!("bad retained group image: {e}")))
                         .and_then(|image| {
-                            target.merge_group_signed_image(&image, mutation.author_id)
+                            target.merge_group_signed_image(&image, mutation.author_id, local_peer)
                         })
                 }
             }
@@ -957,6 +958,7 @@ impl KvStoreSync {
 
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
+        let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
         // store's life).
         let listener_store_id = { *store.read().await.id() };
@@ -1015,6 +1017,7 @@ impl KvStoreSync {
                             listener_refresh.as_ref(),
                             &store,
                             &listener_store_id,
+                            listener_local_peer_id,
                             &msg.payload,
                         )
                         .await
@@ -1356,8 +1359,18 @@ impl KvStoreSync {
                             } else {
                                 !s.is_empty() || s.latest_checkpoint.is_some()
                             };
-                            let full = (has_payload && !cooled_down && !responder_is_group_signed)
-                                .then(|| s.full_delta());
+                            let full = if has_payload && !cooled_down && !responder_is_group_signed
+                            {
+                                match s.full_delta() {
+                                    Ok(delta) => Some(delta),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "cannot allocate full-state delta tags");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let retained = if has_payload
                                 && !cooled_down
                                 && responder_is_group_signed
@@ -2198,7 +2211,7 @@ mod tests {
         // Exact tag ceiling restored: the next minted seq is strictly above
         // every pre-restart seq (no OR-Set (peer, seq) tag reuse).
         assert!(
-            restored.next_seq() > counter_before,
+            restored.next_seq().expect("sequence") > counter_before,
             "restored seq counter must exceed every pre-restart seq"
         );
 
@@ -2223,6 +2236,76 @@ mod tests {
         assert!(
             load_snapshot(&path).is_err(),
             "garbage body must be an error (fail closed)"
+        );
+    }
+
+    #[test]
+    fn retained_import_sequence_floor_survives_snapshot_restart() {
+        let owner = agent(1);
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "09".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let group_id = group.stable_group_id().as_bytes().to_vec();
+        let id = store_id(19);
+        let local_peer = peer(4);
+        let ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let mut source =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group_id.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "page".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("source put");
+        source.remove("page").expect("source remove");
+        let source: KvStore =
+            bincode::deserialize(&bincode::serialize(&source).expect("retained image encode"))
+                .expect("retained image decode");
+
+        let mut target = KvStore::new_group_signed(id, "Wiki".to_string(), owner, group_id, ctx)
+            .expect("fresh target");
+        target
+            .merge_group_signed_image(&source, owner, local_peer)
+            .expect("authenticated import");
+        target
+            .put(
+                "page".to_string(),
+                b"first".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("first re-add");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("kv").join("retained.bin");
+        write_snapshot_atomic(&path, &encode_snapshot(&target).expect("snapshot encode"))
+            .expect("snapshot write");
+        let mut restored = load_snapshot(&path)
+            .expect("snapshot load")
+            .expect("snapshot present");
+        restored.remove("page").expect("remove after restart");
+        restored
+            .put(
+                "page".to_string(),
+                b"second".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("second re-add after restart");
+        assert_eq!(
+            restored.get("page").expect("visible re-add").value,
+            b"second"
         );
     }
 
@@ -2519,7 +2602,7 @@ mod tests {
                 timestamp: 0,
             })
             .expect("genuine creator checkpoint");
-        let mut hostile = source.full_delta();
+        let mut hostile = source.full_delta().expect("full delta");
         hostile.owner_checkpoint = Some(checkpoint);
 
         let mut target = KvStore::new_group_signed(
@@ -2558,6 +2641,7 @@ mod tests {
                 None,
                 &target,
                 &id,
+                peer(1),
                 &encoded,
             )
             .await,
@@ -3480,7 +3564,7 @@ mod tests {
             KvStoreDelta::for_put(
                 "secret-key".to_string(),
                 entry,
-                (peer(1), s.next_seq()),
+                (peer(1), s.next_seq().expect("sequence")),
                 s.current_version(),
             )
         };
@@ -3558,7 +3642,7 @@ mod tests {
             KvStoreDelta::for_put(
                 "intruder-key".to_string(),
                 entry,
-                (peer(3), s.next_seq()),
+                (peer(3), s.next_seq().expect("sequence")),
                 s.current_version(),
             )
         };
@@ -4558,7 +4642,7 @@ mod tests {
             crate::kv::store::AnchorChannel::RestParam,
         );
         let k2_only = {
-            let full = owned.full_delta();
+            let full = owned.full_delta().expect("full delta");
             let (key, (entry, tag)) = full
                 .added
                 .iter()
@@ -4693,7 +4777,7 @@ mod tests {
             crate::kv::store::AnchorChannel::Persistence,
         );
         let live_only = {
-            let full = owned.full_delta();
+            let full = owned.full_delta().expect("full delta");
             let (key, (entry, tag)) = full
                 .added
                 .iter()
@@ -4876,7 +4960,7 @@ mod tests {
                 peer(1),
             )
             .expect("k1");
-        let full = owned.full_delta();
+        let full = owned.full_delta().expect("full delta");
         let encoded = encode_delta(peer(1), &full).expect("encode full");
         pubsub
             .publish(topic.to_string(), bytes::Bytes::from(encoded))
@@ -5190,7 +5274,7 @@ mod tests {
             .allow_writer(writer, &owner_id)
             .expect("learn allowlist");
         let k_owner_seed = {
-            let full = owned.full_delta();
+            let full = owned.full_delta().expect("full delta");
             let (key, (entry, tag)) = full
                 .added
                 .iter()
@@ -5294,7 +5378,7 @@ mod tests {
             Some(owner),
             crate::kv::store::AnchorChannel::RestParam,
         );
-        let s1 = holder.full_delta();
+        let s1 = holder.full_delta().expect("full delta");
         replica
             .merge_delta(&s1, peer(1), Some(&owner))
             .expect("serve 1");
@@ -5303,7 +5387,7 @@ mod tests {
         // The holder deletes the key; the next VERIFIED serve prunes it
         // (tombstoning the first serve's synthetic tag locally).
         holder.remove("k_doomed").expect("delete");
-        let s2 = holder.full_delta();
+        let s2 = holder.full_delta().expect("full delta");
         assert_eq!(
             s2.served_digest(&store_id(1)),
             Some(holder.served_digest()),
@@ -5326,7 +5410,7 @@ mod tests {
                 peer(1),
             )
             .expect("re-add");
-        let s3 = holder.full_delta();
+        let s3 = holder.full_delta().expect("full delta");
         replica
             .merge_delta(&s3, peer(1), Some(&owner))
             .expect("serve 3");
@@ -5350,7 +5434,7 @@ mod tests {
             kp: &crate::identity::AgentKeypair,
             seq: u64,
         ) -> KvStoreDelta {
-            let mut delta = store.full_delta();
+            let mut delta = store.full_delta().expect("full delta");
             delta.owner_checkpoint = Some(
                 make_owner_checkpoint(OwnerCheckpointParams {
                     topic: "kv-stale-checkpoint-prune",

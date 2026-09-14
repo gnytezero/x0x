@@ -1457,6 +1457,20 @@ impl PubSubManager {
             .map(|_| ())
     }
 
+    /// Retain the explicit-topic publish fan-out for targeted-delivery tests.
+    #[cfg(test)]
+    pub(crate) async fn publish_topic_id_with_fanout_for_test(
+        &self,
+        topic: String,
+        topic_id: TopicId,
+        payload: Bytes,
+    ) -> NetworkResult<u32> {
+        let outcome = self
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .await?;
+        Ok(outcome.fan_out)
+    }
+
     /// Publish to a topic with an explicit transport `TopicId`, returning the
     /// signed V2 envelope bytes when signing is enabled.
     ///
