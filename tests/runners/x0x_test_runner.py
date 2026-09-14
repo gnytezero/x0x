@@ -43,6 +43,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -53,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 _LOCAL_TESTS_DIR = os.path.dirname(_SCRIPT_DIR)
@@ -97,6 +100,15 @@ RESULT_RAW_QUIC_ACK_MS: Optional[int] = _optional_int_env(
 )
 RESULT_QUEUE_MAX = 1024
 RESULT_QUEUE_MAX_AGE_SECS = 300
+RESULT_TOTAL_BUDGET_SECS = 30.0
+RESULT_RAW_BUDGET_SECS = 20.0
+RESULT_HTTP_TIMEOUT_SECS = 15.0
+RESULT_PUBLISHER_WORKERS = 4
+RESULT_HTTP_WORKERS = 4
+RESULT_HTTP_TASKS_MAX = 16
+COMMAND_REPLAY_MAX_ENTRIES = 256
+COMMAND_REPLAY_MAX_BYTES = 4 * 1024 * 1024
+COMMAND_REPLAY_TTL_SECS = 300
 
 
 def now_ms() -> int:
@@ -168,7 +180,12 @@ class X0xClient:
             return True
 
     def _open(self, method, path, data, timeout, accept=None):
+        deadline = time.monotonic() + timeout
+
         def send(token):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("HTTP request budget expired")
             headers = {"Authorization": f"Bearer {token}"}
             if accept is None:
                 headers["Content-Type"] = "application/json"
@@ -177,7 +194,7 @@ class X0xClient:
             req = urllib.request.Request(
                 self.base_url + path, data=data, method=method, headers=headers
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            return urllib.request.urlopen(req, timeout=remaining)
 
         token = self._current_token()
         try:
@@ -211,11 +228,14 @@ class X0xClient:
     def agent(self) -> Dict[str, Any]:
         return self._request("GET", "/agent")
 
-    def publish(self, topic: str, payload: bytes) -> Dict[str, Any]:
+    def publish(
+        self, topic: str, payload: bytes, timeout: float = 15.0,
+    ) -> Dict[str, Any]:
         return self._request(
             "POST",
             "/publish",
             body={"topic": topic, "payload": b64encode(payload)},
+            timeout=timeout,
         )
 
     def subscribe(self, topic: str) -> Dict[str, Any]:
@@ -233,6 +253,7 @@ class X0xClient:
         raw_quic_receive_ack_ms: Optional[int] = None,
         stop_fallback_on_raw_error: bool = False,
         require_gossip: bool = False,
+        timeout: float = 15.0,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -248,7 +269,7 @@ class X0xClient:
             body["stop_fallback_on_raw_error"] = True
         if require_gossip:
             body["require_gossip"] = True
-        return self._request("POST", "/direct/send", body=body)
+        return self._request("POST", "/direct/send", body=body, timeout=timeout)
 
     # ─── contacts ──────────────────────────────────────────────────────
     def contacts_list(self) -> Dict[str, Any]:
@@ -352,7 +373,7 @@ class TestRunner:
         # target_aid=None means publish on the legacy results topic
         # (last-resort fallback for orchestrators that don't include
         # an anchor address).
-        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool, float]]" = (
+        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool, float, Optional[Tuple[str, str]]]]" = (
             queue.Queue(maxsize=RESULT_QUEUE_MAX)
         )
         self._agent_id: Optional[str] = None
@@ -363,6 +384,25 @@ class TestRunner:
         # fresh discover.
         self._last_known_anchor_aid: Optional[str] = None
         self._subscription_ids: Dict[str, str] = {}
+        # Both control listeners can dispatch concurrently. Entries remain in
+        # this table while their action is running, so pressure never evicts an
+        # in-flight mutation and permits a duplicate to run it again.
+        self._replay_lock = threading.Lock()
+        self._replay: "collections.OrderedDict[Tuple[str, str], Dict[str, Any]]" = (
+            collections.OrderedDict()
+        )
+        self._replay_bytes = 0
+        self._dispatch_context = threading.local()
+        self._queued_result_keys: set = set()
+        self._queued_result_lock = threading.Lock()
+        self._http_slots = threading.BoundedSemaphore(RESULT_HTTP_TASKS_MAX)
+        self._http_futures: set = set()
+        self._http_futures_lock = threading.Lock()
+        self._http_lifecycle_lock = threading.Lock()
+        self._http_work_q: "queue.Queue[Tuple[concurrent.futures.Future, Callable[..., bool], Tuple[Any, ...]]]" = queue.Queue(
+            maxsize=RESULT_HTTP_TASKS_MAX,
+        )
+        self._http_workers: List[threading.Thread] = []
 
     # ─── lifecycle ─────────────────────────────────────────────────────
     def run(self) -> int:
@@ -375,10 +415,10 @@ class TestRunner:
         threads = [
             threading.Thread(target=self._control_listener_loop, daemon=True),
             threading.Thread(target=self._direct_listener_loop, daemon=True),
-            threading.Thread(target=self._publisher_loop, daemon=True),
         ]
         for t in threads:
             t.start()
+        publisher_threads = self._start_publisher_workers()
 
         self._announce_ready()
 
@@ -388,6 +428,7 @@ class TestRunner:
         except KeyboardInterrupt:
             pass
         self._stop.set()
+        self._stop_publisher_workers(publisher_threads)
         return 0
 
     def _bootstrap(self) -> None:
@@ -453,15 +494,64 @@ class TestRunner:
         )
 
     # ─── outbound delivery (DM-first, pubsub fallback) ─────────────────
+    def _start_publisher_workers(self) -> List[threading.Thread]:
+        workers = [
+            threading.Thread(
+                target=self._publisher_loop,
+                name=f"x0x-result-publisher-{index + 1}",
+                daemon=True,
+            )
+            for index in range(RESULT_PUBLISHER_WORKERS)
+        ]
+        for worker in workers:
+            worker.start()
+        return workers
+
+    def _stop_publisher_workers(
+        self, workers: List[threading.Thread],
+    ) -> None:
+        self._stop.set()
+        for worker in workers:
+            worker.join(timeout=1.0)
+        while True:
+            try:
+                item = self._send_q.get_nowait()
+            except queue.Empty:
+                break
+            self._release_dropped_result(item)
+        with self._http_lifecycle_lock:
+            while True:
+                try:
+                    future, _job, _args = self._http_work_q.get_nowait()
+                except queue.Empty:
+                    break
+                future.cancel()
+            with self._http_futures_lock:
+                outstanding = list(self._http_futures)
+        surviving = sum(not future.done() for future in outstanding)
+        if surviving:
+            self.log.warning(
+                "result HTTP shutdown left %d bounded running tasks to finish",
+                surviving,
+            )
+
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                envelope, target_aid, result_chunks_v2, enqueued_at = self._send_q.get(
-                    timeout=0.5
-                )
+                (
+                    envelope,
+                    target_aid,
+                    result_chunks_v2,
+                    enqueued_at,
+                    replay_key,
+                ) = self._send_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             publish_started = time.monotonic()
+            total_deadline = enqueued_at + RESULT_TOTAL_BUDGET_SECS
+            raw_deadline = min(
+                total_deadline, enqueued_at + RESULT_RAW_BUDGET_SECS,
+            )
             self.log.info(
                 "result stage=publish_start kind=%s request_id=%s command_id=%s "
                 "queue_wait_ms=%.1f monotonic=%.6f",
@@ -469,37 +559,62 @@ class TestRunner:
                 envelope.get("command_id"),
                 max(0.0, (publish_started - enqueued_at) * 1000), publish_started,
             )
+            delivery_key = self._result_delivery_key(
+                envelope, target_aid, result_chunks_v2, replay_key,
+            )
             payload = json.dumps(envelope).encode("utf-8")
-            if target_aid:
-                v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
-                mode = "chunks_v2" if result_chunks_v2 and v1_bytes > DM_MAX_BYTES else "v1"
-                self.log.info(
-                    "result delivery kind=%s request_id=%s command_id=%s "
-                    "mode=%s json_bytes=%d dm_bytes=%d",
-                    envelope.get("kind"), envelope.get("request_id"),
-                    envelope.get("command_id"), mode, len(payload), v1_bytes,
-                )
-                if self._send_result_dm(
-                    target_aid, payload, envelope, result_chunks_v2,
-                ):
-                    self.log.info(
-                        "result stage=publish_complete kind=%s request_id=%s "
-                        "command_id=%s mode=%s duration_ms=%.1f",
-                        envelope.get("kind"), envelope.get("request_id"),
-                        envelope.get("command_id"), mode,
-                        (time.monotonic() - publish_started) * 1000,
+            submitted_http: List[concurrent.futures.Future] = []
+            try:
+                if target_aid:
+                    v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
+                    mode = (
+                        "chunks_v2"
+                        if result_chunks_v2 and v1_bytes > DM_MAX_BYTES
+                        else "v1"
                     )
-                    continue
-                # DM failed irretrievably — fall through to pubsub so the
-                # orchestrator at least sees the result on the legacy
-                # topic if it's still listening there.
-                self.log.warning(
-                    "result fallback kind=%s request_id=%s command_id=%s "
-                    "from_mode=%s json_bytes=%d",
-                    envelope.get("kind"), envelope.get("request_id"),
-                    envelope.get("command_id"), mode, len(payload),
+                    self.log.info(
+                        "result delivery kind=%s request_id=%s command_id=%s "
+                        "mode=%s json_bytes=%d dm_bytes=%d",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"), mode, len(payload), v1_bytes,
+                    )
+                    if self._send_result_dm(
+                        target_aid,
+                        payload,
+                        envelope,
+                        result_chunks_v2,
+                        raw_deadline,
+                        submitted_http,
+                    ):
+                        self.log.info(
+                            "result stage=publish_complete kind=%s request_id=%s "
+                            "command_id=%s mode=%s duration_ms=%.1f",
+                            envelope.get("kind"), envelope.get("request_id"),
+                            envelope.get("command_id"), mode,
+                            (time.monotonic() - publish_started) * 1000,
+                        )
+                        continue
+                    # DM failed irretrievably — fall through to pubsub so the
+                    # orchestrator can still receive it on the legacy topic.
+                    self.log.warning(
+                        "result fallback kind=%s request_id=%s command_id=%s "
+                        "from_mode=%s json_bytes=%d",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"), mode, len(payload),
+                    )
+                if not self._publish_result_legacy(
+                    payload, envelope, total_deadline, submitted_http,
+                ):
+                    self.log.error(
+                        "result delivery failed within budget: kind=%s "
+                        "request_id=%s command_id=%s",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"),
+                    )
+            finally:
+                self._finish_result_after_http(
+                    submitted_http, delivery_key, replay_key,
                 )
-            self._publish_result_legacy(payload, envelope)
 
     def _send_result_dm(
         self,
@@ -507,6 +622,8 @@ class TestRunner:
         payload: bytes,
         envelope: Dict[str, Any],
         result_chunks_v2: bool = False,
+        deadline: Optional[float] = None,
+        submitted_http: Optional[List[concurrent.futures.Future]] = None,
     ) -> bool:
         # Phase-A result DMs use the raw-QUIC message ACK path so the control
         # plane stays independent of PlumTree. If raw delivery fails, the
@@ -514,7 +631,13 @@ class TestRunner:
         # orchestrator can record the failure details.
         wire = b"x0xtest|res|" + base64.b64encode(payload)
         if len(wire) <= DM_MAX_BYTES:
-            return self._send_result_wire(target_aid, wire, envelope, 1, 1)
+            return self._run_http_job(
+                lambda: self._send_result_wire(
+                    target_aid, wire, envelope, 1, 1, deadline,
+                ),
+                deadline,
+                submitted_http,
+            )
         if result_chunks_v2:
             request_id = envelope.get("request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -525,16 +648,155 @@ class TestRunner:
             except ValueError as exc:
                 self.log.warning("result cannot be chunked: %s", exc)
                 return False
+            futures = []
             for wire_index, frame in enumerate(frames, start=1):
-                if not self._send_result_wire(
-                    target_aid, frame, envelope, wire_index, len(frames)
-                ):
+                future = self._submit_http_job(
+                    self._send_result_wire,
+                    deadline,
+                    target_aid, frame, envelope, wire_index, len(frames), deadline,
+                )
+                if future is None:
+                    for pending in futures:
+                        pending.cancel()
                     return False
-            return True
+                futures.append(future)
+                if submitted_http is not None:
+                    submitted_http.append(future)
+            remaining = None if deadline is None else max(
+                0.0, deadline - time.monotonic(),
+            )
+            done, pending = concurrent.futures.wait(
+                futures,
+                timeout=remaining,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
+            for future in pending:
+                future.cancel()
+            if pending:
+                return False
+            try:
+                return all(future.result() for future in done)
+            except (concurrent.futures.CancelledError, Exception):
+                return False
         # Older orchestrators cannot reassemble chunks. Let the publisher
         # loop use the existing PubSub fallback without attempting an
         # over-limit direct message.
         return False
+
+    def _run_http_job(
+        self,
+        job: Callable[[], bool],
+        deadline: Optional[float],
+        submitted_http: Optional[List[concurrent.futures.Future]] = None,
+    ) -> bool:
+        future = self._submit_http_job(job, deadline)
+        if future is None:
+            return False
+        if submitted_http is not None:
+            submitted_http.append(future)
+        timeout = None if deadline is None else max(
+            0.0, deadline - time.monotonic(),
+        )
+        try:
+            return bool(future.result(timeout=timeout))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return False
+        except (concurrent.futures.CancelledError, Exception):
+            return False
+
+    def _submit_http_job(
+        self,
+        job: Callable[..., bool],
+        deadline: Optional[float],
+        *args: Any,
+    ) -> Optional[concurrent.futures.Future]:
+        if self._stop.is_set():
+            return None
+        timeout = None if deadline is None else max(
+            0.0, deadline - time.monotonic(),
+        )
+        if timeout == 0.0 or not self._http_slots.acquire(timeout=timeout):
+            return None
+        with self._http_lifecycle_lock:
+            if self._stop.is_set():
+                self._http_slots.release()
+                return None
+            self._ensure_http_workers_locked()
+            future: concurrent.futures.Future = concurrent.futures.Future()
+            with self._http_futures_lock:
+                self._http_futures.add(future)
+
+            def terminal(done: concurrent.futures.Future) -> None:
+                with self._http_futures_lock:
+                    self._http_futures.discard(done)
+                self._http_slots.release()
+
+            future.add_done_callback(terminal)
+            try:
+                self._http_work_q.put_nowait((future, job, args))
+            except queue.Full:
+                future.cancel()
+                return None
+        return future
+
+    def _ensure_http_workers_locked(self) -> None:
+        if self._http_workers:
+            return
+        self._http_workers = [
+            threading.Thread(
+                target=self._http_worker_loop,
+                name=f"x0x-result-http-{index + 1}",
+                daemon=True,
+            )
+            for index in range(RESULT_HTTP_WORKERS)
+        ]
+        for worker in self._http_workers:
+            worker.start()
+
+    def _http_worker_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                future, job, args = self._http_work_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(job(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+    def _finish_result_after_http(
+        self,
+        futures: List[concurrent.futures.Future],
+        delivery_key: Optional[Tuple[Any, ...]],
+        replay_key: Optional[Tuple[str, str]],
+    ) -> None:
+        pending = [future for future in futures if not future.done()]
+
+        def release() -> None:
+            if delivery_key is not None:
+                with self._queued_result_lock:
+                    self._queued_result_keys.discard(delivery_key)
+            self._mark_replay_delivery_finished(replay_key)
+
+        if not pending:
+            release()
+            return
+        lock = threading.Lock()
+        remaining = [len(pending)]
+
+        def completed(_future: concurrent.futures.Future) -> None:
+            should_release = False
+            with lock:
+                remaining[0] -= 1
+                should_release = remaining[0] == 0
+            if should_release:
+                release()
+
+        for future in pending:
+            future.add_done_callback(completed)
 
     def _send_result_wire(
         self,
@@ -543,9 +805,19 @@ class TestRunner:
         envelope: Dict[str, Any],
         wire_index: int,
         wire_count: int,
+        deadline: Optional[float] = None,
     ) -> bool:
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+            if self._stop.is_set():
+                return False
             attempt_started = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - attempt_started
+                if remaining <= 0:
+                    return False
+                request_timeout = min(RESULT_HTTP_TIMEOUT_SECS, remaining)
+            else:
+                request_timeout = RESULT_HTTP_TIMEOUT_SECS
             try:
                 self.client.direct_send(
                     target_aid,
@@ -554,6 +826,7 @@ class TestRunner:
                     prefer_raw_quic_if_connected=True,
                     raw_quic_receive_ack_ms=RESULT_RAW_QUIC_ACK_MS,
                     stop_fallback_on_raw_error=True,
+                    timeout=request_timeout,
                 )
                 self.log.info(
                     "result stage=wire_complete kind=%s request_id=%s command_id=%s "
@@ -587,7 +860,10 @@ class TestRunner:
                     envelope.get("command_id"), wire_index, wire_count,
                     attempt, PUBLISH_RETRY_MAX, duration_ms, status,
                 )
-                time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
+                if not self._sleep_within_deadline(
+                    PUBLISH_RETRY_BACKOFF_SECS * attempt, deadline,
+                ):
+                    return False
             except Exception as exc:
                 self.log.warning(
                     "result stage=wire_complete kind=%s request_id=%s "
@@ -599,12 +875,47 @@ class TestRunner:
                     (time.monotonic() - attempt_started) * 1000,
                     type(exc).__name__,
                 )
-                time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
+                if not self._sleep_within_deadline(
+                    PUBLISH_RETRY_BACKOFF_SECS * attempt, deadline,
+                ):
+                    return False
         return False
 
+    @staticmethod
+    def _sleep_within_deadline(
+        seconds: float, deadline: Optional[float],
+    ) -> bool:
+        if deadline is None:
+            time.sleep(seconds)
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        sleep_for = min(seconds, remaining)
+        time.sleep(sleep_for)
+        return sleep_for >= seconds and time.monotonic() < deadline
+
     def _publish_result_legacy(
-        self, payload: bytes, envelope: Dict[str, Any]
-    ) -> None:
+        self,
+        payload: bytes,
+        envelope: Dict[str, Any],
+        deadline: Optional[float] = None,
+        submitted_http: Optional[List[concurrent.futures.Future]] = None,
+    ) -> bool:
+        return self._run_http_job(
+            lambda: self._publish_result_legacy_http(
+                payload, envelope, deadline,
+            ),
+            deadline,
+            submitted_http,
+        )
+
+    def _publish_result_legacy_http(
+        self,
+        payload: bytes,
+        envelope: Dict[str, Any],
+        deadline: Optional[float] = None,
+    ) -> bool:
         if self._pubsub_disabled_after_discover:
             self.log.error(
                 "dropping result after DM failure because pubsub fallback is "
@@ -612,11 +923,22 @@ class TestRunner:
                 envelope.get("kind"), envelope.get("request_id"),
                 envelope.get("command_id"),
             )
-            return
+            return False
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+            if self._stop.is_set():
+                return False
             attempt_started = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - attempt_started
+                if remaining <= 0:
+                    return False
+                request_timeout = min(RESULT_HTTP_TIMEOUT_SECS, remaining)
+            else:
+                request_timeout = RESULT_HTTP_TIMEOUT_SECS
             try:
-                self.client.publish(LEGACY_RESULTS_TOPIC, payload)
+                self.client.publish(
+                    LEGACY_RESULTS_TOPIC, payload, timeout=request_timeout,
+                )
                 self.log.info(
                     "result stage=fallback_complete kind=%s request_id=%s "
                     "command_id=%s attempt=%d/%d duration_ms=%.1f outcome=ok",
@@ -624,7 +946,7 @@ class TestRunner:
                     envelope.get("command_id"), attempt, PUBLISH_RETRY_MAX,
                     (time.monotonic() - attempt_started) * 1000,
                 )
-                return
+                return True
             except Exception as exc:
                 self.log.warning(
                     "result stage=fallback_complete kind=%s request_id=%s "
@@ -635,19 +957,25 @@ class TestRunner:
                     (time.monotonic() - attempt_started) * 1000,
                     type(exc).__name__,
                 )
-                time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
+                if not self._sleep_within_deadline(
+                    PUBLISH_RETRY_BACKOFF_SECS * attempt, deadline,
+                ):
+                    return False
         self.log.error(
             "dropping result after retries: kind=%s request_id=%s command_id=%s",
             envelope.get("kind"), envelope.get("request_id"),
             envelope.get("command_id"),
         )
+        return False
 
     def _enqueue_result(
         self,
         body: Dict[str, Any],
         target_aid: Optional[str] = None,
         result_chunks_v2: bool = False,
-    ) -> None:
+        coalesce: bool = True,
+        replay_key: Optional[Tuple[str, str]] = None,
+    ) -> bool:
         body.setdefault("node", self.node_name)
         body.setdefault("agent_id", self._agent_id)
         body.setdefault("machine_id", self._machine_id)
@@ -656,9 +984,28 @@ class TestRunner:
         if not isinstance(current_ms, int):
             current_ms = now_ms()
             body["ts_ms"] = current_ms
+        context_key = replay_key or getattr(self._dispatch_context, "replay_key", None)
+        if replay_key is not None:
+            self._pin_replay_delivery(replay_key)
+        elif context_key is not None:
+            self._remember_replay_result(
+                context_key, body, target_aid, result_chunks_v2,
+            )
+        delivery_key = self._result_delivery_key(
+            body, target_aid, result_chunks_v2, context_key,
+        )
+        if delivery_key is not None and coalesce:
+            with self._queued_result_lock:
+                if delivery_key in self._queued_result_keys:
+                    self.log.info(
+                        "coalescing queued result kind=%s request_id=%s",
+                        body.get("kind"), body.get("request_id"),
+                    )
+                    return False
+                self._queued_result_keys.add(delivery_key)
         self._prune_stale_results(current_ms)
         enqueued_at = time.monotonic()
-        item = (body, target_aid, result_chunks_v2, enqueued_at)
+        item = (body, target_aid, result_chunks_v2, enqueued_at, context_key)
         try:
             self._send_q.put_nowait(item)
             self.log.info(
@@ -667,11 +1014,16 @@ class TestRunner:
                 body.get("kind"), body.get("request_id"), body.get("command_id"),
                 enqueued_at, self._send_q.qsize(),
             )
-            return
+            return True
         except queue.Full:
             pass
         try:
-            dropped, _, _, _ = self._send_q.get_nowait()
+            dropped, dropped_target, dropped_chunks, _, dropped_replay = (
+                self._send_q.get_nowait()
+            )
+            self._release_dropped_result(
+                (dropped, dropped_target, dropped_chunks, 0.0, dropped_replay),
+            )
             self.log.warning(
                 "dropping oldest queued result after result buffer filled: "
                 "kind=%s request_id=%s",
@@ -688,6 +1040,7 @@ class TestRunner:
                 body.get("kind"), body.get("request_id"), body.get("command_id"),
                 enqueued_at, self._send_q.qsize(),
             )
+            return True
         except queue.Full:
             self.log.error(
                 "dropping current result because result buffer remained full: "
@@ -695,6 +1048,157 @@ class TestRunner:
                 body.get("kind"),
                 body.get("request_id"),
             )
+            if delivery_key is not None and coalesce:
+                with self._queued_result_lock:
+                    self._queued_result_keys.discard(delivery_key)
+            self._mark_replay_delivery_finished(context_key)
+            return False
+
+    @staticmethod
+    def _result_delivery_key(
+        body: Dict[str, Any],
+        target_aid: Optional[str],
+        result_chunks_v2: bool,
+        replay_key: Optional[Tuple[str, str]],
+    ) -> Optional[Tuple[str, str, str]]:
+        request_id = body.get("request_id")
+        if not target_aid or not isinstance(request_id, str) or not request_id:
+            return None
+        identity = (
+            repr(replay_key)
+            if replay_key is not None
+            else hashlib.sha256(
+                json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+        negotiation = "chunks" if result_chunks_v2 else "legacy"
+        return identity, target_aid, negotiation
+
+    def _remember_replay_result(
+        self,
+        key: Tuple[str, str],
+        body: Dict[str, Any],
+        target_aid: Optional[str],
+        result_chunks_v2: bool,
+    ) -> None:
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        with self._replay_lock:
+            entry = self._replay.get(key)
+            if entry is None or entry["state"] != "in_flight":
+                return
+            prior_bytes = entry["result_bytes"]
+            available = COMMAND_REPLAY_MAX_BYTES - (self._replay_bytes - prior_bytes)
+            if len(encoded) <= available:
+                entry["result"] = (dict(body), target_aid, result_chunks_v2)
+                entry["result_bytes"] = len(encoded)
+                self._replay_bytes += len(encoded) - prior_bytes
+            else:
+                entry["result"] = None
+                entry["result_bytes"] = 0
+                entry["result_unavailable"] = True
+                self._replay_bytes -= prior_bytes
+            entry["delivery_pending"] = True
+
+    def _pin_replay_delivery(self, key: Tuple[str, str]) -> None:
+        with self._replay_lock:
+            entry = self._replay.get(key)
+            if entry is not None and entry["state"] == "complete":
+                entry["delivery_pending"] = True
+
+    def _mark_replay_delivery_finished(
+        self, replay_key: Optional[Tuple[str, str]],
+    ) -> None:
+        if replay_key is None:
+            return
+        with self._replay_lock:
+            entry = self._replay.get(replay_key)
+            if entry is not None:
+                entry["delivery_pending"] = False
+            self._prune_replay_locked(time.monotonic())
+
+    def _release_dropped_result(
+        self,
+        item: Tuple[
+            Dict[str, Any], Optional[str], bool, float, Optional[Tuple[str, str]]
+        ],
+    ) -> None:
+        body, target, chunks, _, replay_key = item
+        delivery_key = self._result_delivery_key(
+            body, target, chunks, replay_key,
+        )
+        if delivery_key is not None:
+            with self._queued_result_lock:
+                self._queued_result_keys.discard(delivery_key)
+        self._mark_replay_delivery_finished(replay_key)
+
+    def _prune_replay_locked(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._replay.items()
+            if entry["state"] == "complete"
+            and not entry["delivery_pending"]
+            and now - entry["completed_at"] >= COMMAND_REPLAY_TTL_SECS
+        ]
+        for key in expired:
+            entry = self._replay.pop(key)
+            self._replay_bytes -= entry["result_bytes"]
+
+    @staticmethod
+    def _command_fingerprint(cmd: Dict[str, Any]) -> str:
+        encoded = json.dumps(cmd, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _begin_replay(
+        self,
+        cmd: Dict[str, Any],
+        source_aid: Optional[str],
+        source_authenticated: bool,
+    ) -> Tuple[str, Optional[Tuple[str, str]], Optional[Tuple[Dict[str, Any], Optional[str], bool]]]:
+        request_id = (cmd.get("params") or {}).get("request_id")
+        command_id = cmd.get("command_id")
+        if not isinstance(source_aid, str) or len(source_aid) != 64:
+            return "execute", None, None
+        if not isinstance(request_id, str) or not request_id or command_id != request_id:
+            return "execute", None, None
+        namespace = "direct" if source_authenticated else "legacy-pubsub"
+        key = f"{namespace}:{source_aid}", request_id
+        fingerprint = self._command_fingerprint(cmd)
+        now = time.monotonic()
+        with self._replay_lock:
+            self._prune_replay_locked(now)
+            existing = self._replay.get(key)
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    return "conflict", key, None
+                self._replay.move_to_end(key)
+                if existing["state"] == "complete":
+                    if existing.get("result_unavailable"):
+                        return "unavailable", key, None
+                    return "replay", key, existing.get("result")
+                return "coalesce", key, None
+            if len(self._replay) >= COMMAND_REPLAY_MAX_ENTRIES:
+                return "busy", key, None
+            self._replay[key] = {
+                "fingerprint": fingerprint,
+                "state": "in_flight",
+                "result": None,
+                "result_bytes": 0,
+                "result_unavailable": False,
+                "delivery_pending": False,
+            }
+        return "execute", key, None
+
+    def _finish_replay(self, key: Optional[Tuple[str, str]]) -> None:
+        if key is None:
+            return
+        with self._replay_lock:
+            entry = self._replay.get(key)
+            if entry is None:
+                return
+            if entry.get("result") is None:
+                entry["result_unavailable"] = True
+            entry["state"] = "complete"
+            entry["completed_at"] = time.monotonic()
+            self._prune_replay_locked(entry["completed_at"])
 
     def _prune_stale_results(self, now_ms_value: int) -> None:
         cutoff_ms = now_ms_value - (RESULT_QUEUE_MAX_AGE_SECS * 1000)
@@ -705,9 +1209,10 @@ class TestRunner:
                 item = self._send_q.get_nowait()
             except queue.Empty:
                 break
-            envelope, _, _, _ = item
+            envelope, target, chunks, _, replay_key = item
             ts_ms = envelope.get("ts_ms")
             if isinstance(ts_ms, int) and ts_ms < cutoff_ms:
+                self._release_dropped_result(item)
                 dropped += 1
             else:
                 kept.append(item)
@@ -715,6 +1220,7 @@ class TestRunner:
             try:
                 self._send_q.put_nowait(item)
             except queue.Full:
+                self._release_dropped_result(item)
                 dropped += 1
         if dropped:
             self.log.warning(
@@ -820,7 +1326,11 @@ class TestRunner:
         ).get("anchor_aid")
         if isinstance(anchor, str) and len(anchor) == 64:
             self._last_known_anchor_aid = anchor
-        self._dispatch_command(cmd, source_aid=anchor)
+        # PubSub authenticates neither the embedded anchor nor its command ID.
+        # It gets a separate compatibility namespace from direct-message peers.
+        self._dispatch_command(
+            cmd, source_aid=anchor, source_authenticated=False,
+        )
 
     def _handle_direct_event(self, event_type: str, data: str) -> None:
         if event_type != "direct_message":
@@ -951,6 +1461,53 @@ class TestRunner:
 
     # ─── command dispatch ──────────────────────────────────────────────
     def _dispatch_command(
+        self,
+        cmd: Dict[str, Any],
+        source_aid: Optional[str] = None,
+        source_authenticated: bool = True,
+    ) -> None:
+        target = cmd.get("target_node", "*")
+        if target not in (self.node_name, "*"):
+            return
+        disposition, replay_key, cached = self._begin_replay(
+            cmd, source_aid, source_authenticated,
+        )
+        request_id = (cmd.get("params") or {}).get("request_id")
+        if disposition == "coalesce":
+            self.log.info("coalescing in-flight command request_id=%s", request_id)
+            return
+        if disposition == "replay" and cached is not None:
+            body, target_aid, chunks = cached
+            self._enqueue_result(
+                dict(body), target_aid, chunks, replay_key=replay_key,
+            )
+            return
+        if disposition in ("conflict", "busy", "unavailable"):
+            errors = {
+                "conflict": "request_id reused with different command",
+                "busy": "runner replay cache is full with protected commands",
+                "unavailable": "completed command result exceeds replay cache bound",
+            }
+            self._enqueue_result(
+                {
+                    "kind": "error",
+                    "command_id": cmd.get("command_id"),
+                    "request_id": request_id,
+                    "outcome": {"error": errors[disposition]},
+                },
+                target_aid=source_aid,
+                result_chunks_v2=cmd.get("result_chunks_v2") is True,
+                coalesce=False,
+            )
+            return
+        self._dispatch_context.replay_key = replay_key
+        try:
+            self._execute_command(cmd, source_aid)
+        finally:
+            self._dispatch_context.replay_key = None
+            self._finish_replay(replay_key)
+
+    def _execute_command(
         self,
         cmd: Dict[str, Any],
         source_aid: Optional[str] = None,
