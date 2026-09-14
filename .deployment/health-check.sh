@@ -6,7 +6,13 @@
 
 set -euo pipefail
 
-EXPECTED_VERSION="0.14.0"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+EXPECTED_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | sed -n '1p')
+if [[ -z "$EXPECTED_VERSION" ]]; then
+    echo "Unable to derive expected version from $REPO_ROOT/Cargo.toml" >&2
+    exit 2
+fi
 EXTENDED=false
 SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
 
@@ -18,11 +24,11 @@ NC='\033[0m'
 
 # Parse version from JSON using grep/sed (no python3 dependency)
 parse_version() {
-    echo "$1" | grep -o '"version":"[^"]*"' | cut -d'"' -f4
+    printf '%s\n' "$1" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p'
 }
 
 parse_peers() {
-    echo "$1" | grep -o '"peers":[0-9]*' | cut -d: -f2
+    printf '%s\n' "$1" | sed -n 's/.*"connected_peers"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | sed -n '1p'
 }
 
 check_node() {
@@ -80,17 +86,19 @@ check_node() {
     version=$(parse_version "$health")
     version=${version:-unknown}
 
-    if [[ "$version" == "$EXPECTED_VERSION" ]]; then
-        echo -ne "${GREEN}OK${NC} v${version}"
-    elif [[ "$version" == "unknown" ]]; then
-        echo -ne "${GREEN}OK${NC} (version unknown)"
-    else
-        echo -ne "${YELLOW}OK${NC} v${version} (expected v${EXPECTED_VERSION})"
+    if [[ "$version" == "unknown" ]]; then
+        echo -e "${RED}VERSION MISSING${NC} (expected v${EXPECTED_VERSION})"
+        return 1
+    elif [[ "$version" != "$EXPECTED_VERSION" ]]; then
+        echo -e "${RED}VERSION MISMATCH${NC} v${version} (expected v${EXPECTED_VERSION})"
+        return 1
     fi
+
+    echo -ne "${GREEN}OK${NC} v${version}"
 
     if [[ "$EXTENDED" == "true" && -n "${net_status:-}" && "$net_status" != "{}" ]]; then
         local peers
-        peers=$(echo "$net_status" | grep -o '"connected_peers":[0-9]*' | cut -d: -f2)
+        peers=$(parse_peers "$net_status")
         peers=${peers:-?}
         echo -ne " | peers: ${peers}"
     fi
@@ -124,9 +132,9 @@ main() {
         for entry in "${nodes[@]}"; do
             local node="${entry%%:*}" ip="${entry##*:}"
             if check_node "$node" "$ip"; then
-                ((healthy++))
+                healthy=$((healthy + 1))
             fi
-            ((total++))
+            total=$((total + 1))
         done
 
         echo

@@ -100,12 +100,34 @@ class DerivationControls(unittest.TestCase):
             r["samples"]["D5"][cut]["stages"]["peer_scores"] = []
         self.assertEqual(module.derive(r, LOCK)["derivation"], "CONSISTENT")
         r["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"][0]["outbound"]["eager"]["bytes"] = 0
-        self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["D5_EAGER_ORACLE"])
+        self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["D5_DISSEMINATION_ORACLE"])
+
+    def test_ihave_only_is_active_default_dissemination(self):
+        r = fixture()
+        row = r["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"][0]["outbound"]
+        row["eager"] = {"msgs": 0, "bytes": 0}
+        row["ihave"] = {"msgs": 1, "bytes": 64}
+        self.assertEqual(module.derive(r, LOCK)["derivation"], "CONSISTENT")
+
+    def test_mixed_default_dissemination_remains_consistent(self):
+        r = fixture()
+        row = r["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"][0]["outbound"]
+        row["ihave"] = {"msgs": 1, "bytes": 64}
+        self.assertEqual(module.derive(r, LOCK)["derivation"], "CONSISTENT")
 
     def test_nonzero_optout_is_failure(self):
         r = fixture()
         r["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"] = copy.deepcopy(r["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"])
-        self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["O5_EAGER_ORACLE"])
+        self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["O5_BUS_EGRESS_ORACLE"])
+
+    def test_each_non_eager_optout_bus_kind_is_failure(self):
+        for kind in ("ihave", "iwant", "anti_entropy"):
+            with self.subTest(kind=kind):
+                r = fixture()
+                row = copy.deepcopy(r["samples"]["D5"]["t0"]["egress"]["outbound_by_topic_named"][0])
+                row["outbound"][kind] = {"msgs": 1, "bytes": 64}
+                r["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"] = [row]
+                self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["O5_BUS_EGRESS_ORACLE"])
 
     def test_unexpected_topic_cannot_be_counted_as_zero(self):
         r = fixture()
