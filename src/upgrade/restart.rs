@@ -730,11 +730,19 @@ fn show_property<'a>(show: &'a str, key: &str) -> Option<&'a str> {
 ///
 /// Conservative by contract: returns `None` for anything it cannot decode
 /// with certainty (unterminated quote, trailing backslash, quoting in the
-/// middle of a token). Raw `%` (specifier) and `$` (variable) sequences are
-/// also refused — the shown ExecStart is the RAW configured line, and
-/// comparing it against the running process's EXPANDED argv would require
-/// reimplementing specifier/variable expansion; refusing is the fail-closed
-/// side of that trade.
+/// middle of a token).
+///
+/// `%` is passed through (#690): `%`-specifier expansion (`%%` → `%`)
+/// happens at unit LOAD time and `systemctl show` serializes the stored
+/// post-expansion argv verbatim — the exact array systemd spawns — so a
+/// literal `%` in a decoded token is plain data, exactly comparable to
+/// the running argv.
+///
+/// `$` goes through [`simulate_spawn_expansion`], which reproduces the
+/// deterministic half of systemd's spawn-time word expansion: `$$`
+/// collapses and mid-word `$` stays literal, while unresolved
+/// substitutions refuse. The exact-boundary comparison in the readback
+/// remains the fail-closed gate — any divergence refuses.
 #[cfg(any(test, target_os = "linux"))]
 fn parse_systemd_argv_tokens(raw: &str) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
@@ -776,15 +784,60 @@ fn parse_systemd_argv_tokens(raw: &str) -> Option<Vec<String>> {
     if tokens.is_empty() {
         return None;
     }
-    for token in &tokens {
-        if token.contains('%') || token.contains('$') {
-            return None;
+    tokens.iter().map(|t| simulate_spawn_expansion(t)).collect()
+}
+
+/// Apply the deterministic half of systemd's spawn-time word expansion
+/// (`replace_env_argv`, flags=0 — braceless mid-word expansion disabled)
+/// to one shown `argv[]` token, so it can be compared against the running
+/// process's actual argv:
+///
+/// * a token STARTING with `$` (other than `$$…`) is a whole-word form:
+///   a valid name substitutes and word-splits (`$FOO`), an invalid name
+///   or a lone `$` is DROPPED from the argv entirely — either way not
+///   derivable → `None`;
+/// * `${…` anywhere is an inline substitution → `None`;
+/// * `$$` collapses to one literal `$`, pairwise left-to-right;
+/// * every other `$` (mid-word or trailing) is literal data.
+#[cfg(any(test, target_os = "linux"))]
+fn simulate_spawn_expansion(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    if bytes.first() == Some(&b'$') && bytes.get(1) != Some(&b'$') {
+        // Whole-word leading `$`: substituted, split, or dropped — never
+        // a literal passthrough.
+        return None;
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(pos) = rest.find('$') {
+        // `$` is one ASCII byte, so every slice point is a char boundary.
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        match rest.as_bytes().get(1) {
+            Some(&b'$') => {
+                out.push('$');
+                rest = &rest[2..];
+            }
+            Some(&b'{') => return None, // `${…` inline substitution
+            _ => {
+                out.push('$');
+                rest = &rest[1..];
+            }
         }
     }
-    Some(tokens)
+    out.push_str(rest);
+    Some(out)
 }
 
 /// `ExecStart={ path=/x/y ; argv[]=a b ; … }` → `(path, argv_tokens)`.
+///
+/// The `path=` field is taken VERBATIM, unlike the argv tokens: systemd
+/// never environment-expands the executable path — load-time expansion is
+/// `%`-specifiers only, and the execve target is the raw stored path — so
+/// a `$` in the shown path is literal filename data. The argv[0] the
+/// readback binds is either the implicit copy of the path (spawn-identity
+/// only for single-`$` paths) or, for any `$` shape, the `@` override's
+/// `$$`-escaped copy, which spawn-collapses back to the literal path.
 #[cfg(any(test, target_os = "linux"))]
 fn parse_exec_start(value: &str) -> Option<(String, Vec<String>)> {
     let path = value
@@ -3936,6 +3989,185 @@ mod tests {
                     assert_eq!(unit.template_version, Some(1));
                 }
                 other => panic!("expected Verified for Restart={restart}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn systemd_argv_tokenizer_passes_load_expanded_percent_through() {
+        // `systemctl show` renders the post-load, specifier-EXPANDED argv:
+        // a literal `%` in a decoded token is data (written `%%` in the
+        // unit file by the autostart renderer, expanded at load by
+        // config_parse_exec), not syntax to interpret or refuse (#690).
+        assert_eq!(
+            parse_systemd_argv_tokens("/opt/x0x%prod/x0xd --name 100%"),
+            Some(vec![
+                "/opt/x0x%prod/x0xd".to_string(),
+                "--name".to_string(),
+                "100%".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn systemd_argv_tokenizer_decodes_literal_dollar_escapes() {
+        // Spawn-time expansion collapses `$$` → one literal `$`, pairwise,
+        // left-to-right.
+        assert_eq!(
+            parse_systemd_argv_tokens("/opt/x0xd --name $$FOO"),
+            Some(vec![
+                "/opt/x0xd".to_string(),
+                "--name".to_string(),
+                "$FOO".to_string(),
+            ])
+        );
+        // Pairs collapse wherever they appear, including inside quotes.
+        assert_eq!(
+            parse_systemd_argv_tokens("pre$$mid$$end \"$$$$\""),
+            Some(vec!["pre$mid$end".to_string(), "$$".to_string(),])
+        );
+    }
+
+    #[test]
+    fn systemd_argv_tokenizer_keeps_midword_and_trailing_dollar_literal() {
+        // Braceless mid-word expansion is disabled for ExecStart words, so
+        // a `$` that is not `${`, `$$`, or a whole-word `$NAME` is literal
+        // data — even valid-name-shaped (`python$literal` stays literal).
+        assert_eq!(
+            parse_systemd_argv_tokens("/opt/x0x$prod/x0xd --pre$FOO 100$"),
+            Some(vec![
+                "/opt/x0x$prod/x0xd".to_string(),
+                "--pre$FOO".to_string(),
+                "100$".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn systemd_argv_tokenizer_refuses_unresolved_dollar_substitutions() {
+        // Whole-word `$NAME` substitutes and word-splits (invalid names
+        // and a lone `$` are DROPPED entirely — env-util.c bad-variables
+        // path); `${…` substitutes inline. None of those forms are
+        // derivable from the shown text.
+        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd $FOO"), None);
+        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd $1abc"), None);
+        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd $"), None);
+        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd ${FOO}"), None);
+        assert_eq!(parse_systemd_argv_tokens("/opt/x0xd pre${FOO}post"), None);
+    }
+
+    #[test]
+    fn systemd_readback_verifies_literal_percent_path_deployment() {
+        // #690 live defect: a deployment at /opt/x0x%prod/x0xd (renderer
+        // writes `%%`, systemd expands at load, show renders the literal
+        // `%` in path and argv) must VERIFY, not refuse.
+        let exec = "/opt/x0x%prod/x0xd";
+        let argv = real_fixture_argv(exec);
+        let out = healthy_show(4242, "inv-1", exec, "always");
+        let verdict = readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: SYSTEM_CGROUP,
+                pid: 4242,
+                invocation_id: Some("inv-1"),
+                executable: Path::new(exec),
+                argv: &argv,
+                monotonic_now_us: Some(101_000_000),
+            },
+            &mut |_user, _unit| Ok(Some(out.clone())),
+            &|loaded, ours| loaded == exec && ours == Path::new(exec),
+        );
+        match verdict {
+            SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
+            other => panic!("expected Verified for literal-% deployment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn systemd_readback_verifies_literal_dollar_argument() {
+        // A literal-`$` argument renders as `$$FOO`; show renders the raw
+        // `$$FOO` and the process runs `$FOO` — decoding `$$` must VERIFY.
+        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
+            .replace("--name testnet", "--name $$FOO");
+        let argv = vec![
+            "/opt/x0x/x0xd".to_string(),
+            "--name".to_string(),
+            "$FOO".to_string(),
+        ];
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &argv,
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        match verdict {
+            SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
+            other => panic!("expected Verified for literal-$$ argument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn systemd_readback_refuses_unresolved_variable_argument() {
+        // A single-`$` `$FOO` shows raw while the process runs the
+        // variable's value — an unresolved substitution, refused.
+        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
+            .replace("--name testnet", "--name $FOO");
+        let argv = vec![
+            "/opt/x0x/x0xd".to_string(),
+            "--name".to_string(),
+            "EXPANDED_TEST_VALUE".to_string(),
+        ];
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &argv,
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        match verdict {
+            SystemdPolicyReadback::NotGuaranteed { detail } => assert!(
+                detail.contains("does not run this executable/argv"),
+                "{detail}"
+            ),
+            other => panic!("expected NotGuaranteed for unresolved $FOO, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn systemd_readback_verifies_escaped_argv0_dollar_paths() {
+        // `@`-prefixed raw path with a separately `$$`-escaped argv[0]
+        // copy: show renders the raw path in `path=` and the escaped copy
+        // as argv[0], while the process runs the literal path as argv[0].
+        // The spawn simulation decodes the copy back to the path, so the
+        // executable/argv binding VERIFIES.
+        for path in [
+            "/opt/x0x$prod/x0xd",
+            "/opt/p${FOO}/x0xd",
+            "/opt/p$$literal/x0xd",
+        ] {
+            let escaped = path.replace('$', "$$");
+            let out = healthy_show(4242, "inv-1", path, "always")
+                .replace(&format!("argv[]={path} "), &format!("argv[]={escaped} "));
+            let argv = real_fixture_argv(path);
+            let verdict = readback_systemd_policy_in(
+                SystemdReadbackInput {
+                    cgroup: SYSTEM_CGROUP,
+                    pid: 4242,
+                    invocation_id: Some("inv-1"),
+                    executable: Path::new(path),
+                    argv: &argv,
+                    monotonic_now_us: Some(101_000_000),
+                },
+                &mut |_user, _unit| Ok(Some(out.clone())),
+                &|loaded, ours| loaded == path && ours == Path::new(path),
+            );
+            match verdict {
+                SystemdPolicyReadback::Verified(unit) => {
+                    assert_eq!(unit.unit, "x0xd.service", "path {path}")
+                }
+                other => panic!("expected Verified for @-escaped argv0 {path}, got {other:?}"),
             }
         }
     }
