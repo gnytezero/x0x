@@ -1088,8 +1088,23 @@ impl KvStore {
     }
 
     /// Get the next monotonically-increasing sequence number.
-    pub fn next_seq(&self) -> u64 {
-        self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
+    pub fn next_seq(&self) -> Result<u64> {
+        self.reserve_sequences(1)
+    }
+
+    /// Verify that `count` sequence numbers can be minted without wrapping.
+    pub(crate) fn reserve_sequences(&self, count: u64) -> Result<u64> {
+        if count == 0 {
+            return Err(KvError::Merge(
+                "cannot reserve zero local sequence numbers".to_string(),
+            ));
+        }
+        self.seq_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(count)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| KvError::Merge("local sequence allocator is exhausted".to_string()))
     }
 
     /// Current value of the in-memory sequence counter (highest seq minted).
@@ -1110,9 +1125,7 @@ impl KvStore {
     /// runs ahead of `version` — persisting the real counter, not a
     /// version-derived floor, is what makes this bound exact.)
     pub(crate) fn restore_seq_counter(&self, floor: u64) {
-        if self.seq_counter.load(Ordering::Relaxed) < floor {
-            self.seq_counter.store(floor, Ordering::Relaxed);
-        }
+        self.seq_counter.fetch_max(floor, Ordering::Relaxed);
     }
 
     /// Get the current version.
@@ -1648,6 +1661,32 @@ impl KvStore {
                 max: crate::kv::entry::MAX_INLINE_SIZE,
             });
         }
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            if let Some(existing) = self.get(&key) {
+                if existing.value == value && existing.content_type == content_type {
+                    return Ok(());
+                }
+                return Err(KvError::ImmutableKey(key));
+            }
+        }
+        let seq = self.reserve_sequences(1)?;
+        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+    }
+
+    pub(crate) fn put_with_reserved_sequence(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+        peer_id: PeerId,
+        seq: u64,
+    ) -> Result<()> {
+        if value.len() > crate::kv::entry::MAX_INLINE_SIZE {
+            return Err(KvError::ValueTooLarge {
+                size: value.len(),
+                max: crate::kv::entry::MAX_INLINE_SIZE,
+            });
+        }
 
         // AppendOnly: existing keys are immutable, even for the owner.
         if matches!(self.policy, AccessPolicy::AppendOnly) {
@@ -1666,8 +1705,6 @@ impl KvStore {
         } else {
             None
         };
-
-        let seq = self.next_seq();
 
         // Add key to OR-Set
         self.keys
@@ -2614,6 +2651,7 @@ impl KvStore {
         &mut self,
         other: &KvStore,
         endorser: AgentId,
+        local_peer: PeerId,
     ) -> Result<()> {
         let same_binding = self.id == other.id
             && self.owner == other.owner
@@ -2640,6 +2678,18 @@ impl KvStore {
                 });
             }
         }
+        let retained_sequence_floor = self
+            .keys
+            .max_retained_sequence_for_peer(&local_peer)
+            .into_iter()
+            .chain(other.keys.max_retained_sequence_for_peer(&local_peer))
+            .max();
+        if retained_sequence_floor.is_some_and(|floor| floor > u64::MAX - 2) {
+            return Err(KvError::Merge(
+                "retained group image leaves insufficient local sequence allocator capacity"
+                    .to_string(),
+            ));
+        }
 
         let mut trial = self.clone();
         trial
@@ -2658,6 +2708,9 @@ impl KvStore {
         // locally anchored.
         trial.last_history_endorser = Some(endorser);
         trial.version = self.version.saturating_add(1);
+        if let Some(floor) = retained_sequence_floor {
+            trial.restore_seq_counter(floor);
+        }
         *self = trial;
         Ok(())
     }
@@ -2670,13 +2723,24 @@ impl KvStore {
     }
 
     /// Generate a delta containing all state (for initial sync).
-    #[must_use]
-    pub fn full_delta(&self) -> KvStoreDelta {
+    pub fn full_delta(&self) -> Result<KvStoreDelta> {
         let mut delta = KvStoreDelta::new(self.version);
+        let active = self.keys.elements();
+        let first_sequence = if active.is_empty() {
+            None
+        } else {
+            Some(
+                self.reserve_sequences(u64::try_from(active.len()).map_err(|_| {
+                    KvError::Merge(
+                        "active key count exceeds sequence allocator capacity".to_string(),
+                    )
+                })?)?,
+            )
+        };
 
         // Walk the active-key OR-Set directly and look entries up, rather than
         // cloning the whole key set into an intermediate HashSet first.
-        for key in self.keys.elements() {
+        for (offset, key) in active.into_iter().enumerate() {
             if let Some(entry) = self.entries.get(key) {
                 // Synthetic tags must be FRESH per entry (F3, fix-loop):
                 // the digest-verified adopt prunes stale keys with a local
@@ -2689,7 +2753,13 @@ impl KvStore {
                 // counter across restarts, so that holds after a restart
                 // too). The zero peer id is fine: tags are scoped per key,
                 // and uniqueness over time is what the tombstones require.
-                let tag = (PeerId::new([0u8; 32]), self.next_seq());
+                let offset = u64::try_from(offset).map_err(|_| {
+                    KvError::Merge("active key offset exceeds sequence allocator capacity".into())
+                })?;
+                let sequence = first_sequence
+                    .and_then(|first| first.checked_add(offset))
+                    .ok_or_else(|| KvError::Merge("sequence allocator exhausted".into()))?;
+                let tag = (PeerId::new([0u8; 32]), sequence);
                 delta.added.insert(key.clone(), (entry.clone(), tag));
             }
         }
@@ -2704,7 +2774,7 @@ impl KvStore {
         // cold-recover this store's content even when relayed by a non-owner
         // (the checkpoint's owner signature survives re-wrap).
         delta.owner_checkpoint = self.latest_checkpoint.clone();
-        delta
+        Ok(delta)
     }
 
     /// The content digest this store declares in a `StateServedV2` marker
@@ -3097,8 +3167,8 @@ mod tests {
             AccessPolicy::Signed,
         )
         .expect("kv store");
-        let s1 = store.next_seq();
-        let s2 = store.next_seq();
+        let s1 = store.next_seq().expect("sequence");
+        let s2 = store.next_seq().expect("sequence");
         assert!(s2 > s1);
     }
 
@@ -3235,7 +3305,7 @@ mod tests {
         store.allow_writer(writer, &owner).expect("allow");
 
         // Full delta should include the allowlist
-        let delta = store.full_delta();
+        let delta = store.full_delta().expect("full delta");
         assert!(delta.allowlist_additions.is_some());
         assert!(delta
             .allowlist_additions
@@ -3551,7 +3621,7 @@ mod tests {
                 peer(1),
             )
             .expect("owner put");
-        let full = owner_store.full_delta();
+        let full = owner_store.full_delta().expect("full delta");
         // Anchored joiner — no learn_ownership / announce ever happens.
         let mut joiner = KvStore::new_replica(
             store_id(1),
@@ -3670,7 +3740,7 @@ mod tests {
                 peer(1),
             )
             .expect("source put");
-        let delta = source.full_delta();
+        let delta = source.full_delta().expect("full delta");
         let v_before = dest.current_version();
 
         dest.merge_delta(&delta, peer(2), None)
@@ -3717,7 +3787,7 @@ mod tests {
             )
             .expect("put");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut delta = owner_store.full_delta();
+        let mut delta = owner_store.full_delta().expect("full delta");
         delta.owner_checkpoint = Some(cp);
 
         let mut dest = KvStore::new_encrypted_unchecked(id, String::new(), owner, vec![1, 2, 3]);
@@ -3877,7 +3947,7 @@ mod tests {
 
         let endorser = agent(7);
         target
-            .merge_group_signed_image(&source, endorser)
+            .merge_group_signed_image(&source, endorser, peer(2))
             .expect("authenticated retained image");
 
         assert!(target.get("removed").is_none(), "OR-Set tombstone survives");
@@ -3891,6 +3961,125 @@ mod tests {
             target.policy(),
             AccessPolicy::GroupSigned { group_id } if group_id == &group
         ));
+    }
+
+    #[test]
+    fn retained_import_floors_same_peer_sequence_above_tombstones() {
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let id = store_id(18);
+        let group = vec![7u8; 16];
+        let local_peer = peer(4);
+        let mut source =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "page".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("source put");
+        source.remove("page").expect("source remove");
+        let encoded = bincode::serialize(&source).expect("retained wire image");
+        let source: KvStore = bincode::deserialize(&encoded).expect("fresh retained decode");
+        assert_eq!(source.seq_counter_value(), 0, "wire image skips allocator");
+
+        let mut target = KvStore::new_group_signed(id, "Wiki".to_string(), owner, group, ctx)
+            .expect("independent target");
+        target
+            .merge_group_signed_image(&source, owner, local_peer)
+            .expect("authenticated retained merge");
+        assert_eq!(
+            target.seq_counter_value(),
+            source
+                .keys
+                .max_retained_sequence_for_peer(&local_peer)
+                .expect("source retained sequence"),
+            "allocator is restored to the imported retained-tag ceiling"
+        );
+        target
+            .put(
+                "page".to_string(),
+                b"new".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("re-add after imported tombstone");
+        assert_eq!(target.get("page").expect("re-add visible").value, b"new");
+        target.remove("page").expect("remove re-add");
+        target
+            .put(
+                "page".to_string(),
+                b"newer".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("second re-add");
+        assert_eq!(
+            target.get("page").expect("second re-add visible").value,
+            b"newer"
+        );
+    }
+
+    #[test]
+    fn retained_import_rejects_exhausted_same_peer_sequence_transactionally() {
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let id = store_id(19);
+        let group = vec![7u8; 16];
+        let local_peer = peer(4);
+        let mut source =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "page".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("source put");
+        source
+            .keys
+            .add("page".to_string(), (local_peer, u64::MAX - 1))
+            .expect("near-exhausted retained tag");
+
+        let mut target =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group, ctx).expect("target");
+        let before = bincode::serialize(&target).expect("before");
+        assert!(matches!(
+            target.merge_group_signed_image(&source, owner, local_peer),
+            Err(KvError::Merge(message)) if message.contains("allocator capacity")
+        ));
+        assert_eq!(bincode::serialize(&target).expect("after"), before);
+        assert_eq!(target.seq_counter_value(), 0);
+    }
+
+    #[test]
+    fn full_delta_fails_closed_when_synthetic_tags_would_exhaust_allocator() {
+        let owner = agent(1);
+        let mut store = KvStore::new(
+            store_id(20),
+            "store".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        )
+        .expect("store");
+        store
+            .put(
+                "page".to_string(),
+                b"value".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store.restore_seq_counter(u64::MAX);
+        let before = bincode::serialize(&store).expect("before");
+        assert!(matches!(store.full_delta(), Err(KvError::Merge(_))));
+        assert_eq!(bincode::serialize(&store).expect("after"), before);
+        assert_eq!(store.seq_counter_value(), u64::MAX);
     }
 
     #[test]
@@ -3972,7 +4161,9 @@ mod tests {
             .expect("bad entry")
             .content_hash = [0; 32];
 
-        assert!(target.merge_group_signed_image(&hostile, owner).is_err());
+        assert!(target
+            .merge_group_signed_image(&hostile, owner, peer(1))
+            .is_err());
         assert_eq!(
             bincode::serialize(&target).expect("unchanged target"),
             before
@@ -3981,7 +4172,9 @@ mod tests {
         let bad = hostile.entries.get_mut("bad").expect("bad entry");
         bad.content_hash = *blake3::hash(&bad.value).as_bytes();
         bad.key = "wrong-map-key".to_string();
-        assert!(target.merge_group_signed_image(&hostile, owner).is_err());
+        assert!(target
+            .merge_group_signed_image(&hostile, owner, peer(1))
+            .is_err());
         assert_eq!(
             bincode::serialize(&target).expect("unchanged target"),
             before
@@ -3992,7 +4185,7 @@ mod tests {
         bad.value = vec![0; crate::kv::entry::MAX_INLINE_SIZE + 1];
         bad.content_hash = *blake3::hash(&bad.value).as_bytes();
         assert!(matches!(
-            target.merge_group_signed_image(&hostile, owner),
+            target.merge_group_signed_image(&hostile, owner, peer(1)),
             Err(KvError::ValueTooLarge { .. })
         ));
         assert_eq!(
@@ -4054,7 +4247,7 @@ mod tests {
                 peer(2),
             )
             .expect("member put");
-        let delta = member_view.full_delta();
+        let delta = member_view.full_delta().expect("full delta");
         store
             .merge_delta(&delta, peer(2), Some(&member))
             .expect("member merge");
@@ -4069,7 +4262,7 @@ mod tests {
         outsider_view
             .set_secure_context(Arc::clone(&ctx) as Arc<dyn KvSecureContext>)
             .expect("attach ctx");
-        let d2 = outsider_view.full_delta();
+        let d2 = outsider_view.full_delta().expect("full delta");
         let before = store.current_version();
         store
             .merge_delta(&d2, peer(9), Some(&outsider))
@@ -4136,7 +4329,7 @@ mod tests {
             )
             .expect("put");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut delta = owner_store.full_delta();
+        let mut delta = owner_store.full_delta().expect("full delta");
         delta.owner_checkpoint = Some(cp);
 
         // Fresh member replica: empty, anchored on the group creator.
@@ -4240,7 +4433,7 @@ mod tests {
             .expect("put");
         let cp = checkpoint_for(&signed_store, topic, &kp, 1);
         assert!(matches!(cp.policy, AccessPolicy::Signed));
-        let mut delta = signed_store.full_delta();
+        let mut delta = signed_store.full_delta().expect("full delta");
         delta.owner_checkpoint = Some(cp);
 
         let mut encrypted_replica = KvStore::new_encrypted(
@@ -4344,7 +4537,7 @@ mod tests {
             )
             .expect("put");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut delta = owner_store.full_delta();
+        let mut delta = owner_store.full_delta().expect("full delta");
         delta.owner_checkpoint = Some(cp.clone());
 
         // Anchored joiner; the relayer is NOT the owner.
@@ -4378,7 +4571,7 @@ mod tests {
             )
             .expect("put");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut delta = owner_store.full_delta();
+        let mut delta = owner_store.full_delta().expect("full delta");
         delta.owner_checkpoint = Some(cp);
         let mut tags = std::collections::HashSet::new();
         tags.insert((peer(9), 1));
@@ -4423,7 +4616,7 @@ mod tests {
             )
             .expect("put k1");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut stale_delta = owner_store.full_delta();
+        let mut stale_delta = owner_store.full_delta().expect("full delta");
         stale_delta.owner_checkpoint = Some(cp1);
 
         // Owner at time 2: k1 deleted, k_final written; checkpoint seq 2.
@@ -4437,7 +4630,7 @@ mod tests {
             )
             .expect("put k_final");
         let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
-        let mut snapshot = owner_store.full_delta();
+        let mut snapshot = owner_store.full_delta().expect("full delta");
         snapshot.owner_checkpoint = Some(cp2);
 
         // Fresh anchored joiner cold-recovers checkpoint 2 via a relay.
@@ -4492,7 +4685,7 @@ mod tests {
             )
             .expect("put k2");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut d1 = owner_store.full_delta();
+        let mut d1 = owner_store.full_delta().expect("full delta");
         d1.owner_checkpoint = Some(cp1);
         let mut joiner =
             KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
@@ -4507,7 +4700,7 @@ mod tests {
         // Owner deletes k2 and cuts a newer checkpoint over {k1}.
         owner_store.remove("k2").expect("delete k2");
         let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
-        let mut d2 = owner_store.full_delta();
+        let mut d2 = owner_store.full_delta().expect("full delta");
         d2.owner_checkpoint = Some(cp2);
         joiner
             .merge_delta(&d2, peer(9), Some(&agent(9)))
@@ -4537,7 +4730,7 @@ mod tests {
             )
             .expect("put");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut delta = owner_store.full_delta();
+        let mut delta = owner_store.full_delta().expect("full delta");
         // Tamper: mutate value AND recompute content_hash (an honest re-hash).
         // The recomputed content_root no longer matches the checkpoint root.
         if let Some((e, _)) = delta.added.get_mut("k") {
@@ -4670,7 +4863,7 @@ mod tests {
             )
             .expect("put");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut relay = owner_store.full_delta();
+        let mut relay = owner_store.full_delta().expect("full delta");
         relay.owner_checkpoint = Some(cp1);
         // Joiner adopts the relay at seq 1.
         let mut joiner =
@@ -4693,7 +4886,7 @@ mod tests {
             )
             .expect("put");
         let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
-        let mut full2 = owner_store.full_delta();
+        let mut full2 = owner_store.full_delta().expect("full delta");
         full2.owner_checkpoint = Some(cp2);
         joiner
             .merge_delta(&full2, peer(9), Some(&agent(9)))
@@ -4745,8 +4938,12 @@ mod tests {
             .expect("owner put");
         let entry = owner.get(key).cloned().expect("entry readable after put");
         let version = owner.current_version();
-        let mut delta =
-            KvStoreDelta::for_put(key.to_string(), entry, (p, owner.next_seq()), version);
+        let mut delta = KvStoreDelta::for_put(
+            key.to_string(),
+            entry,
+            (p, owner.next_seq().expect("sequence")),
+            version,
+        );
         delta.owner_checkpoint = Some(checkpoint_for(owner, topic, kp, seq));
         // Attach the owner's authoritative name so a fresh replica (name="")
         // learns it from the incremental delta before maybe_cache_checkpoint
@@ -4811,7 +5008,7 @@ mod tests {
         // Legit control: an un-tampered non-owner relay IS adopted. This proves
         // every rejection below is tamper detection, not the relayer identity.
         {
-            let mut legit = owner_store.full_delta();
+            let mut legit = owner_store.full_delta().expect("full delta");
             legit.owner_checkpoint = Some(cp.clone());
             let mut j =
                 KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
@@ -4887,7 +5084,7 @@ mod tests {
         ];
 
         for (name, mutate) in mutators {
-            let mut delta = owner_store.full_delta();
+            let mut delta = owner_store.full_delta().expect("full delta");
             delta.owner_checkpoint = Some(cp.clone());
             mutate(&mut delta);
 
@@ -5073,7 +5270,7 @@ mod tests {
         );
 
         // Owner offline: only the relay serves a full delta.
-        let relay_full = relay.full_delta();
+        let relay_full = relay.full_delta().expect("full delta");
         assert!(
             relay_full.owner_checkpoint.is_some(),
             "relay carries a cached owner checkpoint for cold recovery"
@@ -5110,7 +5307,7 @@ mod tests {
             .put("k".to_string(), b"v".to_vec(), "text/plain".to_string(), p)
             .expect("owner put");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1);
 
         let mut replica =
@@ -5157,7 +5354,7 @@ mod tests {
             )
             .expect("owner put k2");
         let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
-        let mut snap2 = owner_store.full_delta();
+        let mut snap2 = owner_store.full_delta().expect("full delta");
         snap2.owner_checkpoint = Some(cp2);
         restarted
             .merge_delta(&snap2, peer(9), Some(&agent(9)))
@@ -5367,7 +5564,7 @@ mod tests {
             )
             .expect("owner append");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap = owner_store.full_delta();
+        let mut snap = owner_store.full_delta().expect("full delta");
         snap.owner_checkpoint = Some(cp);
 
         let mut joiner =
@@ -5411,7 +5608,7 @@ mod tests {
                 .expect("forge put");
         }
         let cp = checkpoint_for(&forged, topic, kp, seq);
-        let mut snap = forged.full_delta();
+        let mut snap = forged.full_delta().expect("full delta");
         snap.owner_checkpoint = Some(cp);
         snap
     }
@@ -5435,7 +5632,7 @@ mod tests {
                 .expect("owner append");
         }
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1);
 
         let mut replica =
@@ -5478,7 +5675,7 @@ mod tests {
             )
             .expect("owner append");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1);
 
         let mut replica =
@@ -5594,7 +5791,7 @@ mod tests {
             )
             .expect("owner append");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1.clone());
 
         let mut replica =
@@ -5617,7 +5814,7 @@ mod tests {
             )
             .expect("forge put");
         let cp2 = checkpoint_for(&forged, topic, &kp, 2);
-        let mut snap2 = forged.full_delta();
+        let mut snap2 = forged.full_delta().expect("full delta");
         snap2.owner_checkpoint = Some(cp2);
 
         replica
@@ -5653,7 +5850,7 @@ mod tests {
             )
             .expect("owner append");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1.clone());
 
         let mut replica =
@@ -5883,7 +6080,7 @@ mod tests {
                 .expect("owner append");
         }
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1);
 
         let mut replica =
@@ -5914,7 +6111,7 @@ mod tests {
             )
             .expect("owner append k3");
         let cp3 = checkpoint_for(&owner_store, topic, &kp, 3);
-        let mut snap3 = owner_store.full_delta();
+        let mut snap3 = owner_store.full_delta().expect("full delta");
         snap3.owner_checkpoint = Some(cp3);
         replica
             .merge_delta(&snap3, peer(9), Some(&agent(9)))
@@ -5953,7 +6150,7 @@ mod tests {
             )
             .expect("owner append");
         let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
-        let mut snap1 = owner_store.full_delta();
+        let mut snap1 = owner_store.full_delta().expect("full delta");
         snap1.owner_checkpoint = Some(cp1.clone());
 
         let mut replica =
