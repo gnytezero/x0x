@@ -573,6 +573,7 @@ impl KvStoreSync {
         protector: &SharedTreeKemKvProtector,
         store: &Arc<RwLock<KvStore>>,
         store_id: &KvStoreId,
+        local_peer: PeerId,
         payload: &[u8],
         pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
     ) -> bool {
@@ -613,7 +614,7 @@ impl KvStoreSync {
             None
         };
         protector
-            .merge_main_record(opened, sender_peer, store, retained_image)
+            .merge_main_record(opened, sender_peer, local_peer, store, retained_image)
             .await
             .is_ok()
     }
@@ -743,6 +744,7 @@ impl KvStoreSync {
         refresh: Option<&SecureRefreshFn>,
         store: &Arc<RwLock<KvStore>>,
         store_id: &KvStoreId,
+        local_peer: PeerId,
         payload: &[u8],
         pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
     ) -> bool {
@@ -818,7 +820,11 @@ impl KvStoreSync {
                     bincode::deserialize::<KvStore>(mutation_payload)
                         .map_err(|e| KvError::Gossip(format!("bad retained group image: {e}")))
                         .and_then(|image| {
-                            target.merge_group_retained_image(&image, mutation.author_id)
+                            target.merge_group_retained_image(
+                                &image,
+                                mutation.author_id,
+                                local_peer,
+                            )
                         })
                 }
             }
@@ -843,6 +849,7 @@ impl KvStoreSync {
         refresh: Option<&SecureRefreshFn>,
         store: &Arc<RwLock<KvStore>>,
         store_id: &KvStoreId,
+        local_peer: PeerId,
         payload: &[u8],
         pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
     ) -> bool {
@@ -918,7 +925,9 @@ impl KvStoreSync {
             } else {
                 bincode::deserialize::<KvStore>(payload)
                     .map_err(|e| KvError::Gossip(format!("bad retained encrypted image: {e}")))
-                    .and_then(|image| s.merge_group_retained_image(&image, mutation.author_id))
+                    .and_then(|image| {
+                        s.merge_group_retained_image(&image, mutation.author_id, local_peer)
+                    })
             }
         } else {
             bincode::deserialize::<KvStoreDelta>(&mutation.payload)
@@ -1289,6 +1298,7 @@ impl KvStoreSync {
 
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
+        let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
         // store's life).
         let listener_store_id = { *store.read().await.id() };
@@ -1336,6 +1346,7 @@ impl KvStoreSync {
                         protector,
                         &store,
                         &listener_store_id,
+                        listener_local_peer_id,
                         &msg.payload,
                         &listener_pages,
                     )
@@ -1352,6 +1363,7 @@ impl KvStoreSync {
                             listener_refresh.as_ref(),
                             &store,
                             &listener_store_id,
+                            listener_local_peer_id,
                             &msg.payload,
                             &listener_pages,
                         )
@@ -1362,6 +1374,7 @@ impl KvStoreSync {
                             listener_refresh.as_ref(),
                             &store,
                             &listener_store_id,
+                            listener_local_peer_id,
                             &msg.payload,
                             &listener_pages,
                         )
@@ -1716,8 +1729,17 @@ impl KvStoreSync {
                             } else {
                                 !s.is_empty() || s.latest_checkpoint.is_some()
                             };
-                            let full = (has_payload && !cooled_down && !responder_uses_retained)
-                                .then(|| s.full_delta());
+                            let full = if has_payload && !cooled_down && !responder_uses_retained {
+                                match s.full_delta() {
+                                    Ok(delta) => Some(delta),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "cannot allocate full-state delta tags");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let retained = if has_payload && !cooled_down && responder_uses_retained
                             {
                                 match serialize_retained_group_image(&s) {
@@ -2544,9 +2566,157 @@ mod tests {
     use crate::identity::AgentId;
     use crate::kv::encrypted::seal_mutation;
     use crate::kv::store::AccessPolicy;
+    use crate::kv::TreeKemKvProtector;
     use crate::kv::{KvEntry, KvStoreId};
     use crate::network::{NetworkConfig, NetworkNode};
     use std::time::Duration;
+
+    struct TestTreeKemProtector {
+        group_id: Vec<u8>,
+        group: tokio::sync::Mutex<crate::mls::TreeKemMlsGroup>,
+        readers: std::collections::HashSet<AgentId>,
+        writers: std::sync::Mutex<std::collections::HashSet<AgentId>>,
+        authorization: [u8; 32],
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kv::TreeKemKvProtector for TestTreeKemProtector {
+        fn group_id(&self) -> Vec<u8> {
+            self.group_id.clone()
+        }
+
+        async fn seal_record(
+            &self,
+            signing: &AuthorSigning,
+            kind: KvMutationKind,
+            store_id: &KvStoreId,
+            payload: &[u8],
+            reader_only: bool,
+        ) -> Result<TreeKemKvStoreRecordV1> {
+            let admitted = if reader_only {
+                self.readers.contains(&signing.agent_id)
+            } else {
+                self.writers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&signing.agent_id)
+            };
+            if !admitted {
+                return Err(KvError::Unauthorized("test TreeKEM role denied".into()));
+            }
+            let mut group = self.group.lock().await;
+            let epoch = group.epoch();
+            let inner = crate::kv::treekem::sign_inner_mutation(
+                signing,
+                kind,
+                payload,
+                crate::kv::treekem::TreeKemInnerBinding {
+                    group_id: self.group_id.clone(),
+                    epoch,
+                    store_id,
+                    authorization_binding: self.authorization,
+                    reader_only,
+                },
+            )?;
+            let ciphertext = group
+                .encrypt_message(&inner)
+                .map_err(|error| KvError::SecureRecord(error.to_string()))?;
+            Ok(TreeKemKvStoreRecordV1 {
+                version: 1,
+                group_id: self.group_id.clone(),
+                store_id: *store_id.as_bytes(),
+                epoch,
+                reader_only,
+                ciphertext,
+            })
+        }
+
+        async fn open_record(
+            &self,
+            store_id: &KvStoreId,
+            record: &TreeKemKvStoreRecordV1,
+        ) -> Result<crate::kv::treekem::OpenedTreeKemKvRecord> {
+            if record.group_id != self.group_id || record.store_id != *store_id.as_bytes() {
+                return Err(KvError::SecureRecord(
+                    "test TreeKEM binding mismatch".into(),
+                ));
+            }
+            let mut group = self.group.lock().await;
+            let plaintext = group
+                .decrypt_message(&record.ciphertext)
+                .map_err(|error| KvError::SecureRecord(error.to_string()))?;
+            let opened = crate::kv::treekem::open_inner_mutation(
+                &self.group_id,
+                record.epoch,
+                store_id,
+                &plaintext,
+                self.authorization,
+            )?;
+            let admitted = if opened.reader_only {
+                self.readers.contains(&opened.mutation.author_id)
+            } else {
+                self.writers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&opened.mutation.author_id)
+            };
+            if !admitted {
+                return Err(KvError::Unauthorized("test TreeKEM role denied".into()));
+            }
+            Ok(opened)
+        }
+
+        async fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+            self.readers.contains(agent)
+        }
+
+        async fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+            self.writers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(agent)
+        }
+
+        async fn merge_main_record(
+            &self,
+            opened: crate::kv::treekem::OpenedTreeKemKvRecord,
+            sender_peer: PeerId,
+            local_peer: PeerId,
+            store: &Arc<RwLock<KvStore>>,
+            retained_image: Option<Vec<u8>>,
+        ) -> Result<()> {
+            if !self.is_authorized_writer(&opened.mutation.author_id).await
+                || opened.authorization_binding != self.authorization
+            {
+                return Err(KvError::Unauthorized("test TreeKEM merge denied".into()));
+            }
+            let mut store = store.write().await;
+            match opened.mutation.kind {
+                KvMutationKind::RetainedState => {
+                    let image: KvStore = bincode::deserialize(
+                        retained_image
+                            .as_deref()
+                            .ok_or_else(|| KvError::Gossip("missing retained image".into()))?,
+                    )?;
+                    store.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+                }
+                KvMutationKind::Delta | KvMutationKind::FullState => {
+                    let delta: KvStoreDelta = bincode::deserialize(&opened.mutation.payload)?;
+                    store.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+                }
+                KvMutationKind::Control => {
+                    Err(KvError::Unauthorized("control on main topic".into()))
+                }
+            }
+        }
+
+        fn invalidate(&self) {
+            self.writers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
 
     fn agent(n: u8) -> AgentId {
         AgentId([n; 32])
@@ -2594,8 +2764,8 @@ mod tests {
         // Simulate the handle-layer double seq mint: the counter can run
         // ahead of `version`. The persisted counter — not a version-derived
         // floor — must be the restore ceiling.
-        let _ = store.next_seq();
-        let _ = store.next_seq();
+        let _ = store.next_seq().expect("sequence");
+        let _ = store.next_seq().expect("sequence");
         let counter_before = store.seq_counter_value();
         let bytes = encode_snapshot(&store).expect("encode");
         write_snapshot_atomic(&path, &bytes).expect("atomic write");
@@ -2612,7 +2782,7 @@ mod tests {
         // Exact tag ceiling restored: the next minted seq is strictly above
         // every pre-restart seq (no OR-Set (peer, seq) tag reuse).
         assert!(
-            restored.next_seq() > counter_before,
+            restored.next_seq().expect("sequence") > counter_before,
             "restored seq counter must exceed every pre-restart seq"
         );
 
@@ -2637,6 +2807,76 @@ mod tests {
         assert!(
             load_snapshot(&path).is_err(),
             "garbage body must be an error (fail closed)"
+        );
+    }
+
+    #[test]
+    fn retained_import_sequence_floor_survives_snapshot_restart() {
+        let owner = agent(1);
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "09".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let group_id = group.stable_group_id().as_bytes().to_vec();
+        let id = store_id(19);
+        let local_peer = peer(4);
+        let ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let mut source =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group_id.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "page".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("source put");
+        source.remove("page").expect("source remove");
+        let source: KvStore =
+            bincode::deserialize(&bincode::serialize(&source).expect("retained image encode"))
+                .expect("retained image decode");
+
+        let mut target = KvStore::new_group_signed(id, "Wiki".to_string(), owner, group_id, ctx)
+            .expect("fresh target");
+        target
+            .merge_group_retained_image(&source, owner, local_peer)
+            .expect("authenticated import");
+        target
+            .put(
+                "page".to_string(),
+                b"first".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("first re-add");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("kv").join("retained.bin");
+        write_snapshot_atomic(&path, &encode_snapshot(&target).expect("snapshot encode"))
+            .expect("snapshot write");
+        let mut restored = load_snapshot(&path)
+            .expect("snapshot load")
+            .expect("snapshot present");
+        restored.remove("page").expect("remove after restart");
+        restored
+            .put(
+                "page".to_string(),
+                b"second".to_vec(),
+                "text/plain".to_string(),
+                local_peer,
+            )
+            .expect("second re-add after restart");
+        assert_eq!(
+            restored.get("page").expect("visible re-add").value,
+            b"second"
         );
     }
 
@@ -2933,7 +3173,7 @@ mod tests {
                 timestamp: 0,
             })
             .expect("genuine creator checkpoint");
-        let mut hostile = source.full_delta();
+        let mut hostile = source.full_delta().expect("full delta");
         hostile.owner_checkpoint = Some(checkpoint);
 
         let mut target = KvStore::new_group_signed(
@@ -2972,6 +3212,7 @@ mod tests {
                 None,
                 &target,
                 &id,
+                peer(1),
                 &encoded,
                 &Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
             )
@@ -3956,6 +4197,7 @@ mod tests {
                 None,
                 &store,
                 &store_id(10),
+                peer(1),
                 &encoded,
                 &Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
             )
@@ -4061,7 +4303,7 @@ mod tests {
             KvStoreDelta::for_put(
                 "secret-key".to_string(),
                 entry,
-                (peer(1), s.next_seq()),
+                (peer(1), s.next_seq().expect("sequence")),
                 s.current_version(),
             )
         };
@@ -4077,6 +4319,215 @@ mod tests {
             .get("secret-key")
             .map(|e| e.value.clone());
         assert_eq!(value, Some(b"hush".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn treekem_responder_pages_large_history_and_receiver_reassembles_out_of_order() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let owner_kp = AgentKeypair::generate().expect("owner kp");
+        let writer_kp = AgentKeypair::generate().expect("writer kp");
+        let reader_kp = AgentKeypair::generate().expect("reader kp");
+        let owner = owner_kp.agent_id();
+        let writer = writer_kp.agent_id();
+        let reader = reader_kp.agent_id();
+        let (group_info, mut contexts, group_id) = encrypted_group(&[owner, writer, reader]);
+        let reader_ctx = contexts.pop().expect("reader context");
+        let writer_ctx = contexts.pop().expect("writer context");
+        let _owner_ctx = contexts.pop().expect("owner context");
+
+        let mut owner_group =
+            crate::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[1; 32])
+                .expect("owner group");
+        let writer_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(writer, &[2; 32]).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(reader, &[3; 32]).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances");
+        let reader_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        drop(owner_group); // the canonical owner is offline while the writer serves.
+
+        let readers = std::collections::HashSet::from([owner, writer, reader]);
+        let writers = std::collections::HashSet::from([owner, writer]);
+        let authorization = *blake3::hash(b"current roster and AdminOnly policy").as_bytes();
+        let writer_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(writer_group),
+            readers: readers.clone(),
+            writers: std::sync::Mutex::new(writers.clone()),
+            authorization,
+        });
+        let reader_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(reader_group),
+            readers,
+            writers: std::sync::Mutex::new(writers),
+            authorization,
+        });
+        let id = store_id(44);
+        let mut source = KvStore::new_treekem_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group_id.clone(),
+            writer_ctx,
+        )
+        .expect("writer store");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed removal");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(2),
+                )
+                .expect("large entry");
+        }
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_ctx)
+            .expect("reader context");
+        source.remove("removed").expect("retained tombstone");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("concurrent target write");
+
+        let topic = "store/treekem-paged-history";
+        let mut main_probe = pubsub.subscribe(topic.to_string()).await;
+        let mut writer_sync = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(writer),
+        )
+        .expect("writer sync");
+        writer_sync.set_treekem_context(writer_protector.clone());
+        writer_sync
+            .set_author_signing(AuthorSigning::from_keypair(&writer_kp).expect("writer signing"));
+        writer_sync.start().await.expect("start responder");
+        let retained = {
+            let store = writer_sync.read().await;
+            serialize_retained_group_image(&store).expect("retained image")
+        };
+        let max_wire =
+            crate::gossip::pubsub::max_signed_v3_payload_bytes(topic).expect("wire budget");
+        let expected_frames =
+            crate::kv::retained_paging::split_image(&retained, max_wire.saturating_sub(16 * 1024))
+                .expect("paged frames")
+                .len();
+        assert!(
+            expected_frames > 2,
+            "history must span multiple data frames"
+        );
+
+        let request = KvSyncMessage::StateRequest { requester: peer(3) };
+        let reader_signing =
+            Arc::new(AuthorSigning::from_keypair(&reader_kp).expect("reader signing"));
+        let reader_trait: SharedTreeKemKvProtector = reader_protector.clone();
+        let request_bytes = KvStoreSync::seal_treekem_control(
+            &reader_trait,
+            &reader_signing,
+            &id,
+            peer(3),
+            &request,
+        )
+        .await
+        .expect("reader state request");
+        pubsub
+            .publish(
+                format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}"),
+                bytes::Bytes::from(request_bytes),
+            )
+            .await
+            .expect("publish request");
+
+        let mut wire_frames = Vec::with_capacity(expected_frames);
+        for _ in 0..expected_frames {
+            let message = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+                .await
+                .expect("responder frame timeout")
+                .expect("responder frame");
+            assert!(message.payload.len() <= max_wire);
+            wire_frames.push(message.payload);
+        }
+        wire_frames.reverse();
+        let target = Arc::new(RwLock::new(target));
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        for payload in wire_frames {
+            let _ = KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &payload,
+                &pages,
+            )
+            .await;
+        }
+        let merged = target.read().await;
+        assert!(merged.get("removed").is_none());
+        assert_eq!(
+            merged.get("concurrent").expect("concurrent").value,
+            b"local"
+        );
+        assert_eq!(merged.last_history_endorser(), Some(&writer));
+        drop(merged);
+
+        reader_protector
+            .writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&writer);
+        let hostile = writer_protector
+            .seal_record(
+                &AuthorSigning::from_keypair(&writer_kp).expect("writer signing"),
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&KvStoreDelta::new(99)).expect("delta"),
+                false,
+            )
+            .await
+            .expect("stale writer record");
+        let hostile = encode_delta(peer(2), &hostile).expect("wire record");
+        assert!(
+            !KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &hostile,
+                &pages,
+            )
+            .await
+        );
+        let _ = group_info;
     }
 
     #[tokio::test]
@@ -4139,7 +4590,7 @@ mod tests {
             KvStoreDelta::for_put(
                 "intruder-key".to_string(),
                 entry,
-                (peer(3), s.next_seq()),
+                (peer(3), s.next_seq().expect("sequence")),
                 s.current_version(),
             )
         };
@@ -5139,7 +5590,7 @@ mod tests {
             crate::kv::store::AnchorChannel::RestParam,
         );
         let k2_only = {
-            let full = owned.full_delta();
+            let full = owned.full_delta().expect("full delta");
             let (key, (entry, tag)) = full
                 .added
                 .iter()
@@ -5274,7 +5725,7 @@ mod tests {
             crate::kv::store::AnchorChannel::Persistence,
         );
         let live_only = {
-            let full = owned.full_delta();
+            let full = owned.full_delta().expect("full delta");
             let (key, (entry, tag)) = full
                 .added
                 .iter()
@@ -5457,7 +5908,7 @@ mod tests {
                 peer(1),
             )
             .expect("k1");
-        let full = owned.full_delta();
+        let full = owned.full_delta().expect("full delta");
         let encoded = encode_delta(peer(1), &full).expect("encode full");
         pubsub
             .publish(topic.to_string(), bytes::Bytes::from(encoded))
@@ -5771,7 +6222,7 @@ mod tests {
             .allow_writer(writer, &owner_id)
             .expect("learn allowlist");
         let k_owner_seed = {
-            let full = owned.full_delta();
+            let full = owned.full_delta().expect("full delta");
             let (key, (entry, tag)) = full
                 .added
                 .iter()
@@ -5875,7 +6326,7 @@ mod tests {
             Some(owner),
             crate::kv::store::AnchorChannel::RestParam,
         );
-        let s1 = holder.full_delta();
+        let s1 = holder.full_delta().expect("full delta");
         replica
             .merge_delta(&s1, peer(1), Some(&owner))
             .expect("serve 1");
@@ -5884,7 +6335,7 @@ mod tests {
         // The holder deletes the key; the next VERIFIED serve prunes it
         // (tombstoning the first serve's synthetic tag locally).
         holder.remove("k_doomed").expect("delete");
-        let s2 = holder.full_delta();
+        let s2 = holder.full_delta().expect("full delta");
         assert_eq!(
             s2.served_digest(&store_id(1)),
             Some(holder.served_digest()),
@@ -5907,7 +6358,7 @@ mod tests {
                 peer(1),
             )
             .expect("re-add");
-        let s3 = holder.full_delta();
+        let s3 = holder.full_delta().expect("full delta");
         replica
             .merge_delta(&s3, peer(1), Some(&owner))
             .expect("serve 3");
@@ -5931,7 +6382,7 @@ mod tests {
             kp: &crate::identity::AgentKeypair,
             seq: u64,
         ) -> KvStoreDelta {
-            let mut delta = store.full_delta();
+            let mut delta = store.full_delta().expect("full delta");
             delta.owner_checkpoint = Some(
                 make_owner_checkpoint(OwnerCheckpointParams {
                     topic: "kv-stale-checkpoint-prune",

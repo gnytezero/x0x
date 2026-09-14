@@ -1010,6 +1010,7 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         &self,
         opened: x0x::kv::treekem::OpenedTreeKemKvRecord,
         sender_peer: saorsa_gossip_types::PeerId,
+        local_peer: saorsa_gossip_types::PeerId,
         store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
         retained_image: Option<Vec<u8>>,
     ) -> x0x::kv::Result<()> {
@@ -1045,7 +1046,7 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                         )
                     })?)
                     .map_err(|e| x0x::kv::KvError::Gossip(format!("bad retained image: {e}")))?;
-                target.merge_group_retained_image(&image, opened.mutation.author_id)
+                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
             }
             x0x::kv::KvMutationKind::Control => Err(x0x::kv::KvError::Unauthorized(
                 "TreeKEM control record on main topic".to_string(),
@@ -2384,6 +2385,7 @@ mod tests {
             .merge_main_record(
                 opened,
                 saorsa_gossip_types::PeerId::new([1; 32]),
+                saorsa_gossip_types::PeerId::new([2; 32]),
                 &target,
                 Some(retained),
             )
@@ -2423,6 +2425,7 @@ mod tests {
             .merge_main_record(
                 stale_opened,
                 saorsa_gossip_types::PeerId::new([1; 32]),
+                saorsa_gossip_types::PeerId::new([2; 32]),
                 &target,
                 Some(bincode::serialize(&source).expect("stale image")),
             )

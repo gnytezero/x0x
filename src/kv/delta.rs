@@ -150,7 +150,7 @@ impl DeltaCrdt for KvStore {
         if since_version >= current {
             return None;
         }
-        Some(self.full_delta())
+        self.full_delta().ok()
     }
 
     fn version(&self) -> u64 {

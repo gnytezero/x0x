@@ -75,6 +75,7 @@ pub trait TreeKemKvProtector: Send + Sync {
         &self,
         opened: OpenedTreeKemKvRecord,
         sender_peer: PeerId,
+        local_peer: PeerId,
         store: &Arc<tokio::sync::RwLock<super::KvStore>>,
         retained_image: Option<Vec<u8>>,
     ) -> Result<()>;

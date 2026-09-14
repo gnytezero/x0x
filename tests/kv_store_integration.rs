@@ -740,7 +740,7 @@ fn test_delta_roundtrip_put() {
         .expect("put");
 
     // Generate full delta from source.
-    let delta = source.full_delta();
+    let delta = source.full_delta().expect("full delta");
     assert!(!delta.is_empty());
 
     // Apply delta to a fresh target store.
@@ -998,7 +998,7 @@ fn test_full_delta_includes_allowlist() {
     .expect("kv store");
     store.allow_writer(writer, &owner).expect("allow");
 
-    let delta = store.full_delta();
+    let delta = store.full_delta().expect("full delta");
     let additions = delta.allowlist_additions.expect("should have allowlist");
     assert!(additions.contains(&writer));
 }
@@ -1044,9 +1044,9 @@ fn test_put_empty_key_name() {
 fn test_monotonic_sequence_counter() {
     let store = make_store(1, "Seq", 1);
 
-    let s1 = store.next_seq();
-    let s2 = store.next_seq();
-    let s3 = store.next_seq();
+    let s1 = store.next_seq().expect("sequence");
+    let s2 = store.next_seq().expect("sequence");
+    let s3 = store.next_seq().expect("sequence");
 
     assert!(s1 < s2);
     assert!(s2 < s3);

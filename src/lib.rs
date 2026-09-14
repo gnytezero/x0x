@@ -17212,12 +17212,23 @@ impl KvStoreHandle {
             let mut store = self.sync.write().await;
             Self::check_local_put(&store, &self.agent_id, &key, &value)?;
             let version_before = store.current_version();
+            if matches!(store.policy(), kv::AccessPolicy::AppendOnly)
+                && store
+                    .get(&key)
+                    .is_some_and(|entry| entry.value == value && entry.content_type == content_type)
+            {
+                return Ok(kv::KvStoreDelta::new(version_before));
+            }
+            let first_seq = store.reserve_sequences(2).map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))
+            })?;
             store
-                .put(
+                .put_with_reserved_sequence(
                     key.clone(),
                     value.clone(),
                     content_type.clone(),
                     self.peer_id,
+                    first_seq,
                 )
                 .map_err(|e| match e {
                     // AppendOnly immutability violation — surfaced distinctly
@@ -17238,8 +17249,8 @@ impl KvStoreHandle {
             let version = store.current_version();
             let mut delta = match entry {
                 Some(e) => {
-                    // NOTE: this next_seq() is the SECOND seq minted for this
-                    // put (KvStore::put minted one for the local OR-Set tag),
+                    // This is the SECOND sequence reserved atomically for this
+                    // put (the first is the local OR-Set tag),
                     // so the published delta tag differs from the local tag.
                     // That divergence is benign, precisely because of how the
                     // two remove paths treat tags: a LOCAL remove
@@ -17256,7 +17267,7 @@ impl KvStoreHandle {
                     // after a restart. Deliberately not "fixed": returning
                     // the tag from KvStore::put would change its public
                     // signature for no behavioral gain.
-                    kv::KvStoreDelta::for_put(key, e, (self.peer_id, store.next_seq()), version)
+                    kv::KvStoreDelta::for_put(key, e, (self.peer_id, first_seq + 1), version)
                 }
                 None => {
                     return Err(error::IdentityError::Storage(std::io::Error::other(
@@ -19736,6 +19747,51 @@ mod tests {
                 "round {round}: snapshot must not lag or regress the store version"
             );
         }
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn kv_handle_put_fails_closed_after_sequence_exhaustion() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let handle = agent
+            .create_kv_store("sequence-exhaustion", "sequence-exhaustion-topic")
+            .await
+            .expect("store");
+        handle.sync.read().await.restore_seq_counter(u64::MAX - 2);
+
+        handle
+            .put_with_delta(
+                "last".to_string(),
+                b"last".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("final two-tag put");
+        let version = handle.sync.read().await.current_version();
+        for key in ["overflow", "still-overflow"] {
+            let error = handle
+                .put_with_delta(key.to_string(), b"never".to_vec(), "text/plain".to_string())
+                .await
+                .expect_err("exhausted allocator must fail repeatedly");
+            assert!(error
+                .to_string()
+                .contains("sequence allocator is exhausted"));
+        }
+        let store = handle.sync.read().await;
+        assert_eq!(store.current_version(), version);
+        assert!(store.get("overflow").is_none());
+        assert!(store.get("still-overflow").is_none());
+        drop(store);
+        handle.cancel_sync();
         agent.shutdown().await;
     }
 
