@@ -41,7 +41,7 @@ use saorsa_gossip_types::TopicId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// One eager-forward token, in nanosecond-scaled units so refill is
 /// continuous integer math (no floats on the hot path).
@@ -51,6 +51,52 @@ const TOKEN_UNITS_PER_MSG: u128 = 1_000_000_000;
 /// (`elapsed_ns × rate`) and operator typos; 100k msgs/s per topic is far
 /// above any measured fleet rate (busiest observed topic: ~19/s).
 pub const MAX_BUDGET_MSGS_PER_SEC: u64 = 100_000;
+
+/// #697: how long a relay topic may stay silent (no inbound frame, no local
+/// subscriber) before its per-topic state is evicted. Relay topics arrive
+/// via inbound frames alone (`ensure_registered` on the inbound path), and
+/// nothing else reclaimed them — measured ~7 topics/hour, linear, no
+/// plateau over 6 h on the bootstraps (tag shards alone allow 65,536).
+pub(crate) const RELAY_TOPIC_IDLE_SECS: u64 = 3600;
+
+/// #697: how often the eviction sweep runs. Decoupled from the idle
+/// horizon so operators can watch `relay_fanout.topics` fall without a
+/// per-frame cost; the first interval tick fires immediately, which only
+/// ever evicts already-idle topics.
+pub(crate) const RELAY_TOPIC_EVICT_POLL_SECS: u64 = 600;
+
+/// Coarse wall-clock seconds for #697 last-use stamps. Hours-scale
+/// horizons do not need monotonic precision; coarse granularity keeps the
+/// hot-path refresh to one relaxed atomic store under a read lock.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The validator registry the lifecycle serializes against — sg's
+/// per-topic validator map. A crate-internal seam (NOT a public API) so
+/// the #697 review's deterministic interleaving regression can observe
+/// the actual install/remove operations and the lock they run under;
+/// the only production implementation is the blanket impl for
+/// [`saorsa_gossip_pubsub::PlumtreePubSub`].
+pub(crate) trait ValidatorRegistry {
+    fn install_topic_validator(&self, topic: TopicId, validator: TopicValidator);
+    fn clear_topic_validator(&self, topic: TopicId);
+}
+
+impl<T> ValidatorRegistry for saorsa_gossip_pubsub::PlumtreePubSub<T>
+where
+    T: saorsa_gossip_transport::GossipTransport + Send + Sync + 'static,
+{
+    fn install_topic_validator(&self, topic: TopicId, validator: TopicValidator) {
+        self.set_topic_validator(topic, validator);
+    }
+
+    fn clear_topic_validator(&self, topic: TopicId) {
+        saorsa_gossip_pubsub::PlumtreePubSub::clear_topic_validator(self, topic);
+    }
+}
 
 /// Per-topic eager-forward token bucket (C3). One token = one message the
 /// validator may return `ForwardAndDeliver` for; refill is lazy (computed
@@ -99,7 +145,6 @@ impl TokenBucket {
 fn refill_units(elapsed_ns: u128, rate_per_sec: u64) -> u128 {
     elapsed_ns.saturating_mul(u128::from(rate_per_sec))
 }
-
 /// Shared x0x relay-fanout state: base validators, the set of topics with
 /// a composite registered on sg, C3 buckets, and the live subscriber set.
 pub(crate) struct RelayFanout {
@@ -107,10 +152,13 @@ pub(crate) struct RelayFanout {
     /// consults these live, so registration order and later swaps are
     /// irrelevant — no sg re-registration needed.
     base: RwLock<HashMap<TopicId, TopicValidator>>,
-    /// Topics whose composite validator is registered on sg. Validators
-    /// live in a separate sg map from topic state, so they survive sg
-    /// `unsubscribe` (topic-state removal) — the set never goes stale.
-    registered: RwLock<HashSet<TopicId>>,
+    /// Topics whose composite validator is registered on sg, with a coarse
+    /// unix-seconds last-use stamp (#697). Validators live in a separate
+    /// sg map from topic state, so they survive sg `unsubscribe` — the set
+    /// never went stale, but it also never shrank: entries idle past
+    /// [`RELAY_TOPIC_IDLE_SECS`] with no local subscriber are evicted by
+    /// [`RelayFanout::evict_idle`].
+    registered: RwLock<HashMap<TopicId, AtomicU64>>,
     /// C3 token buckets by topic, created on the first budget decision.
     /// Bounded by the daemon's topic universe, exactly like sg's own
     /// per-topic maps.
@@ -138,7 +186,7 @@ impl RelayFanout {
     pub(crate) fn new(subscribed_topic_ids: Arc<RwLock<HashSet<TopicId>>>) -> Arc<Self> {
         Arc::new(Self {
             base: RwLock::new(HashMap::new()),
-            registered: RwLock::new(HashSet::new()),
+            registered: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
             budget: RwLock::new(super::config::default_relay_fanout_budget()),
             subscribed_topic_ids,
@@ -168,29 +216,115 @@ impl RelayFanout {
         write_unpoisoned(&self.base).insert(topic, validator);
     }
 
-    /// Idempotently register this topic's composite validator on sg. Cheap
-    /// on the hot path (one read-lock set lookup); the write path runs
-    /// once per topic lifetime. Called from the subscribe path (topic
-    /// creation), the inbound path (topics sg learns from peers without a
-    /// local subscription — the relay case C2 exists for), and
+    /// Idempotently register this topic's composite validator on the
+    /// registry. Cheap on the hot path (one read-lock map lookup); the
+    /// write path runs once per topic lifetime. Called from the subscribe
+    /// path (topic creation), the inbound path (topics sg learns from
+    /// peers without a local subscription — the relay case C2 exists for;
+    /// the per-frame call is also the #697 last-use refresh), and
     /// construction for the storm-control topics.
-    pub(crate) fn ensure_registered<T>(
+    ///
+    /// The registry install runs UNDER the `registered` write lock, so map
+    /// membership and the validator's presence on the registry can never
+    /// disagree (the #697 review's P1: clearing after an unlock let a
+    /// concurrent install land between the map removal and the clear,
+    /// leaving a member with no validator forever).
+    pub(crate) fn ensure_registered<R: ValidatorRegistry + ?Sized>(
         self: &Arc<Self>,
-        plumtree: &saorsa_gossip_pubsub::PlumtreePubSub<T>,
+        registry: &R,
         topic: TopicId,
-    ) where
-        T: saorsa_gossip_transport::GossipTransport + Send + Sync + 'static,
-    {
-        if read_unpoisoned(&self.registered).contains(&topic) {
+    ) {
+        if self.note_topic_use(&topic) {
             return;
         }
-        if !write_unpoisoned(&self.registered).insert(topic) {
-            return; // raced another registration; it installed the composite
+        let mut registered = write_unpoisoned(&self.registered);
+        if registered.contains_key(&topic) {
+            // Raced another registration; it installed the composite under
+            // this same lock. Refresh the stamp it wrote and bail.
+            if let Some(last_use) = registered.get(&topic) {
+                last_use.store(unix_now_secs(), Ordering::Relaxed);
+            }
+            return;
         }
         let fanout = Arc::clone(self);
         let validator: TopicValidator =
             Arc::new(move |topic, payload| fanout.verdict(topic, payload));
-        plumtree.set_topic_validator(topic, validator);
+        registry.install_topic_validator(topic, validator);
+        registered.insert(topic, AtomicU64::new(unix_now_secs()));
+    }
+
+    /// #697 hot-path last-use refresh: one relaxed atomic store under the
+    /// read lock keeps an entry off the eviction path. Returns whether the
+    /// topic was already registered (the `ensure_registered` fast path).
+    fn note_topic_use(&self, topic: &TopicId) -> bool {
+        read_unpoisoned(&self.registered)
+            .get(topic)
+            .is_some_and(|last_use| {
+                last_use.store(unix_now_secs(), Ordering::Relaxed);
+                true
+            })
+    }
+
+    /// #697: evict per-topic relay state for topics that have been silent
+    /// for `idle_secs` AND have no local subscriber AND carry no base
+    /// (storm-control) validator. The registry removal runs UNDER the
+    /// `registered` write lock (same serialization as the install side),
+    /// and each evicted topic's C3 bucket is reclaimed. An evicted topic
+    /// sighted again on the inbound path simply re-registers through
+    /// `ensure_registered` — eviction trades one re-install for the
+    /// reclaim. `now_secs` is a parameter (not read from the clock) so the
+    /// sweep is deterministic under test.
+    fn evict_idle<R: ValidatorRegistry + ?Sized>(
+        &self,
+        now_secs: u64,
+        idle_secs: u64,
+        registry: &R,
+    ) -> Vec<TopicId> {
+        let mut registered = write_unpoisoned(&self.registered);
+        let subscribed = read_unpoisoned(&self.subscribed_topic_ids);
+        let base = read_unpoisoned(&self.base);
+        let mut evicted = Vec::new();
+        registered.retain(|topic, last_use| {
+            let idle = now_secs.saturating_sub(last_use.load(Ordering::Relaxed));
+            let keep = idle < idle_secs || subscribed.contains(topic) || base.contains_key(topic);
+            if !keep {
+                evicted.push(*topic);
+            }
+            keep
+        });
+        drop(base);
+        drop(subscribed);
+        // Still holding the `registered` write lock: the registry clear
+        // must not interleave with a concurrent install (see
+        // `ensure_registered`).
+        for topic in &evicted {
+            registry.clear_topic_validator(*topic);
+        }
+        drop(registered);
+        if !evicted.is_empty() {
+            let mut buckets = write_unpoisoned(&self.buckets);
+            for topic in &evicted {
+                buckets.remove(topic);
+            }
+        }
+        evicted
+    }
+
+    /// #697 sweep wired into the manager: evict idle relay topics and drop
+    /// their registry composites. Called from a slow interval task (see
+    /// the PubSubManager constructor), not the hot path.
+    pub(crate) fn evict_idle_topics<R: ValidatorRegistry + ?Sized>(&self, registry: &R) {
+        self.evict_idle(unix_now_secs(), RELAY_TOPIC_IDLE_SECS, registry);
+    }
+
+    /// #697 test probe: whether the `registered` lifecycle lock is
+    /// currently write-held. The deterministic interleaving regression
+    /// asserts this from INSIDE its registry's install/remove, proving
+    /// the actual sg-side operations can only run under the lifecycle
+    /// lock (the review's P1 — the old code cleared after unlocking).
+    #[cfg(test)]
+    fn registered_write_locked_for_test(&self) -> bool {
+        self.registered.try_write().is_err()
     }
 
     /// Number of topics with a composite validator registered (diagnostics).
@@ -249,12 +383,54 @@ impl RelayFanout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
+    use std::sync::PoisonError;
 
     fn subscriber_set() -> Arc<RwLock<HashSet<TopicId>>> {
         Arc::new(RwLock::new(HashSet::new()))
     }
 
+    /// Registry stub for state-level tests: no sg instance needed.
+    struct NoopRegistry;
+    impl ValidatorRegistry for NoopRegistry {
+        fn install_topic_validator(&self, _topic: TopicId, _validator: TopicValidator) {}
+        fn clear_topic_validator(&self, _topic: TopicId) {}
+    }
+
+    /// Records the actual install/remove operations and asserts — from
+    /// inside the operation — that the fanout's lifecycle lock is
+    /// write-held at that moment. With the pre-P1 code (clear after
+    /// unlock) the eviction-side assert fires; this is the deterministic
+    /// interleaving regression: no scheduler dependence, the serialization
+    /// itself is pinned.
+    struct LockProbingRegistry {
+        fanout: Arc<RelayFanout>,
+        ops: Mutex<Vec<(&'static str, TopicId)>>,
+    }
+
+    impl ValidatorRegistry for LockProbingRegistry {
+        fn install_topic_validator(&self, topic: TopicId, _validator: TopicValidator) {
+            assert!(
+                self.fanout.registered_write_locked_for_test(),
+                "install must run under the registered lifecycle lock (P1)"
+            );
+            self.ops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(("install", topic));
+        }
+
+        fn clear_topic_validator(&self, topic: TopicId) {
+            assert!(
+                self.fanout.registered_write_locked_for_test(),
+                "clear must run under the registered lifecycle lock (P1)"
+            );
+            self.ops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(("clear", topic));
+        }
+    }
     #[test]
     fn c2_unconsumed_topic_is_always_lazy_even_with_budget() {
         // Why (#674 C2): a relay with zero local subscribers on a topic has
@@ -402,9 +578,163 @@ mod tests {
             topic,
             Arc::new(|_t, _p| ValidationAction::ForwardAndDeliver),
         );
+
         assert_eq!(
             fanout.verdict(&topic, b"payload"),
             ValidationAction::LazyForward
+        );
+    }
+    // #697: per-topic relay state (registered composites + C3 buckets) grew
+    // monotonically on relays (~7 topics/hour, linear, no plateau across
+    // 6 h) because nothing reclaimed entries for topics that stopped being
+    // relayed. The sweep evicts only topics that are idle AND unsubscribed
+    // AND base-validator-free; anything active, locally consumed, or
+    // storm-controlled survives. The sweep's clock is a parameter, so the
+    // stamps below are deterministic.
+    #[test]
+    fn idle_relay_topics_are_evicted_active_subscribed_and_base_survive() {
+        let subscribed = subscriber_set();
+        let fanout = RelayFanout::new(Arc::clone(&subscribed));
+
+        let idle_unsub = TopicId::new([11; 32]);
+        let active_unsub = TopicId::new([12; 32]);
+        let idle_sub = TopicId::new([13; 32]);
+        let idle_base = TopicId::new([14; 32]);
+        let now = 10_000u64;
+        let stale = now - 2 * RELAY_TOPIC_IDLE_SECS;
+        {
+            let mut registered = write_unpoisoned(&fanout.registered);
+            for (topic, stamp) in [
+                (idle_unsub, stale),
+                (active_unsub, now),
+                (idle_sub, stale),
+                (idle_base, stale),
+            ] {
+                registered.insert(topic, AtomicU64::new(stamp));
+            }
+        }
+        write_unpoisoned(&subscribed).insert(idle_sub);
+        fanout.register_base(
+            idle_base,
+            Arc::new(|_t, _p| ValidationAction::ForwardAndDeliver),
+        );
+        {
+            let mut buckets = write_unpoisoned(&fanout.buckets);
+            buckets.insert(idle_unsub, TokenBucket::full());
+            buckets.insert(idle_sub, TokenBucket::full());
+        }
+
+        let evicted = fanout.evict_idle(now, RELAY_TOPIC_IDLE_SECS, &NoopRegistry);
+
+        assert_eq!(
+            evicted,
+            vec![idle_unsub],
+            "only the idle+unsubscribed+baseless topic is evicted"
+        );
+        assert_eq!(
+            fanout.registered_topics(),
+            3,
+            "active, subscribed and base topics survive"
+        );
+        assert!(
+            !read_unpoisoned(&fanout.buckets).contains_key(&idle_unsub),
+            "the evicted topic's bucket is reclaimed too"
+        );
+        assert!(
+            read_unpoisoned(&fanout.buckets).contains_key(&idle_sub),
+            "a surviving topic keeps its bucket"
+        );
+    }
+
+    // #697 growth bound: churn through a large relay-topic universe and the
+    // state stays reclaimable — one sweep returns the maps to the retained
+    // set instead of growing without bound (tag shards alone allow 65,536).
+    #[test]
+    fn relay_topic_state_is_bounded_under_topic_churn() {
+        let fanout = RelayFanout::new(subscriber_set());
+        let now = 10_000u64;
+        let stale = now - 2 * RELAY_TOPIC_IDLE_SECS;
+        {
+            let mut registered = write_unpoisoned(&fanout.registered);
+            let mut buckets = write_unpoisoned(&fanout.buckets);
+            for i in 0..1_000u32 {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&i.to_be_bytes());
+                let topic = TopicId::new(bytes);
+                registered.insert(topic, AtomicU64::new(stale));
+                buckets.insert(topic, TokenBucket::full());
+            }
+        }
+        assert_eq!(fanout.registered_topics(), 1_000);
+
+        let evicted = fanout.evict_idle(now, RELAY_TOPIC_IDLE_SECS, &NoopRegistry);
+
+        assert_eq!(evicted.len(), 1_000);
+        assert_eq!(
+            fanout.registered_topics(),
+            0,
+            "nothing survives a fully idle universe"
+        );
+        assert!(
+            read_unpoisoned(&fanout.buckets).is_empty(),
+            "every evicted topic's bucket is reclaimed"
+        );
+    }
+
+    // #697: an inbound frame refreshes the last-use stamp, keeping a live
+    // relay topic off the eviction path (the hot-path half of the fix).
+    #[test]
+    fn inbound_sight_refreshes_last_use_against_eviction() {
+        let fanout = RelayFanout::new(subscriber_set());
+        let topic = TopicId::new([15; 32]);
+        write_unpoisoned(&fanout.registered).insert(topic, AtomicU64::new(0));
+
+        fanout.note_topic_use(&topic);
+
+        let evicted = fanout.evict_idle(unix_now_secs(), RELAY_TOPIC_IDLE_SECS, &NoopRegistry);
+        assert!(evicted.is_empty(), "a freshly sighted topic is not idle");
+        assert_eq!(fanout.registered_topics(), 1);
+    }
+
+    // P1 regression (#697 review): the eviction's registry clear and the
+    // registration's install must be serialized against the `registered`
+    // map by the SAME write lock — the pre-fix code removed the entry,
+    // unlocked, then cleared, so a concurrent install could land between
+    // the map removal and the clear, leaving the topic a map member with
+    // NO validator on the registry (C2/C3 gone) forever. The probing
+    // registry asserts lock-held from inside each actual operation (no
+    // scheduler-dependent interleaving), and the op sequence pins the
+    // full lifecycle: install → clear → re-install after a re-sight.
+    #[test]
+    fn install_and_clear_are_serialized_under_the_lifecycle_lock() {
+        let fanout = RelayFanout::new(subscriber_set());
+        let registry = LockProbingRegistry {
+            fanout: Arc::clone(&fanout),
+            ops: Mutex::new(Vec::new()),
+        };
+        let topic = TopicId::new([21; 32]);
+        let now = 10_000u64;
+
+        fanout.ensure_registered(&registry, topic);
+        assert_eq!(fanout.registered_topics(), 1);
+
+        // Age the topic out; the clear runs under the lifecycle lock.
+        write_unpoisoned(&fanout.registered)
+            .insert(topic, AtomicU64::new(now - 2 * RELAY_TOPIC_IDLE_SECS));
+        let evicted = fanout.evict_idle(now, RELAY_TOPIC_IDLE_SECS, &registry);
+        assert_eq!(evicted, vec![topic]);
+        assert_eq!(fanout.registered_topics(), 0);
+
+        // A re-sighted topic re-installs coherently — the exact sequence
+        // the P1 gap could corrupt is now atomic end-to-end.
+        fanout.ensure_registered(&registry, topic);
+        assert_eq!(fanout.registered_topics(), 1);
+
+        let ops = registry.ops.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            *ops,
+            vec![("install", topic), ("clear", topic), ("install", topic)],
+            "exactly one coherent install/clear/install lifecycle"
         );
     }
 }
