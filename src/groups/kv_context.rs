@@ -47,6 +47,8 @@ struct GssState {
     shared_secret: Option<Vec<u8>>,
     secret_epoch: u64,
     active_members: HashSet<AgentId>,
+    member_roles: std::collections::HashMap<AgentId, GroupRole>,
+    write_access: GroupWriteAccess,
 }
 
 impl GssState {
@@ -55,11 +57,28 @@ impl GssState {
             .active_members()
             .filter_map(|m| agent_from_hex(&m.agent_id))
             .collect();
+        let member_roles = info
+            .active_members()
+            .filter_map(|m| agent_from_hex(&m.agent_id).map(|agent| (agent, m.role)))
+            .collect();
         Self {
             stable_group_id: info.stable_group_id().to_string(),
             shared_secret: info.shared_secret.clone(),
             secret_epoch: info.secret_epoch,
             active_members,
+            member_roles,
+            write_access: info.policy.write_access,
+        }
+    }
+
+    fn authorizes_writer(&self, agent: &AgentId) -> bool {
+        match self.write_access {
+            GroupWriteAccess::MembersOnly => self.active_members.contains(agent),
+            GroupWriteAccess::AdminOnly => self
+                .member_roles
+                .get(agent)
+                .is_some_and(|role| role.at_least(GroupRole::Admin)),
+            GroupWriteAccess::ModeratedPublic => false,
         }
     }
 }
@@ -348,7 +367,9 @@ impl GssKvSecureContext {
         let next = GssState::from_group(info);
         let changed = state.shared_secret != next.shared_secret
             || state.secret_epoch != next.secret_epoch
-            || state.active_members != next.active_members;
+            || state.active_members != next.active_members
+            || state.member_roles != next.member_roles
+            || state.write_access != next.write_access;
         if changed {
             tracing::debug!(
                 target: "x0x::kv",
@@ -471,10 +492,14 @@ impl KvSecureContext for GssKvSecureContext {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.active_members.contains(&signing.agent_id) {
+        let authorized = if kind == KvMutationKind::Control {
+            state.active_members.contains(&signing.agent_id)
+        } else {
+            state.authorizes_writer(&signing.agent_id)
+        };
+        if !authorized {
             return Err(KvError::SecureRecord(
-                "encrypted publication refused: signing author is not an active group member"
-                    .to_string(),
+                "encrypted publication refused by current member/write policy".to_string(),
             ));
         }
         seal_mutation_with_snapshot(
@@ -535,6 +560,13 @@ impl KvSecureContext for GssKvSecureContext {
             .contains(agent)
     }
 
+    fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authorizes_writer(agent)
+    }
+
     fn invalidate(&self) {
         let mut state = self
             .state
@@ -550,6 +582,7 @@ impl KvSecureContext for GssKvSecureContext {
         }
         state.shared_secret = None;
         state.active_members.clear();
+        state.member_roles.clear();
     }
 }
 

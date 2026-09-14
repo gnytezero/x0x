@@ -549,7 +549,7 @@ impl KvStoreSync {
                     bincode::deserialize::<KvStore>(mutation_payload)
                         .map_err(|e| KvError::Gossip(format!("bad retained group image: {e}")))
                         .and_then(|image| {
-                            target.merge_group_signed_image(&image, mutation.author_id)
+                            target.merge_group_retained_image(&image, mutation.author_id)
                         })
                 }
             }
@@ -601,7 +601,7 @@ impl KvStoreSync {
         };
         if !matches!(
             mutation.kind,
-            KvMutationKind::Delta | KvMutationKind::FullState
+            KvMutationKind::Delta | KvMutationKind::FullState | KvMutationKind::RetainedState
         ) {
             tracing::warn!(
                 "rejected sealed main-topic record for store {store_id}: wrong kind {:?}",
@@ -609,26 +609,30 @@ impl KvStoreSync {
             );
             return false;
         }
-        // Membership IS the v1 write rule — enforce before merge, with the
-        // verified author identity (never the transport sender).
-        if !ctx.is_active_member(&mutation.author_id) {
+        if !ctx.is_authorized_writer(&mutation.author_id) {
             tracing::warn!(
-                "rejected sealed record for store {store_id}: author {} is not an active group member",
+                "rejected sealed record for store {store_id}: author {} is not a current authorized writer",
                 hex::encode(mutation.author_id.as_bytes())
             );
             return false;
         }
-        let delta: KvStoreDelta = match bincode::deserialize(&mutation.payload) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    "rejected sealed record for store {store_id}: bad delta payload: {e}"
-                );
-                return false;
-            }
-        };
         let mut s = store.write().await;
-        match s.merge_delta(&delta, sender_peer, Some(&mutation.author_id)) {
+        let result = if mutation.kind == KvMutationKind::RetainedState {
+            if mutation.payload.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
+                Err(KvError::Gossip(
+                    "retained encrypted group image exceeds size limit".to_string(),
+                ))
+            } else {
+                bincode::deserialize::<KvStore>(&mutation.payload)
+                    .map_err(|e| KvError::Gossip(format!("bad retained encrypted image: {e}")))
+                    .and_then(|image| s.merge_group_retained_image(&image, mutation.author_id))
+            }
+        } else {
+            bincode::deserialize::<KvStoreDelta>(&mutation.payload)
+                .map_err(|e| KvError::Gossip(format!("bad sealed delta payload: {e}")))
+                .and_then(|delta| s.merge_delta(&delta, sender_peer, Some(&mutation.author_id)))
+        };
+        match result {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!("failed to merge sealed delta for store {store_id}: {e}");
@@ -650,9 +654,14 @@ impl KvStoreSync {
         if let Some(refresh) = refresh {
             refresh().await;
         }
-        if matches!(msg, KvSyncMessage::StateRequest { .. })
-            && !ctx.is_authorized_reader(&signing.agent_id)
-        {
+        let authorized = match msg {
+            KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&signing.agent_id),
+            KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
+                ctx.is_authorized_writer(&signing.agent_id)
+            }
+            KvSyncMessage::OwnerAnnounce { .. } => false,
+        };
+        if !authorized {
             return None;
         }
         let payload = bincode::serialize(msg).ok()?;
@@ -697,14 +706,21 @@ impl KvStoreSync {
             );
             return None;
         }
-        if !ctx.is_active_member(&mutation.author_id) {
+        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload).ok()?;
+        let authorized = match &msg {
+            KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&mutation.author_id),
+            KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
+                ctx.is_authorized_writer(&mutation.author_id)
+            }
+            KvSyncMessage::OwnerAnnounce { .. } => false,
+        };
+        if !authorized {
             tracing::warn!(
-                "rejected sealed control message for store {store_id}: author {} is not an active group member",
+                "rejected sealed control message for store {store_id}: author {} is not authorized for this control kind",
                 hex::encode(mutation.author_id.as_bytes())
             );
             return None;
         }
-        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload).ok()?;
         Some((mutation.author_id, msg))
     }
 
@@ -947,7 +963,7 @@ impl KvStoreSync {
             let s = store.read().await;
             let local_is_owner =
                 self.local_agent_id.is_some() && s.owner() == self.local_agent_id.as_ref();
-            store_is_group_signed || !local_is_owner || s.is_empty()
+            store_is_encrypted || store_is_group_signed || !local_is_owner || s.is_empty()
         };
         // Defense in depth against cross-topic replay: the v2 signature covers
         // the embedded topic, but pub/sub delivery does not re-check it against
@@ -1188,6 +1204,7 @@ impl KvStoreSync {
         let responder_signing = self.author_signing.clone();
         let responder_is_encrypted = store_is_encrypted;
         let responder_is_group_signed = store_is_group_signed;
+        let responder_uses_retained = responder_is_encrypted || responder_is_group_signed;
         let responder_store_id = { *self.store.read().await.id() };
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
@@ -1254,7 +1271,7 @@ impl KvStoreSync {
                         // joiners can refresh policy / confirm ownership.
                         // (Ownership itself is never learned from this — a
                         // joiner anchors its owner at construction.)
-                        let announce = if responder_is_group_signed {
+                        let announce = if responder_secure.is_some() {
                             None
                         } else {
                             let s = responder_store.read().await;
@@ -1356,16 +1373,14 @@ impl KvStoreSync {
                                 local_agent_id.is_some() && s.owner() == local_agent_id.as_ref();
                             let cp =
                                 (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
-                            let has_payload = if responder_is_group_signed {
+                            let has_payload = if responder_uses_retained {
                                 s.has_retained_group_history()
                             } else {
                                 !s.is_empty() || s.latest_checkpoint.is_some()
                             };
-                            let full = (has_payload && !cooled_down && !responder_is_group_signed)
+                            let full = (has_payload && !cooled_down && !responder_uses_retained)
                                 .then(|| s.full_delta());
-                            let retained = if has_payload
-                                && !cooled_down
-                                && responder_is_group_signed
+                            let retained = if has_payload && !cooled_down && responder_uses_retained
                             {
                                 match serialize_retained_group_image(&s) {
                                     Ok(bytes) => Some(bytes),
@@ -1392,6 +1407,26 @@ impl KvStoreSync {
                         if let Some(retained) = retained {
                             let serialized =
                                 match (responder_secure.as_ref(), responder_signing.as_ref()) {
+                                    (Some(ctx), Some(signing)) if responder_is_encrypted => {
+                                        if let Some(refresh) = responder_refresh.as_ref() {
+                                            refresh().await;
+                                        }
+                                        ctx.seal_authorized(
+                                            signing,
+                                            KvMutationKind::RetainedState,
+                                            &responder_store_id,
+                                            &retained,
+                                        )
+                                        .and_then(
+                                            |record| {
+                                                encode_delta(local_peer_id, &record).map_err(|e| {
+                                                    KvError::Gossip(format!(
+                                                        "sealed retained image encode failed: {e}"
+                                                    ))
+                                                })
+                                            },
+                                        )
+                                    }
                                     (Some(ctx), Some(signing)) => {
                                         Self::sign_publication(
                                             &responder_store,
@@ -3154,6 +3189,155 @@ mod tests {
         sync
     }
 
+    #[tokio::test]
+    async fn encrypted_controls_separate_reader_requests_from_writer_evidence() {
+        let owner_keypair = AgentKeypair::generate().expect("owner keypair");
+        let reader_keypair = AgentKeypair::generate().expect("reader keypair");
+        let owner = owner_keypair.agent_id();
+        let reader = reader_keypair.agent_id();
+        let (mut info, contexts, _) = encrypted_group(&[owner, reader]);
+        info.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        for context in &contexts {
+            context.update_from_group(&info);
+        }
+        let context = contexts[1].clone() as SharedKvSecureContext;
+        let signing = Arc::new(AuthorSigning::from_keypair(&reader_keypair).expect("signing"));
+        let id = store_id(12);
+        let request = KvSyncMessage::StateRequest { requester: peer(2) };
+        let request_bytes =
+            KvStoreSync::seal_control_message(&context, None, &signing, &id, peer(2), &request)
+                .await
+                .expect("active nonwriter may request encrypted state");
+        assert!(
+            KvStoreSync::open_control_message(&context, None, &id, &request_bytes)
+                .await
+                .is_some()
+        );
+
+        let evidence = KvSyncMessage::StateServedV2 {
+            responder: peer(2),
+            digest: [0; 32],
+            entry_count: 0,
+        };
+        assert!(
+            KvStoreSync::seal_control_message(&context, None, &signing, &id, peer(2), &evidence,)
+                .await
+                .is_none(),
+            "nonwriter cannot endorse retained state"
+        );
+        let owner_announce = KvSyncMessage::OwnerAnnounce {
+            owner,
+            policy: AccessPolicy::Signed,
+            policy_version: u64::MAX,
+        };
+        assert!(
+            KvStoreSync::seal_control_message(
+                &context,
+                None,
+                &signing,
+                &id,
+                peer(2),
+                &owner_announce,
+            )
+            .await
+            .is_none(),
+            "group stores never publish legacy owner authority"
+        );
+
+        // A current member can bypass the local semantic helper and produce
+        // a cryptographically valid Control record. Receive admission still
+        // rejects writer evidence and legacy authority by decoded kind.
+        for message in [evidence, owner_announce] {
+            let payload = bincode::serialize(&message).expect("control payload");
+            let record = context
+                .seal_authorized(&signing, KvMutationKind::Control, &id, &payload)
+                .expect("valid member control envelope");
+            let bytes = encode_delta(peer(2), &record).expect("control wire");
+            assert!(
+                KvStoreSync::open_control_message(&context, None, &id, &bytes)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_responder_serves_tombstone_only_retained_history() {
+        let node = make_node().await;
+        let keypair = AgentKeypair::generate().expect("keypair");
+        let owner = keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let (_, contexts, group_id) = encrypted_group(&[owner]);
+        let context = contexts[0].clone();
+        let id = store_id(13);
+        let mut store = KvStore::new_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group_id,
+            context.clone() as SharedKvSecureContext,
+        )
+        .expect("encrypted store");
+        store
+            .put(
+                "gone".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store.remove("gone").expect("remove");
+        assert!(store.is_empty());
+        assert!(store.has_retained_group_history());
+
+        let mut sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            "group/private/home".to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("sync");
+        sync.set_secure_context(context.clone(), None);
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("signing"));
+        sync.set_author_signing((*signing).clone());
+        let mut main_probe = pubsub.subscribe("group/private/home".to_string()).await;
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request = KvSyncMessage::StateRequest { requester: peer(9) };
+        let request_bytes = KvStoreSync::seal_control_message(
+            &(context.clone() as SharedKvSecureContext),
+            None,
+            &signing,
+            &id,
+            peer(9),
+            &request,
+        )
+        .await
+        .expect("sealed request");
+        pubsub
+            .publish(
+                "group/private/home/state-sync".to_string(),
+                bytes::Bytes::from(request_bytes),
+            )
+            .await
+            .expect("publish request");
+
+        let response = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+            .await
+            .expect("retained response timeout")
+            .expect("retained response");
+        let (_, record) =
+            decode_delta::<EncryptedKvStoreRecordV1>(&response.payload).expect("decode envelope");
+        let mutation = open_mutation(context.as_ref(), &id, &record).expect("open response");
+        assert_eq!(mutation.kind, KvMutationKind::RetainedState);
+        let image: KvStore = bincode::deserialize(&mutation.payload).expect("retained image");
+        assert!(image.is_empty());
+        assert!(image.has_retained_group_history());
+        sync.stop().await.expect("stop");
+    }
+
     async fn wait_for_key(sync: &KvStoreSync, key: &str) -> bool {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3224,7 +3408,7 @@ mod tests {
         .await
         .expect_err("removed signer must not produce a sealed payload");
         assert!(
-            matches!(err, KvError::SecureRecord(message) if message.contains("not an active group member"))
+            matches!(err, KvError::SecureRecord(message) if message.contains("current member/write policy"))
         );
     }
 
@@ -3274,7 +3458,7 @@ mod tests {
         .await
         .expect_err("refresh-removal must block the publication");
         assert!(
-            matches!(err, KvError::SecureRecord(message) if message.contains("not an active group member"))
+            matches!(err, KvError::SecureRecord(message) if message.contains("current member/write policy"))
         );
         assert!(!shared.is_active_member(&a));
     }

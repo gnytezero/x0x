@@ -1236,7 +1236,7 @@ impl KvStore {
                 // yet) this stays fail-closed (#341 Phase A).
                 self.secure
                     .as_ref()
-                    .is_some_and(|ctx| ctx.is_active_member(agent_id))
+                    .is_some_and(|ctx| ctx.is_authorized_writer(agent_id))
             }
             AccessPolicy::AppendOnly => {
                 // Owner-only writes, exactly like Signed. Immutability of
@@ -1299,9 +1299,9 @@ impl KvStore {
                 // therefore local removes through the handle layer) was
                 // unconditionally permissive on a reserved Encrypted store.
                 match self.secure.as_ref() {
-                    Some(ctx) if ctx.is_active_member(writer) => Ok(()),
+                    Some(ctx) if ctx.is_authorized_writer(writer) => Ok(()),
                     Some(_) => Err(KvError::Unauthorized(format!(
-                        "encrypted store: writer {} is not an active member of group {}",
+                        "encrypted store: writer {} is not an authorized writer in group {}",
                         hex::encode(writer.as_bytes()),
                         hex::encode(group_id)
                     ))),
@@ -1407,17 +1407,17 @@ impl KvStore {
             // reserved fail-closed state — loudly, and never `OwnerUnknown`
             // (this is not an ownership issue).
             return match self.secure.as_ref() {
-                Some(ctx) if ctx.is_active_member(writer) => Ok(()),
+                Some(ctx) if ctx.is_authorized_writer(writer) => Ok(()),
                 Some(_) => {
                     tracing::warn!(
                         target: "x0x::kv",
-                        "refused local write by {} on encrypted store {} (group_id {}) — writer is not an active group member",
+                        "refused local write by {} on encrypted store {} (group_id {}) — writer is not authorized by the current group policy",
                         hex::encode(writer.as_bytes()),
                         self.id,
                         hex::encode(group_id)
                     );
                     Err(KvError::Unauthorized(format!(
-                        "encrypted store: writer {} is not an active member of group {}",
+                        "encrypted store: writer {} is not an authorized writer in group {}",
                         hex::encode(writer.as_bytes()),
                         hex::encode(group_id)
                     )))
@@ -2553,9 +2553,13 @@ impl KvStore {
         if self.id != other.id {
             return Err(KvError::StoreIdMismatch);
         }
-        if self.is_group_signed() || other.is_group_signed() {
+        if self.is_group_signed()
+            || other.is_group_signed()
+            || self.is_encrypted()
+            || other.is_encrypted()
+        {
             return Err(KvError::Merge(
-                "group-signed stores require an authenticated retained-image merge".to_string(),
+                "group stores require an authenticated retained-image merge".to_string(),
             ));
         }
 
@@ -2608,9 +2612,9 @@ impl KvStore {
         Ok(())
     }
 
-    /// Merge a fully retained public-group CRDT image after its current
-    /// endorser has been authenticated by the sync layer.
-    pub(crate) fn merge_group_signed_image(
+    /// Merge a fully retained group CRDT image after its current endorser has
+    /// been authenticated by the sync layer.
+    pub(crate) fn merge_group_retained_image(
         &mut self,
         other: &KvStore,
         endorser: AgentId,
@@ -2618,13 +2622,17 @@ impl KvStore {
         let same_binding = self.id == other.id
             && self.owner == other.owner
             && self.name.get() == other.name.get()
-            && matches!(
-                (&self.policy, &other.policy),
+            && match (&self.policy, &other.policy) {
                 (
                     AccessPolicy::GroupSigned { group_id: ours },
-                    AccessPolicy::GroupSigned { group_id: theirs }
-                ) if ours == theirs
-            );
+                    AccessPolicy::GroupSigned { group_id: theirs },
+                )
+                | (
+                    AccessPolicy::Encrypted { group_id: ours },
+                    AccessPolicy::Encrypted { group_id: theirs },
+                ) => ours == theirs,
+                _ => false,
+            };
         if !same_binding {
             return Err(KvError::Unauthorized(
                 "retained group image has a foreign store/group/owner binding".to_string(),
@@ -3863,7 +3871,7 @@ mod tests {
 
         let endorser = agent(7);
         target
-            .merge_group_signed_image(&source, endorser)
+            .merge_group_retained_image(&source, endorser)
             .expect("authenticated retained image");
 
         assert!(target.get("removed").is_none(), "OR-Set tombstone survives");
@@ -3877,6 +3885,59 @@ mod tests {
             target.policy(),
             AccessPolicy::GroupSigned { group_id } if group_id == &group
         ));
+    }
+
+    #[test]
+    fn encrypted_retained_image_preserves_removal_and_concurrent_write() {
+        let owner = agent(1);
+        let writer = agent(2);
+        let ctx = TestCtx::new(7, &[owner, writer]);
+        let id = store_id(10);
+        let group = vec![7u8; 16];
+        let mut source =
+            KvStore::new_encrypted(id, "Home".to_string(), owner, group.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        let mut target = source.clone();
+        source.remove("removed").expect("remove");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("concurrent");
+
+        target
+            .merge_group_retained_image(&source, writer)
+            .expect("authenticated retained image");
+        assert!(target.get("removed").is_none());
+        assert_eq!(
+            target.get("concurrent").expect("concurrent survives").value,
+            b"local"
+        );
+        assert_eq!(target.last_history_endorser(), Some(&writer));
+        assert!(matches!(
+            target.policy(),
+            AccessPolicy::Encrypted { group_id } if group_id == &group
+        ));
+
+        let mut unauthenticated = source.clone();
+        unauthenticated.allowed_writers.insert(agent(9));
+        let before = target.clone();
+        assert!(target.merge(&unauthenticated).is_err());
+        assert_eq!(target.name(), before.name());
+        assert_eq!(target.len(), before.len());
+        assert_eq!(target.allowed_writers(), before.allowed_writers());
+        assert!(target.get("concurrent").is_some());
     }
 
     #[test]
