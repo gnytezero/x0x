@@ -1529,7 +1529,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/groups/:id/stores",
         cli_name: "group store create",
-        description: "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+        description: "Open a creator-anchored group store: signed plaintext for SignedPublic, encrypted for MlsEncrypted GSS; current group policy gates writes",
         category: "stores",
         request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
     },

@@ -709,6 +709,26 @@ struct GssGroupStoreBinding {
     topic: String,
 }
 
+fn find_store_group<'a>(
+    groups: &'a std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    id: &str,
+) -> Result<(&'a String, &'a x0x::groups::GroupInfo), GroupStoreResponse> {
+    if let Some(pair) = groups.get_key_value(id) {
+        return Ok(pair);
+    }
+    let mut matches = groups
+        .iter()
+        .filter(|(_, info)| info.stable_group_id() == id);
+    let pair = matches.next().ok_or_else(|| not_found("group not found"))?;
+    if matches.next().is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "ambiguous local group binding",
+        ));
+    }
+    Ok(pair)
+}
+
 fn validate_gss_store_group(
     info: &x0x::groups::GroupInfo,
     caller: &AgentId,
@@ -748,21 +768,7 @@ fn resolve_gss_group_store(
     if name.is_empty() {
         return Err(bad_request("store name must not be empty"));
     }
-    let (group_key, info) = if let Some(pair) = groups.get_key_value(id) {
-        pair
-    } else {
-        let mut matches = groups
-            .iter()
-            .filter(|(_, info)| info.stable_group_id() == id);
-        let pair = matches.next().ok_or_else(|| not_found("group not found"))?;
-        if matches.next().is_some() {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                "ambiguous local group binding",
-            ));
-        }
-        pair
-    };
+    let (group_key, info) = find_store_group(groups, id)?;
     validate_gss_store_group(info, caller)?;
     let stable_group_id = info.stable_group_id().to_string();
     let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
@@ -773,6 +779,88 @@ fn resolve_gss_group_store(
         name: name.to_string(),
         store_id,
         topic,
+    })
+}
+
+fn resolve_public_group_store(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    id: &str,
+    name: &str,
+    _caller: &AgentId,
+) -> Result<GssGroupStoreBinding, GroupStoreResponse> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("store name must not be empty"));
+    }
+    let (group_key, info) = find_store_group(groups, id)?;
+    if info.withdrawn {
+        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    }
+    if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
+        return Err(bad_request("public stores require a SignedPublic group"));
+    }
+    if info.policy.write_access == x0x::groups::GroupWriteAccess::ModeratedPublic {
+        return Err(bad_request(
+            "ModeratedPublic group stores are unsupported without a moderation protocol",
+        ));
+    }
+    let stable_group_id = info.stable_group_id().to_string();
+    let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
+    Ok(GssGroupStoreBinding {
+        group_key: group_key.clone(),
+        stable_group_id,
+        creator: info.creator,
+        name: name.to_string(),
+        store_id,
+        topic,
+    })
+}
+
+fn refresh_public_store_binding(
+    ctx: &x0x::groups::PublicGroupKvContext,
+    info: Option<&x0x::groups::GroupInfo>,
+    creator: AgentId,
+) -> bool {
+    if let Some(info) = info {
+        if info.creator == creator
+            && info.stable_group_id().as_bytes() == ctx.group_id()
+            && !info.withdrawn
+            && info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+            && info.policy.write_access != x0x::groups::GroupWriteAccess::ModeratedPublic
+        {
+            ctx.update_from_group(info);
+            return true;
+        }
+    }
+    ctx.invalidate();
+    false
+}
+
+fn public_kv_refresh(
+    state: &Arc<AppState>,
+    ctx: Arc<x0x::groups::PublicGroupKvContext>,
+    group_key: String,
+    topic: String,
+    creator: AgentId,
+) -> x0x::kv::sync::SecureRefreshFn {
+    let state = Arc::clone(state);
+    Arc::new(move || {
+        let ctx = Arc::clone(&ctx);
+        let state = Arc::clone(&state);
+        let group_key = group_key.clone();
+        let topic = topic.clone();
+        Box::pin(async move {
+            let valid = {
+                let groups = state.named_groups.read().await;
+                refresh_public_store_binding(&ctx, groups.get(&group_key), creator)
+            };
+            if !valid {
+                tracing::warn!(target: "x0x::kv", "retiring public group store {topic}: group binding is no longer eligible");
+                if let Some(handle) = state.kv_stores.write().await.remove(&topic) {
+                    handle.retire();
+                }
+            }
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     })
 }
 
@@ -902,7 +990,12 @@ async fn open_bound_gss_store(
     let cached = { state.kv_stores.read().await.get(&expected.topic).cloned() };
     if let Some(handle) = cached {
         if handle
-            .validate_group_binding(&expected.name, &expected.stable_group_id, expected.creator)
+            .validate_group_binding(
+                &expected.name,
+                &expected.stable_group_id,
+                expected.creator,
+                x0x::GroupStoreProtection::Encrypted,
+            )
             .await
             .is_err()
         {
@@ -937,6 +1030,81 @@ async fn open_bound_gss_store(
     Ok((handle, secure, true))
 }
 
+async fn open_bound_public_store(
+    state: &Arc<AppState>,
+    expected: &GssGroupStoreBinding,
+) -> Result<
+    (
+        x0x::KvStoreHandle,
+        Arc<x0x::groups::PublicGroupKvContext>,
+        bool,
+    ),
+    GroupStoreResponse,
+> {
+    let context = {
+        let groups = state.named_groups.read().await;
+        let current = resolve_public_group_store(
+            &groups,
+            &expected.group_key,
+            &expected.name,
+            &state.agent.agent_id(),
+        )?;
+        if &current != expected {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "public group store binding changed during open",
+            ));
+        }
+        let info = groups
+            .get(&current.group_key)
+            .ok_or_else(|| not_found("group not found"))?;
+        Arc::new(
+            x0x::groups::PublicGroupKvContext::from_group(info)
+                .ok_or_else(|| bad_request("group is not SignedPublic"))?,
+        )
+    };
+    if let Some(handle) = state.kv_stores.read().await.get(&expected.topic).cloned() {
+        if handle
+            .validate_group_binding(
+                &expected.name,
+                &expected.stable_group_id,
+                expected.creator,
+                x0x::GroupStoreProtection::PublicSigned,
+            )
+            .await
+            .is_ok()
+        {
+            return Ok((handle, context, false));
+        }
+        handle.retire();
+        state.kv_stores.write().await.remove(&expected.topic);
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "cached public group store binding mismatch",
+        ));
+    }
+    let refresh = public_kv_refresh(
+        state,
+        Arc::clone(&context),
+        expected.group_key.clone(),
+        expected.topic.clone(),
+        expected.creator,
+    );
+    let handle = state
+        .agent
+        .open_public_group_kv_store_persistent(
+            &expected.name,
+            &expected.stable_group_id,
+            expected.creator,
+            Arc::clone(&context) as Arc<dyn KvSecureContext>,
+            refresh,
+            &state.kv_store_state_dir,
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok((handle, context, true))
+}
+
 /// Shared metadata payload for create / idempotent re-open responses.
 async fn group_store_json(
     handle: &x0x::KvStoreHandle,
@@ -944,6 +1112,7 @@ async fn group_store_json(
     store_id: &x0x::kv::KvStoreId,
     stable_group_id: &str,
     epoch: u64,
+    policy: &str,
 ) -> serde_json::Value {
     let ownership = handle.ownership_info().await;
     serde_json::json!({
@@ -952,7 +1121,7 @@ async fn group_store_json(
         "store_id": hex::encode(store_id.as_bytes()),
         "group_id": stable_group_id,
         "topic": topic,
-        "policy": "encrypted",
+        "policy": policy,
         "epoch": epoch,
         "checkpoint_available": handle.has_checkpoint().await,
         "ownership": ownership,
@@ -981,10 +1150,21 @@ pub(in crate::server) async fn create_group_kv_store(
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<CreateGroupStoreRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let binding = {
+    let (binding, public) = {
         let groups = state.named_groups.read().await;
-        match resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id()) {
-            Ok(binding) => binding,
+        let is_public = match find_store_group(&groups, &id) {
+            Ok((_, info)) => {
+                info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+            }
+            Err(response) => return response,
+        };
+        let resolved = if is_public {
+            resolve_public_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+        } else {
+            resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+        };
+        match resolved {
+            Ok(binding) => (binding, is_public),
             Err(response) => return response,
         }
     };
@@ -1001,9 +1181,16 @@ pub(in crate::server) async fn create_group_kv_store(
     // Use the same alias-canonicalizing mutex as all group membership writers.
     let membership = super::named_groups::group_membership_lock(&state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
-    let (handle, secure, created) = match open_bound_gss_store(&state, &binding).await {
-        Ok(opened) => opened,
-        Err(response) => return response,
+    let (handle, epoch, created) = if public {
+        match open_bound_public_store(&state, &binding).await {
+            Ok((handle, context, created)) => (handle, context.current_epoch(), created),
+            Err(response) => return response,
+        }
+    } else {
+        match open_bound_gss_store(&state, &binding).await {
+            Ok((handle, context, created)) => (handle, context.current_epoch(), created),
+            Err(response) => return response,
+        }
     };
     if created {
         state
@@ -1014,7 +1201,11 @@ pub(in crate::server) async fn create_group_kv_store(
         let mut extra = serde_json::Map::new();
         extra.insert(
             "policy".into(),
-            serde_json::Value::String("encrypted".into()),
+            serde_json::Value::String(if public {
+                "group_signed".into()
+            } else {
+                "encrypted".into()
+            }),
         );
         extra.insert(
             "expected_owner".into(),
@@ -1057,7 +1248,8 @@ pub(in crate::server) async fn create_group_kv_store(
                 &binding.topic,
                 &binding.store_id,
                 &binding.stable_group_id,
-                secure.current_epoch(),
+                epoch,
+                if public { "group_signed" } else { "encrypted" },
             )
             .await,
         ),
@@ -1068,6 +1260,7 @@ pub(in crate::server) async fn create_group_kv_store(
 fn validate_gss_store_manifest(
     entry: &crdt_subscriptions::CrdtSubscriptionEntry,
     binding: &GssGroupStoreBinding,
+    expected_policy: &str,
 ) -> Result<(), GroupStoreResponse> {
     if entry.id != binding.topic
         || entry.topic != binding.topic
@@ -1080,7 +1273,7 @@ fn validate_gss_store_manifest(
             .and_then(|v| v.as_str())
             .and_then(|owner| parse_agent_id_hex(owner).ok())
             != Some(binding.creator)
-        || entry.extra.get("policy").and_then(|v| v.as_str()) != Some("encrypted")
+        || entry.extra.get("policy").and_then(|v| v.as_str()) != Some(expected_policy)
     {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -1102,14 +1295,29 @@ pub(in crate::server) async fn restore_bound_gss_store(
         .get("stable_group_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("encrypted store manifest has no stable group ID"))?;
+    let public = entry.extra.get("policy").and_then(|v| v.as_str()) == Some("group_signed");
     let binding = {
         let groups = state.named_groups.read().await;
-        resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+        if public {
+            resolve_public_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+        } else {
+            resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+        }
     };
-    validate_gss_store_manifest(entry, &binding)?;
+    validate_gss_store_manifest(
+        entry,
+        &binding,
+        if public { "group_signed" } else { "encrypted" },
+    )?;
     let membership = super::named_groups::group_membership_lock(state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
-    let (handle, _, created) = open_bound_gss_store(state, &binding).await?;
+    let (handle, created) = if public {
+        let (handle, _, created) = open_bound_public_store(state, &binding).await?;
+        (handle, created)
+    } else {
+        let (handle, _, created) = open_bound_gss_store(state, &binding).await?;
+        (handle, created)
+    };
     if created {
         state
             .kv_stores
@@ -1284,7 +1492,7 @@ mod tests {
                 ),
             ]),
         };
-        assert!(validate_gss_store_manifest(&good, &binding).is_ok());
+        assert!(validate_gss_store_manifest(&good, &binding, "encrypted").is_ok());
         let mut hex_binding = binding.clone();
         hex_binding.creator = AgentId([0xab; 32]);
         let mut upper_owner = good.clone();
@@ -1293,7 +1501,7 @@ mod tests {
             serde_json::Value::String("AB".repeat(32)),
         );
         assert!(
-            validate_gss_store_manifest(&upper_owner, &hex_binding).is_ok(),
+            validate_gss_store_manifest(&upper_owner, &hex_binding, "encrypted").is_ok(),
             "preserve parsed owner-ID spelling compatibility"
         );
         for case in 0..6 {
@@ -1321,7 +1529,7 @@ mod tests {
                 _ => entry.name = " Wiki ".into(),
             }
             assert!(
-                validate_gss_store_manifest(&entry, &binding).is_err(),
+                validate_gss_store_manifest(&entry, &binding, "encrypted").is_err(),
                 "case {case}"
             );
         }
@@ -1608,7 +1816,7 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::FORBIDDEN, "{resp:?}");
 
-        // SignedPublic group -> 400 (encrypted stores need a confidential group).
+        // SignedPublic group -> creator-anchored group-signed store.
         let signed_key = "ef".repeat(16);
         {
             let mut info = GroupInfo::new(
@@ -1634,7 +1842,8 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "{resp:?}");
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        assert_eq!(resp.0["policy"], "group_signed");
 
         // TreeKEM-plane group -> 400 (v1 encrypted stores are GSS-backed).
         let treekem_key = "12".repeat(16);

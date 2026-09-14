@@ -52,6 +52,10 @@ pub const ENCRYPTED_RECORD_DOMAIN: &[u8] = b"x0x.kv.encrypted-record.v1";
 /// Domain-separation tag for the inner signed mutation bytes.
 pub const SIGNED_MUTATION_DOMAIN: &[u8] = b"x0x.kv.signed-mutation.v1";
 
+/// Prefix that distinguishes public group payloads carrying a roster-policy
+/// commitment from encrypted v1 mutation payloads.
+const PUBLIC_AUTHORIZATION_DOMAIN: &[u8] = b"x0x.kv.public-authorization.v1";
+
 /// Key-derivation domain for the store-scoped AEAD key. Deliberately
 /// distinct from the group-message derivation (`x0x.group.secure`), so a
 /// store record's key can never equal a secure-group message key even for
@@ -75,6 +79,10 @@ pub enum KvMutationKind {
     /// A state-sync control message (`KvSyncMessage` bytes) on the
     /// `/state-sync` side topic.
     Control = 2,
+    /// A complete serialized [`crate::kv::KvStore`] CRDT image. Unlike
+    /// `FullState`, this retains OR-Set removals and merges with concurrent
+    /// local state.
+    RetainedState = 3,
 }
 
 /// Outer gossip envelope for an encrypted store record.
@@ -146,6 +154,7 @@ impl SignedKvMutation {
             KvMutationKind::Delta => 0,
             KvMutationKind::FullState => 1,
             KvMutationKind::Control => 2,
+            KvMutationKind::RetainedState => 3,
         });
         lp(&mut buf, &self.payload);
         buf
@@ -274,6 +283,34 @@ pub trait KvSecureContext: Send + Sync {
     /// write rule for encrypted stores.
     fn is_active_member(&self, agent: &AgentId) -> bool;
 
+    /// Whether `agent` may currently write under the group's role policy.
+    /// Encrypted v1 defaults to active membership.
+    fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+        self.is_active_member(agent)
+    }
+
+    /// Current public roster/policy commitment. Encrypted contexts have no
+    /// plaintext authorization binding and return `None`.
+    fn authorization_binding(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Atomically admit an author and sign a plaintext group mutation from
+    /// one roster/epoch snapshot. Public contexts override this; encrypted
+    /// contexts fail closed.
+    fn sign_authorized(
+        &self,
+        signing: &AuthorSigning,
+        kind: KvMutationKind,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> Result<SignedKvMutation> {
+        let _ = (signing, kind, store_id, payload);
+        Err(KvError::SecureRecord(
+            "group context lacks plaintext signing capability".to_string(),
+        ))
+    }
+
     /// Invalidate the context: the group is gone locally (this agent left,
     /// the group was removed, or its state was withdrawn).
     ///
@@ -283,6 +320,38 @@ pub trait KvSecureContext: Send + Sync {
     /// operating on a stale secret/roster snapshot. A later refresh from a
     /// REJOINED group state may re-arm the context.
     fn invalidate(&self);
+}
+
+/// Bind a public mutation payload to the exact current roster and write
+/// policy. The resulting bytes remain inside the existing signed v1 payload,
+/// preserving the encrypted mutation envelope format.
+#[must_use]
+pub(crate) fn bind_public_payload(binding: [u8; 32], payload: &[u8]) -> Vec<u8> {
+    let mut bound = Vec::with_capacity(PUBLIC_AUTHORIZATION_DOMAIN.len() + 32 + payload.len());
+    bound.extend_from_slice(PUBLIC_AUTHORIZATION_DOMAIN);
+    bound.extend_from_slice(&binding);
+    bound.extend_from_slice(payload);
+    bound
+}
+
+/// Verify and remove the current public roster/policy commitment.
+pub(crate) fn open_public_payload<'a>(
+    ctx: &dyn KvSecureContext,
+    payload: &'a [u8],
+) -> Result<&'a [u8]> {
+    let binding = ctx.authorization_binding().ok_or_else(|| {
+        KvError::SecureRecord("public authorization binding unavailable".to_string())
+    })?;
+    let prefix_len = PUBLIC_AUTHORIZATION_DOMAIN.len() + binding.len();
+    if payload.len() < prefix_len
+        || !payload.starts_with(PUBLIC_AUTHORIZATION_DOMAIN)
+        || payload[PUBLIC_AUTHORIZATION_DOMAIN.len()..prefix_len] != binding
+    {
+        return Err(KvError::SecureRecord(
+            "signed mutation roster/policy binding is stale or foreign".to_string(),
+        ));
+    }
+    Ok(&payload[prefix_len..])
 }
 
 /// The local agent's ML-DSA-65 signing material for sealed mutations.
@@ -409,18 +478,8 @@ pub(crate) fn seal_mutation_with_snapshot<F>(
 where
     F: FnOnce(&[u8]) -> Result<(u64, [u8; 24], Vec<u8>)>,
 {
-    let mut mutation = SignedKvMutation {
-        group_id: group_id.clone(),
-        store_id: *store_id.as_bytes(),
-        epoch,
-        author_id: signing.agent_id,
-        author_pubkey: signing.public_key_bytes(),
-        algorithm: SIG_ALGORITHM_ML_DSA65,
-        kind,
-        payload: payload.to_vec(),
-        signature: Vec::new(),
-    };
-    mutation.signature = signing.sign(&mutation.signing_bytes())?;
+    let mutation =
+        sign_mutation_with_snapshot(group_id.clone(), epoch, signing, kind, store_id, payload)?;
     let plaintext = bincode::serialize(&mutation)
         .map_err(|e| KvError::Gossip(format!("sealed mutation serialize failed: {e}")))?;
     let (sealed_epoch, nonce, ciphertext) = seal(&plaintext)?;
@@ -550,6 +609,64 @@ pub fn verify_mutation_author(mutation: &SignedKvMutation) -> Result<()> {
         KvError::SecureRecord(format!("author signature verification failed: {e:?}"))
     })?;
     Ok(())
+}
+
+/// Verify a plaintext group-signed mutation against current group state.
+pub fn open_signed_mutation(
+    ctx: &dyn KvSecureContext,
+    expected_store_id: &KvStoreId,
+    mutation: SignedKvMutation,
+) -> Result<SignedKvMutation> {
+    let mutation = open_signed_mutation_bound(ctx, expected_store_id, mutation)?;
+    if !ctx.is_authorized_writer(&mutation.author_id) {
+        return Err(KvError::Unauthorized(
+            "signed mutation author is not a current authorized group writer".to_string(),
+        ));
+    }
+    Ok(mutation)
+}
+
+/// Verify signature and current group/store/epoch bindings without granting
+/// content-write authority. Used only for public read-side state requests.
+pub fn open_signed_mutation_bound(
+    ctx: &dyn KvSecureContext,
+    expected_store_id: &KvStoreId,
+    mutation: SignedKvMutation,
+) -> Result<SignedKvMutation> {
+    if mutation.group_id != ctx.group_id()
+        || mutation.store_id != *expected_store_id.as_bytes()
+        || mutation.epoch != ctx.current_epoch()
+    {
+        return Err(KvError::SecureRecord(
+            "signed mutation bindings do not match current group/store/epoch".to_string(),
+        ));
+    }
+    verify_mutation_author(&mutation)?;
+    Ok(mutation)
+}
+
+/// Sign one mutation using an already captured group snapshot.
+pub(crate) fn sign_mutation_with_snapshot(
+    group_id: Vec<u8>,
+    epoch: u64,
+    signing: &AuthorSigning,
+    kind: KvMutationKind,
+    store_id: &KvStoreId,
+    payload: &[u8],
+) -> Result<SignedKvMutation> {
+    let mut mutation = SignedKvMutation {
+        group_id,
+        store_id: *store_id.as_bytes(),
+        epoch,
+        author_id: signing.agent_id,
+        author_pubkey: signing.public_key_bytes(),
+        algorithm: SIG_ALGORITHM_ML_DSA65,
+        kind,
+        payload: payload.to_vec(),
+        signature: Vec::new(),
+    };
+    mutation.signature = signing.sign(&mutation.signing_bytes())?;
+    Ok(mutation)
 }
 
 /// Deterministic store identity for a group-scoped encrypted store.

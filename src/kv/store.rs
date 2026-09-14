@@ -115,11 +115,12 @@ pub enum AccessPolicy {
     /// coordinated protocol change; document next to the discriminant pin
     /// (`access_policy_bincode_discriminants_are_pinned`).
     ///
-    /// NOTE: this variant MUST stay last — bincode encodes enum variants
-    /// positionally, and stores/checkpoints/deltas carrying `AccessPolicy`
-    /// are bincode-serialized on disk and on the wire. Inserting a variant
-    /// mid-enum would corrupt every existing store.
     SelfKeyed,
+
+    /// Public group store with creator-anchored identity and current group
+    /// role authorization. Content is plaintext but every mutation is signed.
+    /// This variant is appended to preserve every earlier bincode discriminant.
+    GroupSigned { group_id: Vec<u8> },
 }
 
 impl std::fmt::Display for AccessPolicy {
@@ -130,6 +131,7 @@ impl std::fmt::Display for AccessPolicy {
             Self::Encrypted { .. } => write!(f, "encrypted"),
             Self::AppendOnly => write!(f, "append_only"),
             Self::SelfKeyed => write!(f, "self_keyed"),
+            Self::GroupSigned { .. } => write!(f, "group_signed"),
         }
     }
 }
@@ -730,6 +732,12 @@ pub struct KvStore {
     #[serde(default, deserialize_with = "de_tolerant")]
     ownership_conflict: Option<(AgentId, AgentId)>,
 
+    /// Current writer who most recently authenticated and endorsed a retained
+    /// public-group history image. This is local import provenance; a remote
+    /// image's copy is never adopted.
+    #[serde(default, deserialize_with = "de_tolerant")]
+    last_history_endorser: Option<AgentId>,
+
     /// Monotonic sequence counter for unique OR-Set tags.
     #[serde(skip, default = "default_seq_counter")]
     seq_counter: Arc<AtomicU64>,
@@ -764,6 +772,7 @@ impl std::fmt::Debug for KvStore {
             .field("anchor_channel", &self.anchor_channel)
             .field("policy_version", &self.policy_version)
             .field("ownership_conflict", &self.ownership_conflict)
+            .field("last_history_endorser", &self.last_history_endorser)
             .field("latest_checkpoint", &self.latest_checkpoint)
             .field("highest_checkpoint_seq", &self.highest_checkpoint_seq)
             .field("secure_context_attached", &self.secure.is_some())
@@ -836,6 +845,7 @@ impl KvStore {
             anchor_channel: AnchorChannel::Creator,
             policy_version: 0,
             ownership_conflict: None,
+            last_history_endorser: None,
             latest_checkpoint: None,
             highest_checkpoint_seq: 0,
             allowed_writers: HashSet::new(),
@@ -892,6 +902,7 @@ impl KvStore {
             anchor_channel: AnchorChannel::Creator,
             policy_version: 0,
             ownership_conflict: None,
+            last_history_endorser: None,
             latest_checkpoint: None,
             highest_checkpoint_seq: 0,
             allowed_writers: HashSet::new(),
@@ -899,6 +910,25 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: Some(ctx),
         })
+    }
+
+    /// Create a public group-signed store with an attached current-policy context.
+    pub fn new_group_signed(
+        id: KvStoreId,
+        name: String,
+        owner: AgentId,
+        group_id: Vec<u8>,
+        ctx: Arc<dyn KvSecureContext>,
+    ) -> Result<Self> {
+        if ctx.group_id() != group_id {
+            return Err(KvError::Unauthorized(
+                "group context binding mismatch".to_string(),
+            ));
+        }
+        let mut store = Self::new(id, name, owner, AccessPolicy::Signed)?;
+        store.policy = AccessPolicy::GroupSigned { group_id };
+        store.secure = Some(ctx);
+        Ok(store)
     }
 
     /// Attach (or replace) the secure context on an `Encrypted` replica.
@@ -914,10 +944,15 @@ impl KvStore {
     /// [`KvError::EncryptedPolicyReserved`] if the store is not
     /// `Encrypted`; [`KvError::Unauthorized`] on a group binding mismatch.
     pub fn set_secure_context(&mut self, ctx: Arc<dyn KvSecureContext>) -> Result<()> {
-        let AccessPolicy::Encrypted { group_id } = &self.policy else {
-            return Err(KvError::EncryptedPolicyReserved {
-                group_id: Vec::new(),
-            });
+        let group_id = match &self.policy {
+            AccessPolicy::Encrypted { group_id } | AccessPolicy::GroupSigned { group_id } => {
+                group_id
+            }
+            _ => {
+                return Err(KvError::EncryptedPolicyReserved {
+                    group_id: Vec::new(),
+                });
+            }
         };
         if ctx.group_id() != *group_id {
             return Err(KvError::Unauthorized(format!(
@@ -940,6 +975,11 @@ impl KvStore {
     #[must_use]
     pub fn is_encrypted(&self) -> bool {
         matches!(self.policy, AccessPolicy::Encrypted { .. })
+    }
+
+    #[must_use]
+    pub fn is_group_signed(&self) -> bool {
+        matches!(self.policy, AccessPolicy::GroupSigned { .. })
     }
 
     /// Force-build a live replica carrying the reserved
@@ -998,6 +1038,7 @@ impl KvStore {
             anchor_channel: channel,
             policy_version: 0,
             ownership_conflict: None,
+            last_history_endorser: None,
             latest_checkpoint: None,
             highest_checkpoint_seq: 0,
             allowed_writers: HashSet::new(),
@@ -1026,6 +1067,7 @@ impl KvStore {
             anchor_channel: AnchorChannel::Persistence,
             policy_version: 0,
             ownership_conflict: None,
+            last_history_endorser: None,
             latest_checkpoint: None,
             highest_checkpoint_seq: 0,
             allowed_writers: HashSet::new(),
@@ -1164,6 +1206,15 @@ impl KvStore {
         self.entries.is_empty()
     }
 
+    /// Whether a group-signed retained-state response has causal history to
+    /// serve. An active-empty store can still carry OR-Set tombstones after
+    /// its last key was removed; any mutation advances `version`, so version
+    /// zero is the only history-free state.
+    #[must_use]
+    pub(crate) fn has_retained_group_history(&self) -> bool {
+        !self.is_empty() || self.version > 0
+    }
+
     /// Check if an agent is authorized to write to this store.
     #[must_use]
     pub fn is_authorized(&self, agent_id: &AgentId) -> bool {
@@ -1200,6 +1251,10 @@ impl KvStore {
                 // mutation paths use `authorize_write` / `is_authorized_for_key`.
                 false
             }
+            AccessPolicy::GroupSigned { .. } => self
+                .secure
+                .as_ref()
+                .is_some_and(|ctx| ctx.is_authorized_writer(agent_id)),
         }
     }
 
@@ -1255,6 +1310,17 @@ impl KvStore {
                     }),
                 }
             }
+            AccessPolicy::GroupSigned { group_id } => match self.secure.as_ref() {
+                Some(ctx) if ctx.is_authorized_writer(writer) => Ok(()),
+                Some(_) => Err(KvError::Unauthorized(format!(
+                    "group-signed store: writer {} is not authorized for group {}",
+                    hex::encode(writer.as_bytes()),
+                    hex::encode(group_id)
+                ))),
+                None => Err(KvError::Unauthorized(
+                    "group-signed store has no current group context".to_string(),
+                )),
+            },
             AccessPolicy::SelfKeyed => {
                 if self.is_authorized_for_key(writer, key) {
                     Ok(())
@@ -1368,6 +1434,19 @@ impl KvStore {
                         group_id: group_id.clone(),
                     })
                 }
+            };
+        }
+        if let AccessPolicy::GroupSigned { group_id } = &self.policy {
+            return match self.secure.as_ref() {
+                Some(ctx) if ctx.is_authorized_writer(writer) => Ok(()),
+                Some(_) => Err(KvError::Unauthorized(format!(
+                    "group-signed store: writer {} is not authorized for group {}",
+                    hex::encode(writer.as_bytes()),
+                    hex::encode(group_id)
+                ))),
+                None => Err(KvError::Unauthorized(
+                    "group-signed store has no current group context".to_string(),
+                )),
             };
         }
         if matches!(self.policy, AccessPolicy::SelfKeyed) {
@@ -2503,6 +2582,53 @@ impl KvStore {
         self.name.merge(&other.name);
         self.version += 1;
         Ok(())
+    }
+
+    /// Merge a fully retained public-group CRDT image after its current
+    /// endorser has been authenticated by the sync layer.
+    pub(crate) fn merge_group_signed_image(
+        &mut self,
+        other: &KvStore,
+        endorser: AgentId,
+    ) -> Result<()> {
+        let same_binding = self.id == other.id
+            && self.owner == other.owner
+            && self.name.get() == other.name.get()
+            && matches!(
+                (&self.policy, &other.policy),
+                (
+                    AccessPolicy::GroupSigned { group_id: ours },
+                    AccessPolicy::GroupSigned { group_id: theirs }
+                ) if ours == theirs
+            );
+        if !same_binding {
+            return Err(KvError::Unauthorized(
+                "retained group image has a foreign store/group/owner binding".to_string(),
+            ));
+        }
+        self.keys
+            .merge_state(&other.keys)
+            .map_err(|e| KvError::Merge(format!("OR-Set image merge failed: {e}")))?;
+        for (key, entry) in &other.entries {
+            if let Some(local) = self.entries.get_mut(key) {
+                local.merge(entry);
+            } else {
+                self.entries.insert(key.clone(), entry.clone());
+            }
+        }
+        // Remote images contribute retained content only. Identity, policy,
+        // checkpoint authority, allowlists, and local sequence state remain
+        // locally anchored.
+        self.last_history_endorser = Some(endorser);
+        self.version = self.version.saturating_add(1);
+        Ok(())
+    }
+
+    /// Current writer who authenticated the most recently imported retained
+    /// history image. This does not claim authorship of historical entries.
+    #[must_use]
+    pub fn last_history_endorser(&self) -> Option<&AgentId> {
+        self.last_history_endorser.as_ref()
     }
 
     /// Generate a delta containing all state (for initial sync).
@@ -3680,6 +3806,53 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
         }
+    }
+
+    #[test]
+    fn group_signed_retained_image_preserves_removal_and_concurrent_write() {
+        let owner = agent(1);
+        let writer = agent(2);
+        let ctx = TestCtx::new(7, &[owner, writer]);
+        let id = store_id(8);
+        let group = vec![7u8; 16];
+        let mut source =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        let mut target = source.clone();
+        source.remove("removed").expect("remove");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("concurrent");
+
+        let endorser = agent(7);
+        target
+            .merge_group_signed_image(&source, endorser)
+            .expect("authenticated retained image");
+
+        assert!(target.get("removed").is_none(), "OR-Set tombstone survives");
+        assert_eq!(
+            target.get("concurrent").expect("concurrent survives").value,
+            b"local"
+        );
+        assert_eq!(target.owner(), Some(&owner));
+        assert_eq!(target.last_history_endorser(), Some(&endorser));
+        assert!(matches!(
+            target.policy(),
+            AccessPolicy::GroupSigned { group_id } if group_id == &group
+        ));
     }
 
     #[test]
@@ -5765,8 +5938,8 @@ mod tests {
         // WHY: AccessPolicy is bincode-encoded positionally in persisted
         // stores, checkpoints (wire + signing bytes), and deltas. If anyone
         // reorders or inserts a variant mid-enum, every existing store
-        // corrupts. This test pins the exact on-wire indices 0..=4.
-        let cases: [(AccessPolicy, u32); 5] = [
+        // corrupts. This test pins the exact on-wire indices 0..=5.
+        let cases: [(AccessPolicy, u32); 6] = [
             (AccessPolicy::Signed, 0),
             (AccessPolicy::Allowlisted, 1),
             (
@@ -5777,6 +5950,12 @@ mod tests {
             ),
             (AccessPolicy::AppendOnly, 3),
             (AccessPolicy::SelfKeyed, 4),
+            (
+                AccessPolicy::GroupSigned {
+                    group_id: Vec::new(),
+                },
+                5,
+            ),
         ];
         for (policy, index) in cases {
             let bytes = bincode::serialize(&policy).expect("serialize");

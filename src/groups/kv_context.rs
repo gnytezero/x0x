@@ -28,11 +28,11 @@
 //! effect on the next record, and a removed member fails the membership
 //! check on its next write attempt.
 
-use super::GroupInfo;
+use super::{GroupConfidentiality, GroupInfo, GroupRole, GroupWriteAccess};
 use crate::identity::AgentId;
 use crate::kv::encrypted::{
-    encrypted_record_aad, seal_mutation_with_snapshot, store_record_key, AuthorSigning,
-    EncryptedKvStoreRecordV1, KvMutationKind, KvSecureContext,
+    bind_public_payload, encrypted_record_aad, seal_mutation_with_snapshot, store_record_key,
+    AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, KvSecureContext,
 };
 use crate::kv::{KvError, KvStoreId, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -72,6 +72,195 @@ fn agent_from_hex(hex_str: &str) -> Option<AgentId> {
         Some(AgentId(arr))
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PublicState {
+    stable_group_id: String,
+    state_revision: u64,
+    roster_root: String,
+    write_access: GroupWriteAccess,
+    writers: std::collections::HashMap<AgentId, GroupRole>,
+    valid: bool,
+}
+
+impl PublicState {
+    fn from_group(info: &GroupInfo) -> Self {
+        let writers = info
+            .active_members()
+            .filter_map(|member| agent_from_hex(&member.agent_id).map(|agent| (agent, member.role)))
+            .collect();
+        Self {
+            stable_group_id: info.stable_group_id().to_string(),
+            state_revision: info.state_revision,
+            roster_root: super::compute_roster_root(&info.members_v2),
+            write_access: info.policy.write_access,
+            writers,
+            valid: !info.withdrawn
+                && info.policy.confidentiality == GroupConfidentiality::SignedPublic,
+        }
+    }
+
+    fn authorizes(&self, agent: &AgentId) -> bool {
+        if !self.valid {
+            return false;
+        }
+        match self.write_access {
+            GroupWriteAccess::MembersOnly => self.writers.contains_key(agent),
+            GroupWriteAccess::AdminOnly => self
+                .writers
+                .get(agent)
+                .is_some_and(|role| role.at_least(GroupRole::Admin)),
+            GroupWriteAccess::ModeratedPublic => false,
+        }
+    }
+
+    fn authorization_binding(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.kv.public-roster-policy.v1");
+        hasher.update(&(self.stable_group_id.len() as u64).to_le_bytes());
+        hasher.update(self.stable_group_id.as_bytes());
+        hasher.update(&self.state_revision.to_le_bytes());
+        hasher.update(self.roster_root.as_bytes());
+        hasher.update(&[match self.write_access {
+            GroupWriteAccess::MembersOnly => 0,
+            GroupWriteAccess::ModeratedPublic => 1,
+            GroupWriteAccess::AdminOnly => 2,
+        }]);
+        *hasher.finalize().as_bytes()
+    }
+}
+
+/// Current-policy authorization for a plaintext group-signed store.
+#[derive(Debug, Clone)]
+pub struct PublicGroupKvContext {
+    state: Arc<std::sync::RwLock<PublicState>>,
+}
+
+impl PublicGroupKvContext {
+    #[must_use]
+    pub fn from_group(info: &GroupInfo) -> Option<Self> {
+        (info.policy.confidentiality == GroupConfidentiality::SignedPublic).then(|| Self {
+            state: Arc::new(std::sync::RwLock::new(PublicState::from_group(info))),
+        })
+    }
+
+    pub fn update_from_group(&self, info: &GroupInfo) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if info.stable_group_id() == state.stable_group_id {
+            *state = PublicState::from_group(info);
+        }
+    }
+
+    #[must_use]
+    pub fn refresh_hook<F, Fut>(ctx: Arc<Self>, fetch_group: F) -> crate::kv::sync::SecureRefreshFn
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<GroupInfo>> + Send + 'static,
+    {
+        let fetch_group = Arc::new(fetch_group);
+        Arc::new(move || {
+            let ctx = Arc::clone(&ctx);
+            let fetch_group = Arc::clone(&fetch_group);
+            Box::pin(async move {
+                match fetch_group().await {
+                    Some(info) => ctx.update_from_group(&info),
+                    None => ctx.invalidate(),
+                }
+            })
+        })
+    }
+}
+
+impl KvSecureContext for PublicGroupKvContext {
+    fn group_id(&self) -> Vec<u8> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stable_group_id
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state_revision
+    }
+
+    fn seal(&self, _: &KvStoreId, _: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
+        Err(KvError::SecureRecord(
+            "public group context cannot encrypt".to_string(),
+        ))
+    }
+
+    fn open(&self, _: &KvStoreId, _: u64, _: &[u8; 24], _: &[u8]) -> Result<Vec<u8>> {
+        Err(KvError::SecureRecord(
+            "public group context cannot decrypt".to_string(),
+        ))
+    }
+
+    fn is_active_member(&self, agent: &AgentId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .writers
+            .contains_key(agent)
+    }
+
+    fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authorizes(agent)
+    }
+
+    fn authorization_binding(&self) -> Option<[u8; 32]> {
+        Some(
+            self.state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .authorization_binding(),
+        )
+    }
+
+    fn sign_authorized(
+        &self,
+        signing: &AuthorSigning,
+        kind: KvMutationKind,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> Result<crate::kv::encrypted::SignedKvMutation> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.authorizes(&signing.agent_id) {
+            return Err(KvError::Unauthorized(
+                "public group publication refused by current writer policy".to_string(),
+            ));
+        }
+        let payload = bind_public_payload(state.authorization_binding(), payload);
+        crate::kv::encrypted::sign_mutation_with_snapshot(
+            state.stable_group_id.as_bytes().to_vec(),
+            state.state_revision,
+            signing,
+            kind,
+            store_id,
+            &payload,
+        )
+    }
+
+    fn invalidate(&self) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .valid = false;
     }
 }
 
@@ -595,5 +784,46 @@ mod tests {
         ctx.update_from_group(&other);
         // Still bound to the original group.
         assert_eq!(ctx.group_id(), b"g-one".to_vec());
+    }
+
+    #[test]
+    fn public_context_enforces_current_role_policy_and_revision() {
+        let owner = AgentId([1; 32]);
+        let member = AgentId([2; 32]);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "public-group".to_string(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.add_member(
+            hex::encode(member.as_bytes()),
+            GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let ctx = PublicGroupKvContext::from_group(&info).expect("public context");
+        assert!(ctx.is_authorized_writer(&member));
+
+        info.policy.write_access = GroupWriteAccess::AdminOnly;
+        info.state_revision = 7;
+        ctx.update_from_group(&info);
+        assert!(!ctx.is_authorized_writer(&member));
+        assert!(ctx.is_authorized_writer(&owner));
+        assert_eq!(ctx.current_epoch(), 7);
+
+        let before = ctx.authorization_binding().expect("binding");
+        info.members_v2.remove(&hex::encode(member.as_bytes()));
+        // Same numeric revision with a different roster must not share a
+        // public-store authorization identity.
+        ctx.update_from_group(&info);
+        assert_eq!(ctx.current_epoch(), 7);
+        assert_ne!(ctx.authorization_binding().expect("binding"), before);
+
+        info.policy.write_access = GroupWriteAccess::ModeratedPublic;
+        ctx.update_from_group(&info);
+        assert!(!ctx.is_authorized_writer(&owner));
     }
 }
