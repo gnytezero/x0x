@@ -38,8 +38,6 @@ import logging
 import os
 import queue
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -48,6 +46,8 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
@@ -225,72 +225,6 @@ class X0xClient:
             },
         )
         return urllib.request.urlopen(req, timeout=timeout)
-
-
-# ─── SSH tunnel manager ────────────────────────────────────────────────
-
-
-@dataclass
-class TunnelHandle:
-    process: subprocess.Popen
-    local_port: int
-    pid: int
-
-
-def start_ssh_tunnel(ip: str, local_port: int, remote_port: int = 13600) -> TunnelHandle:
-    """Forward local_port → remote_port (defaults to testnet API 13600)."""
-    if shutil.which("ssh") is None:
-        raise RuntimeError("ssh not on PATH")
-    cmd = [
-        "ssh", "-N",
-        "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
-        "-o", "ConnectTimeout=10",
-        "-o", "ControlMaster=no",
-        "-o", "ControlPath=none",
-        "-o", "BatchMode=yes",
-        "-o", "ServerAliveInterval=30",
-        f"root@{ip}",
-    ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    )
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{local_port}/health", timeout=2,
-            ) as resp:
-                if resp.status in (200, 401):
-                    return TunnelHandle(
-                        process=proc, local_port=local_port, pid=proc.pid,
-                    )
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                return TunnelHandle(
-                    process=proc, local_port=local_port, pid=proc.pid,
-                )
-        except Exception:
-            pass
-        if proc.poll() is not None:
-            err = (
-                proc.stderr.read().decode("utf-8", errors="replace")
-                if proc.stderr else ""
-            )
-            raise RuntimeError(f"ssh tunnel exited: {err}")
-        time.sleep(0.5)
-    proc.terminate()
-    raise RuntimeError(f"ssh tunnel to {ip}:12600 not ready in 15s")
-
-
-def stop_ssh_tunnel(t: TunnelHandle) -> None:
-    try:
-        t.process.terminate()
-        t.process.wait(timeout=5)
-    except Exception:
-        try:
-            t.process.kill()
-        except Exception:
-            pass
 
 
 # ─── result-router ─────────────────────────────────────────────────────
@@ -1186,6 +1120,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.info("anchor=%s ip=%s network=%s", args.anchor, anchor_ip, _net.name)
     log.info("opening SSH tunnel %d → %s:%d", args.local_port, anchor_ip, _net.api_port)
     tunnel = start_ssh_tunnel(anchor_ip, args.local_port, remote_port=_net.api_port)
+    log.info("SSH tunnel ready: owned_pid=%d local_port=%d", tunnel.pid, tunnel.local_port)
     try:
         client = X0xClient(
             f"http://127.0.0.1:{args.local_port}", anchor_token,
