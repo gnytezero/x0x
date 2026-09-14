@@ -447,9 +447,9 @@ async fn connect_acl_denies_unlisted_datagram_lane() {
 #[ignore = "two-agent loopback acceptor-conflict proof; binds UDP. Integration tier."]
 async fn second_concurrent_call_fails_typed_and_stop_self_heals() {
     let dir = TempDir::new().expect("tmpdir");
-    let Some((alice, bob)) = trusted_pair(&dir).await else {
-        return;
-    };
+    let (alice, bob) = trusted_pair(&dir)
+        .await
+        .expect("two-agent UDP fixture must start for the conflict proof");
 
     let mut receiver = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id());
     receiver.start().await.expect("receiver starts");
