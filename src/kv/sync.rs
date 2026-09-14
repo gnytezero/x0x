@@ -3084,15 +3084,34 @@ mod tests {
             .await
             .expect("publish request");
 
-        let response = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
-            .await
-            .expect("retained response timeout")
-            .expect("retained response");
-        let (_, mutation) = decode_delta::<SignedKvMutation>(&response.payload).expect("decode");
-        assert_eq!(mutation.kind, KvMutationKind::RetainedState);
-        let mutation = open_signed_mutation(context.as_ref(), &id, mutation).expect("verify");
-        let payload = open_public_payload(context.as_ref(), &mutation.payload).expect("binding");
-        let image: KvStore = bincode::deserialize(payload).expect("image");
+        let authorization = context.authorization_binding().expect("roster binding");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let image_bytes = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = main_probe.recv().await.expect("retained response");
+                let (_, mutation) =
+                    decode_delta::<SignedKvMutation>(&response.payload).expect("decode");
+                assert_eq!(mutation.kind, KvMutationKind::RetainedState);
+                let mutation =
+                    open_signed_mutation(context.as_ref(), &id, mutation).expect("verify");
+                let payload =
+                    open_public_payload(context.as_ref(), &mutation.payload).expect("binding");
+                if let Some(image) = assemble_retained_group_image(
+                    payload,
+                    &id,
+                    &mutation.author_id,
+                    authorization,
+                    &pages,
+                )
+                .expect("assemble retained image")
+                {
+                    break image;
+                }
+            }
+        })
+        .await
+        .expect("retained response timeout");
+        let image: KvStore = bincode::deserialize(&image_bytes).expect("image");
         assert!(image.is_empty());
         assert!(image.has_retained_group_history());
         sync.stop().await.expect("stop");
@@ -3958,15 +3977,35 @@ mod tests {
             .await
             .expect("publish request");
 
-        let response = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
-            .await
-            .expect("retained response timeout")
-            .expect("retained response");
-        let (_, record) =
-            decode_delta::<EncryptedKvStoreRecordV1>(&response.payload).expect("decode envelope");
-        let mutation = open_mutation(context.as_ref(), &id, &record).expect("open response");
-        assert_eq!(mutation.kind, KvMutationKind::RetainedState);
-        let image: KvStore = bincode::deserialize(&mutation.payload).expect("retained image");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&context.group_id());
+        hasher.update(&context.current_epoch().to_le_bytes());
+        let authorization = *hasher.finalize().as_bytes();
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let image_bytes = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = main_probe.recv().await.expect("retained response");
+                let (_, record) = decode_delta::<EncryptedKvStoreRecordV1>(&response.payload)
+                    .expect("decode envelope");
+                let mutation =
+                    open_mutation(context.as_ref(), &id, &record).expect("open response");
+                assert_eq!(mutation.kind, KvMutationKind::RetainedState);
+                if let Some(image) = assemble_retained_group_image(
+                    &mutation.payload,
+                    &id,
+                    &mutation.author_id,
+                    authorization,
+                    &pages,
+                )
+                .expect("assemble retained image")
+                {
+                    break image;
+                }
+            }
+        })
+        .await
+        .expect("retained response timeout");
+        let image: KvStore = bincode::deserialize(&image_bytes).expect("retained image");
         assert!(image.is_empty());
         assert!(image.has_retained_group_history());
         sync.stop().await.expect("stop");
