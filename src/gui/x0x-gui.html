@@ -2910,8 +2910,6 @@ function renderFeedPosts(sid){
 
 // --- Space: Wiki / Web page stores ---
 //
-// #565 STAGE 1 CONTAINMENT (interim — does NOT close #565).
-//
 // Wiki and Web used to create an ordinary Signed store from a topic alias
 // built out of the Space id ('x0x-wiki-'+sid.slice(0,16)). A Signed store is
 // owner-write / anyone-read and is NOT bound to group membership, and the
@@ -2932,9 +2930,10 @@ function renderFeedPosts(sid){
 // Legacy pages written by earlier builds stay exactly where they are. Nothing
 // here reads, copies, moves, republishes or deletes them.
 //
-// The full fix — Home/TreeKEM group stores and real collaborative
-// multi-writer sharing — is a separate backend change under independent
-// review. This patch is containment only.
+// The group opener now returns a creator-anchored shared store: SignedPublic
+// groups use signed plaintext with current roster/policy authorization, while
+// MlsEncrypted GSS groups retain encrypted group storage. Wiki/Web keep using
+// only the returned group store id; there is still no generic-store fallback.
 
 // Cache of resolved page stores, keyed `sid|app`. Values:
 //   {ok:true, id}            store is open; `id` is the daemon's identifier
@@ -3138,7 +3137,7 @@ function spacePagesUnavailable(el,reason){
 
 // --- Space: Wiki ---
 function renderSpaceWiki(el,sid){
-  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Wiki pages for this space. In a private space, pages are stored with the space's members and any member can save. In a public space, this build still keeps pages in a store held by your own device, so what you save here may not be what another member sees.</p>
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Wiki pages are shared through this space's group store. You can read them when the space's read policy allows it, and save when your current role has write permission.</p>
   <div class="row mb"><input id="wiki-slug" placeholder="Page name (e.g. getting-started)"><button class="pri" onclick="createWikiPage('${sid}')">Create Page</button></div>
   <div id="wiki-pages"></div>
   <div id="wiki-editor" style="display:none" class="mt">
@@ -3235,7 +3234,7 @@ async function editWikiPage(sid,slug){
 
 // --- Space: Web ---
 function renderSpaceWeb(el,sid){
-  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Web pages for this space. In a private space, pages are stored with the space's members and any member can save. In a public space, this build still keeps pages in a store held by your own device, so what you save here may not be what another member sees.</p>
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Web pages are shared through this space's group store. You can read them when the space's read policy allows it, and save when your current role has write permission.</p>
   <div class="row mb"><input id="web-path" placeholder="Page path (e.g. index, about)"><button class="pri" onclick="editWebPage('${sid}')">Edit Page</button></div>
   <div id="web-preview" class="card" style="min-height:200px;padding:20px">
     <div style="color:var(--tx3);text-align:center;padding:40px">Select or create a page to preview</div>

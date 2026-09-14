@@ -6,10 +6,12 @@
 use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
 use crate::identity::AgentId;
+#[cfg(test)]
+use crate::kv::encrypted::{bind_public_payload, sign_mutation_with_snapshot};
 use crate::kv::encrypted::{
-    bind_public_payload, open_mutation, open_public_payload, open_signed_mutation,
-    open_signed_mutation_bound, sign_mutation_with_snapshot, AuthorSigning,
-    EncryptedKvStoreRecordV1, KvMutationKind, SharedKvSecureContext, SignedKvMutation,
+    open_mutation, open_public_payload, open_signed_mutation, open_signed_mutation_bound,
+    AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, SharedKvSecureContext,
+    SignedKvMutation,
 };
 use crate::kv::store::{AccessPolicy, MergeOutcome};
 use crate::kv::{KvError, KvStore, KvStoreDelta, KvStoreId, Result};
@@ -735,22 +737,15 @@ impl KvStoreSync {
         if let Some(refresh) = refresh {
             refresh().await;
         }
-        if matches!(msg, KvSyncMessage::StateRequest { .. })
-            && !ctx.is_authorized_reader(&signing.agent_id)
-        {
-            return None;
-        }
         let payload = bincode::serialize(msg).ok()?;
-        let payload = bind_public_payload(ctx.authorization_binding()?, &payload);
-        let record = sign_mutation_with_snapshot(
-            ctx.group_id(),
-            ctx.current_epoch(),
-            signing,
-            KvMutationKind::Control,
-            store_id,
-            &payload,
-        )
-        .ok()?;
+        let record = ctx
+            .sign_control_authorized(
+                signing,
+                store_id,
+                &payload,
+                matches!(msg, KvSyncMessage::StateRequest { .. }),
+            )
+            .ok()?;
         encode_delta(local_peer_id, &record).ok()
     }
 

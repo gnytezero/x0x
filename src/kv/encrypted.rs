@@ -317,6 +317,22 @@ pub trait KvSecureContext: Send + Sync {
         ))
     }
 
+    /// Atomically admit a public control-message author and sign from one
+    /// roster/policy snapshot. `reader_only` permits a current reader for a
+    /// state request; other control messages require a current writer.
+    fn sign_control_authorized(
+        &self,
+        signing: &AuthorSigning,
+        store_id: &KvStoreId,
+        payload: &[u8],
+        reader_only: bool,
+    ) -> Result<SignedKvMutation> {
+        let _ = (signing, store_id, payload, reader_only);
+        Err(KvError::SecureRecord(
+            "group context lacks atomic control signing capability".to_string(),
+        ))
+    }
+
     /// Invalidate the context: the group is gone locally (this agent left,
     /// the group was removed, or its state was withdrawn).
     ///
