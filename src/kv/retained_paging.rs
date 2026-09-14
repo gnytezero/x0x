@@ -111,6 +111,38 @@ impl RetainedPagePool {
             }
             return Err(error);
         }
+        let needs_slot = !self.images.contains_key(&binding);
+        let is_new_page = match &frame {
+            RetainedPageV1::Manifest { .. } => false,
+            RetainedPageV1::Page { index, .. } => self
+                .images
+                .get(&binding)
+                .is_none_or(|pending| !pending.pages.contains_key(index)),
+        };
+        if is_new_page {
+            if let RetainedPageV1::Page { bytes, .. } = &frame {
+                let image_len = self
+                    .images
+                    .get(&binding)
+                    .map_or(0, |pending| pending.received_len)
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| {
+                        KvError::Gossip("retained page byte count overflow".to_string())
+                    })?;
+                if image_len > MAX_RETAINED_IMAGE_BYTES {
+                    return Err(KvError::Gossip(
+                        "retained page pool exceeds resource limits".to_string(),
+                    ));
+                }
+            }
+        }
+        if needs_slot || is_new_page {
+            let incoming_len = match &frame {
+                RetainedPageV1::Manifest { .. } => 0,
+                RetainedPageV1::Page { bytes, .. } => bytes.len(),
+            };
+            self.evict_superseded_for(&binding, incoming_len, needs_slot);
+        }
         if !self.images.contains_key(&binding) && self.images.len() >= MAX_INFLIGHT_IMAGES {
             return Err(KvError::Gossip(
                 "too many retained images are awaiting pages".to_string(),
@@ -216,6 +248,38 @@ impl RetainedPagePool {
             }
         }
         Ok(completed)
+    }
+
+    /// Make room for a newly arriving authenticated image from the same exact source.
+    /// Other stores, endorsers, and authorization epochs retain independent
+    /// resource custody and cannot be displaced by this binding.
+    fn evict_superseded_for(
+        &mut self,
+        binding: &RetainedPageBinding,
+        incoming_len: usize,
+        needs_slot: bool,
+    ) {
+        while (needs_slot && self.images.len() >= MAX_INFLIGHT_IMAGES)
+            || self.received_len.saturating_add(incoming_len) > MAX_INFLIGHT_BYTES
+        {
+            let oldest = self
+                .images
+                .iter()
+                .filter(|(candidate, _)| {
+                    *candidate != binding
+                        && candidate.store_id == binding.store_id
+                        && candidate.endorser == binding.endorser
+                        && candidate.authorization == binding.authorization
+                })
+                .min_by_key(|(_, pending)| pending.created)
+                .map(|(candidate, _)| candidate.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            if let Some(pending) = self.images.remove(&oldest) {
+                self.received_len = self.received_len.saturating_sub(pending.received_len);
+            }
+        }
     }
 
     fn prune(&mut self) {
@@ -658,5 +722,283 @@ mod tests {
             )
             .is_err());
         assert!(!pool.images.contains_key(&large_b));
+    }
+
+    #[test]
+    fn newer_same_authority_image_replaces_stalled_capacity_and_completes() {
+        let mut pool = RetainedPagePool::default();
+        let source = RetainedPageBinding {
+            store_id: [1; 32],
+            endorser: [2; 32],
+            authorization: [3; 32],
+            image_id: [0; 32],
+        };
+        for tag in 0..MAX_INFLIGHT_IMAGES {
+            let binding = RetainedPageBinding {
+                image_id: [tag as u8; 32],
+                ..source.clone()
+            };
+            pool.push(
+                binding.clone(),
+                RetainedPageV1::Page {
+                    image_id: binding.image_id,
+                    index: 0,
+                    bytes: vec![tag as u8],
+                },
+            )
+            .expect("stalled authenticated image");
+        }
+
+        let image = vec![9; 1024];
+        let frames = split_image(&image, 256).expect("split fresh image");
+        let decoded: Vec<_> = frames
+            .iter()
+            .map(|frame| decode_page(frame).expect("decode").expect("page frame"))
+            .collect();
+        let image_id = match decoded[0] {
+            RetainedPageV1::Manifest { image_id, .. } => image_id,
+            RetainedPageV1::Page { .. } => panic!("manifest first"),
+        };
+        let fresh = RetainedPageBinding { image_id, ..source };
+        let mut completed = None;
+        for frame in decoded {
+            completed = pool
+                .push(fresh.clone(), frame)
+                .expect("fresh frame")
+                .or(completed);
+        }
+        assert_eq!(completed.as_deref(), Some(image.as_slice()));
+        assert!(!pool.images.contains_key(&fresh));
+        assert_eq!(pool.received_len, 3, "three stalled images remain bounded");
+    }
+
+    #[test]
+    fn full_pool_does_not_evict_a_different_authority() {
+        let mut pool = RetainedPagePool::default();
+        for tag in 0..MAX_INFLIGHT_IMAGES {
+            let binding = RetainedPageBinding {
+                store_id: [1; 32],
+                endorser: [tag as u8; 32],
+                authorization: [tag as u8; 32],
+                image_id: [tag as u8; 32],
+            };
+            pool.push(
+                binding.clone(),
+                RetainedPageV1::Page {
+                    image_id: binding.image_id,
+                    index: 0,
+                    bytes: vec![tag as u8],
+                },
+            )
+            .expect("independent authority");
+        }
+        let newcomer = RetainedPageBinding {
+            store_id: [1; 32],
+            endorser: [99; 32],
+            authorization: [99; 32],
+            image_id: [99; 32],
+        };
+        assert!(pool
+            .push(
+                newcomer.clone(),
+                RetainedPageV1::Page {
+                    image_id: newcomer.image_id,
+                    index: 0,
+                    bytes: vec![99],
+                },
+            )
+            .is_err());
+        assert_eq!(pool.images.len(), MAX_INFLIGHT_IMAGES);
+        assert_eq!(pool.received_len, MAX_INFLIGHT_IMAGES);
+    }
+
+    #[test]
+    fn fresh_manifest_reclaims_same_authority_bytes_when_its_page_arrives() {
+        let mut pool = RetainedPagePool::default();
+        let source = RetainedPageBinding {
+            store_id: [1; 32],
+            endorser: [2; 32],
+            authorization: [3; 32],
+            image_id: [0; 32],
+        };
+        for tag in 1..=2 {
+            let binding = RetainedPageBinding {
+                image_id: [tag; 32],
+                ..source.clone()
+            };
+            pool.push(
+                binding.clone(),
+                RetainedPageV1::Page {
+                    image_id: binding.image_id,
+                    index: 0,
+                    bytes: vec![tag; MAX_RETAINED_IMAGE_BYTES],
+                },
+            )
+            .expect("same-authority stalled page");
+        }
+        let image = vec![7];
+        let image_id = *blake3::hash(&image).as_bytes();
+        let fresh = RetainedPageBinding { image_id, ..source };
+        pool.push(
+            fresh.clone(),
+            RetainedPageV1::Manifest {
+                image_id,
+                total_len: 1,
+                page_count: 1,
+            },
+        )
+        .expect("fresh manifest");
+        let complete = pool
+            .push(
+                fresh,
+                RetainedPageV1::Page {
+                    image_id,
+                    index: 0,
+                    bytes: image.clone(),
+                },
+            )
+            .expect("fresh page reclaims stale byte custody");
+        assert_eq!(complete.as_deref(), Some(image.as_slice()));
+        assert_eq!(pool.received_len, MAX_RETAINED_IMAGE_BYTES);
+    }
+
+    #[test]
+    fn byte_pressure_does_not_evict_a_different_authority() {
+        let mut pool = RetainedPagePool::default();
+        for tag in 1..=2 {
+            let binding = RetainedPageBinding {
+                store_id: [1; 32],
+                endorser: [tag; 32],
+                authorization: [tag; 32],
+                image_id: [tag; 32],
+            };
+            pool.push(
+                binding.clone(),
+                RetainedPageV1::Page {
+                    image_id: binding.image_id,
+                    index: 0,
+                    bytes: vec![tag; MAX_RETAINED_IMAGE_BYTES],
+                },
+            )
+            .expect("independent byte custody");
+        }
+        let image_id = *blake3::hash(&[9]).as_bytes();
+        let fresh = RetainedPageBinding {
+            store_id: [1; 32],
+            endorser: [9; 32],
+            authorization: [9; 32],
+            image_id,
+        };
+        pool.push(
+            fresh.clone(),
+            RetainedPageV1::Manifest {
+                image_id,
+                total_len: 1,
+                page_count: 1,
+            },
+        )
+        .expect("independent manifest");
+        assert!(pool
+            .push(
+                fresh,
+                RetainedPageV1::Page {
+                    image_id,
+                    index: 0,
+                    bytes: vec![9],
+                },
+            )
+            .is_err());
+        assert_eq!(pool.received_len, MAX_INFLIGHT_BYTES);
+    }
+
+    #[test]
+    fn per_image_overflow_does_not_evict_valid_same_authority_custody() {
+        let mut pool = RetainedPagePool::default();
+        let source = RetainedPageBinding {
+            store_id: [1; 32],
+            endorser: [2; 32],
+            authorization: [3; 32],
+            image_id: [1; 32],
+        };
+        pool.push(
+            source.clone(),
+            RetainedPageV1::Page {
+                image_id: source.image_id,
+                index: 0,
+                bytes: vec![1],
+            },
+        )
+        .expect("valid same-authority custody");
+        let overflowing = RetainedPageBinding {
+            image_id: [2; 32],
+            ..source.clone()
+        };
+        pool.push(
+            overflowing.clone(),
+            RetainedPageV1::Page {
+                image_id: overflowing.image_id,
+                index: 0,
+                bytes: vec![2; MAX_RETAINED_IMAGE_BYTES],
+            },
+        )
+        .expect("maximum pending image");
+        assert!(pool
+            .push(
+                overflowing,
+                RetainedPageV1::Page {
+                    image_id: [2; 32],
+                    index: 1,
+                    bytes: vec![3],
+                },
+            )
+            .is_err());
+        assert!(pool.images.contains_key(&source));
+        assert_eq!(pool.received_len, MAX_RETAINED_IMAGE_BYTES + 1);
+    }
+
+    #[test]
+    fn duplicate_page_at_capacity_is_idempotent_without_eviction_or_charge() {
+        let mut pool = RetainedPagePool::default();
+        let binding = RetainedPageBinding {
+            store_id: [1; 32],
+            endorser: [2; 32],
+            authorization: [3; 32],
+            image_id: [4; 32],
+        };
+        let page = RetainedPageV1::Page {
+            image_id: binding.image_id,
+            index: 0,
+            bytes: vec![4; MAX_RETAINED_IMAGE_BYTES],
+        };
+        pool.push(binding.clone(), page.clone())
+            .expect("maximum page");
+        for tag in 5..8 {
+            let other = RetainedPageBinding {
+                store_id: [tag; 32],
+                endorser: [tag; 32],
+                authorization: [tag; 32],
+                image_id: [tag; 32],
+            };
+            pool.push(
+                other.clone(),
+                RetainedPageV1::Page {
+                    image_id: other.image_id,
+                    index: 0,
+                    bytes: vec![tag],
+                },
+            )
+            .expect("independent pending image");
+        }
+        let before_len = pool.received_len;
+        let before_bindings: Vec<_> = pool.images.keys().cloned().collect();
+        assert!(pool
+            .push(binding, page)
+            .expect("duplicate remains idempotent")
+            .is_none());
+        assert_eq!(pool.received_len, before_len);
+        assert_eq!(
+            pool.images.keys().cloned().collect::<Vec<_>>(),
+            before_bindings
+        );
     }
 }

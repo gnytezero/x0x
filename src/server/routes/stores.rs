@@ -10,7 +10,7 @@ use super::super::{
 };
 use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use crate as x0x;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -44,11 +44,17 @@ struct LegacyStoreCandidate {
     ambiguous_group_prefix: bool,
     conflicts: Vec<String>,
     imported: bool,
+    import_pending: bool,
     publish_pending: bool,
     publish_accepted: bool,
     import_idempotency_key: Option<String>,
     can_import: bool,
     import_refusal_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(in crate::server) struct LegacyDownloadQuery {
+    idempotency_key: Option<String>,
 }
 
 struct LoadedLegacyStore {
@@ -2057,6 +2063,55 @@ fn migration_authority_binding(info: &x0x::groups::GroupInfo) -> String {
     )
 }
 
+async fn preview_legacy_import_conflicts(
+    state: &AppState,
+    destination_topic: &str,
+    destination_store_id: &x0x::kv::KvStoreId,
+    source: &x0x::kv::KvStore,
+) -> Result<Vec<String>, GroupStoreResponse> {
+    if let Some(handle) = state.kv_stores.read().await.get(destination_topic).cloned() {
+        return Ok(handle.legacy_import_conflicts(source).await);
+    }
+    let path = state.kv_store_state_dir.join(format!(
+        "{}.bin",
+        hex::encode(destination_store_id.as_bytes())
+    ));
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("destination snapshot cannot be previewed: {error}"),
+            ))
+        }
+    };
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    file.take(LEGACY_PAGE_SNAPSHOT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::CONFLICT,
+                format!("destination snapshot cannot be previewed: {error}"),
+            )
+        })?;
+    if bytes.len() as u64 > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "destination snapshot exceeds the migration preview limit",
+        ));
+    }
+    let destination = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+        api_error(
+            StatusCode::CONFLICT,
+            format!("destination snapshot cannot be previewed: {error}"),
+        )
+    })?;
+    Ok(destination.legacy_import_conflicts(source))
+}
+
 pub(in crate::server) async fn list_legacy_page_imports(
     State(state): State<Arc<AppState>>,
     Path((id, app)): Path<(String, String)>,
@@ -2125,102 +2180,143 @@ pub(in crate::server) async fn list_legacy_page_imports(
             )
         }
     };
-    let conflicts = match source.as_ref() {
-        Some(source) => {
-            let existing = state.kv_stores.read().await.get(&binding.topic).cloned();
-            match existing {
-                Some(handle) => handle.legacy_import_conflicts(&source.store).await,
-                None => {
-                    let destination_path = state
-                        .kv_store_state_dir
-                        .join(format!("{}.bin", hex::encode(binding.store_id.as_bytes())));
-                    match tokio::fs::File::open(&destination_path).await {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                        Err(error) => {
-                            return api_error(
-                                StatusCode::CONFLICT,
-                                format!("destination snapshot cannot be previewed: {error}"),
-                            )
-                        }
-                        Ok(file) => {
-                            use tokio::io::AsyncReadExt;
-                            let mut bytes = Vec::new();
-                            if let Err(error) = file
-                                .take(LEGACY_PAGE_SNAPSHOT_MAX_BYTES + 1)
-                                .read_to_end(&mut bytes)
-                                .await
-                            {
-                                return api_error(
-                                    StatusCode::CONFLICT,
-                                    format!("destination snapshot cannot be previewed: {error}"),
-                                );
-                            }
-                            if bytes.len() as u64 > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
-                                return api_error(
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    "destination snapshot exceeds the migration preview limit",
-                                );
-                            }
-                            match x0x::kv::sync::load_snapshot_bytes(&bytes) {
-                                Ok(destination) => {
-                                    destination.legacy_import_conflicts(&source.store)
-                                }
-                                Err(error) => {
-                                    return api_error(
-                                        StatusCode::CONFLICT,
-                                        format!(
-                                            "destination snapshot cannot be previewed: {error}"
-                                        ),
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
+    let intents =
+        match super::super::legacy_store_migration::read_intents(&state.kv_store_state_dir).await {
+            Ok(intents) => intents,
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("legacy import intent journal is unreadable: {error}"),
+                )
             }
+        };
+    let local_endorser = hex::encode(state.agent.agent_id().as_bytes());
+    let mut relevant_intents = Vec::new();
+    for intent in intents {
+        if receipts
+            .iter()
+            .any(|receipt| receipt.idempotency_key == intent.idempotency_key)
+        {
+            continue;
         }
+        if intent.group_id != stable_group_id || intent.app != app {
+            continue;
+        }
+        if intent.endorser != local_endorser {
+            return api_error(
+                StatusCode::CONFLICT,
+                "legacy import intent owner binding is invalid",
+            );
+        }
+        relevant_intents.push(intent);
+    }
+    let conflicts = match source.as_ref() {
+        Some(source) => match preview_legacy_import_conflicts(
+            &state,
+            &binding.topic,
+            &binding.store_id,
+            &source.store,
+        )
+        .await
+        {
+            Ok(conflicts) => conflicts,
+            Err(response) => return response,
+        },
         None => Vec::new(),
     };
-    let candidates = source.into_iter().map(|source| {
-        let receipt = receipts.iter().find(|receipt| {
-            receipt.group_id == stable_group_id
-                && receipt.app == app
-                && receipt.source_store_id == source.store_id_hex
-                && receipt.source_digest == source.digest
+    let mut candidates = source
+        .into_iter()
+        .map(|source| {
+            let receipt = receipts.iter().find(|receipt| {
+                receipt.group_id == stable_group_id
+                    && receipt.app == app
+                    && receipt.source_store_id == source.store_id_hex
+                    && receipt.source_digest == source.digest
+            });
+            LegacyStoreCandidate {
+                target_group_id: stable_group_id.clone(),
+                imported: receipt.is_some(),
+                import_pending: false,
+                publish_pending: receipt
+                    .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_none()),
+                publish_accepted: receipt
+                    .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_some()),
+                import_idempotency_key: receipt.map(|receipt| receipt.idempotency_key.clone()),
+                source_store_id: source.store_id_hex,
+                topic: source.topic,
+                owner: hex::encode(source.owner.as_bytes()),
+                source_digest: source.digest,
+                active_keys: source.store.active_keys().len(),
+                keys: {
+                    let mut keys = source
+                        .store
+                        .active_keys()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    keys.sort();
+                    keys
+                },
+                ambiguous_group_prefix: ambiguous,
+                conflicts: conflicts.clone(),
+                can_import,
+                import_refusal_reason: (!can_import)
+                    .then(|| "your current group role cannot endorse legacy history".to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+    for intent in relevant_intents {
+        let recovered =
+            match recover_intended_legacy_source(&state, &stable_group_id, app, &intent).await {
+                Ok(source) => source,
+                Err(response) => return response,
+            };
+        candidates.retain(|candidate| {
+            candidate.source_store_id != intent.source_store_id
+                || candidate.source_digest != intent.source_digest
+                || candidate.import_pending
         });
-        LegacyStoreCandidate {
+        let conflicts = match preview_legacy_import_conflicts(
+            &state,
+            &binding.topic,
+            &binding.store_id,
+            &recovered.store,
+        )
+        .await
+        {
+            Ok(conflicts) => conflicts,
+            Err(response) => return response,
+        };
+        let mut keys = recovered
+            .store
+            .active_keys()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        candidates.push(LegacyStoreCandidate {
             target_group_id: stable_group_id.clone(),
-            imported: receipt.is_some(),
-            publish_pending: receipt
-                .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_none()),
-            publish_accepted: receipt
-                .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_some()),
-            import_idempotency_key: receipt.map(|receipt| receipt.idempotency_key.clone()),
-            source_store_id: source.store_id_hex,
-            topic: source.topic,
-            owner: hex::encode(source.owner.as_bytes()),
-            source_digest: source.digest,
-            active_keys: source.store.active_keys().len(),
-            keys: {
-                let mut keys = source
-                    .store
-                    .active_keys()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                keys.sort();
-                keys
-            },
+            source_store_id: recovered.store_id_hex,
+            topic: recovered.topic,
+            owner: hex::encode(recovered.owner.as_bytes()),
+            source_digest: recovered.digest,
+            active_keys: keys.len(),
+            keys,
             ambiguous_group_prefix: ambiguous,
-            conflicts: conflicts.clone(),
+            conflicts,
+            imported: false,
+            import_pending: true,
+            publish_pending: false,
+            publish_accepted: false,
+            import_idempotency_key: Some(intent.idempotency_key),
             can_import,
             import_refusal_reason: (!can_import)
                 .then(|| "your current group role cannot endorse legacy history".to_string()),
-        }
-    });
+        });
+    }
     (
         StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "candidates": candidates.collect::<Vec<_>>() })),
+        Json(serde_json::json!({"ok": true, "candidates": candidates})),
     )
 }
 
@@ -2228,6 +2324,7 @@ pub(in crate::server) async fn download_legacy_page_import(
     State(state): State<Arc<AppState>>,
     Path((id, app, source_id)): Path<(String, String, String)>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    Query(query): Query<LegacyDownloadQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let app = match legacy_page_app(&app) {
         Ok(app) => app,
@@ -2251,6 +2348,46 @@ pub(in crate::server) async fn download_legacy_page_import(
         }
         stable
     };
+    if let Some(idempotency_key) = query.idempotency_key.as_deref() {
+        let intent = match super::super::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            idempotency_key,
+        )
+        .await
+        {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return not_found("legacy import intent is not registered on this device"),
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("legacy import intent is unreadable: {error}"),
+                )
+            }
+        };
+        if intent.group_id != stable
+            || intent.app != app
+            || intent.source_store_id != source_id
+            || intent.endorser != hex::encode(state.agent.agent_id().as_bytes())
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "legacy import intent does not match the requested source",
+            );
+        }
+        let source = match recover_intended_legacy_source(&state, &stable, app, &intent).await {
+            Ok(source) => source,
+            Err(response) => return response,
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "source_store_id": source.store_id_hex,
+                "source_digest": source.digest,
+                "snapshot_b64": BASE64.encode(source.bytes),
+            })),
+        );
+    }
     match load_legacy_page_store(&state, &stable, app, Some(&source_id)).await {
         Ok(Some(source)) => (
             StatusCode::OK,
@@ -2264,6 +2401,67 @@ pub(in crate::server) async fn download_legacy_page_import(
         Ok(None) => not_found("legacy source is not registered on this device"),
         Err(response) => response,
     }
+}
+
+/// Rebuild the reviewed legacy source from a durable pre-merge intent.
+///
+/// The preserved bytes must still match the intent's recorded digest and the
+/// deterministic (topic, owner, policy, store id) binding, so a corrupt or
+/// tampered journal cannot inject foreign content into the canonical
+/// destination. This NEVER reads the live legacy store — recovery replays
+/// exactly what was reviewed.
+async fn recover_intended_legacy_source(
+    state: &AppState,
+    stable_group_id: &str,
+    app: &str,
+    intent: &super::super::legacy_store_migration::LegacyImportIntent,
+) -> Result<LoadedLegacyStore, GroupStoreResponse> {
+    let topic = legacy_page_topic(stable_group_id, app)?;
+    let owner = state.agent.agent_id();
+    let store_id = x0x::kv::KvStoreId::for_topic_owner(&topic, &owner);
+    let bytes = intent.source_snapshot().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import intent snapshot is unreadable: {error}"),
+        )
+    })?;
+    if bytes.len() as u64 > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy import intent snapshot exceeds the migration limit",
+        ));
+    }
+    let digest = hex::encode(blake3::hash(&bytes).as_bytes());
+    if digest != intent.source_digest {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy import intent snapshot does not match its recorded digest",
+        ));
+    }
+    let store = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import intent snapshot is invalid: {error}"),
+        )
+    })?;
+    if hex::encode(store_id.as_bytes()) != intent.source_store_id
+        || store.id() != &store_id
+        || store.owner() != Some(&owner)
+        || store.policy() != &x0x::kv::AccessPolicy::Signed
+    {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy import intent source binding is invalid",
+        ));
+    }
+    Ok(LoadedLegacyStore {
+        store,
+        store_id_hex: intent.source_store_id.clone(),
+        topic,
+        owner,
+        digest,
+        bytes,
+    })
 }
 
 pub(in crate::server) async fn import_legacy_page_store(
@@ -2351,6 +2549,15 @@ pub(in crate::server) async fn import_legacy_page_store(
                 "idempotency key already binds different import arguments",
             );
         }
+        // The receipt is the durable idempotency binding, so a pre-merge
+        // intent snapshot left by a crash between the receipt append and the
+        // intent removal is redundant. Best-effort: a failed removal must
+        // not fail an otherwise durable import, and the next retry retries.
+        let _ = super::super::legacy_store_migration::remove_intent(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await;
         if existing.publish_accepted_at_ms.is_some() {
             return (
                 StatusCode::OK,
@@ -2361,12 +2568,72 @@ pub(in crate::server) async fn import_legacy_page_store(
             );
         }
     }
-    let source = if existing_receipt.is_none() {
-        match load_legacy_page_store(&state, &binding.stable_group_id, app, Some(&source_id)).await
+    let existing_intent = if existing_receipt.is_none() {
+        match super::super::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await
         {
-            Ok(Some(source)) => Some(source),
-            Ok(None) => return not_found("legacy source is not registered on this device"),
-            Err(response) => return response,
+            Ok(intent) => intent,
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("legacy import intent journal is unreadable: {error}"),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(intent) = existing_intent.as_ref() {
+        let same = intent.group_id == binding.stable_group_id
+            && intent.app == app
+            && intent.source_store_id == source_id
+            && intent.source_digest == request.source_digest;
+        if !same {
+            return api_error(
+                StatusCode::CONFLICT,
+                "idempotency key already binds different import arguments",
+            );
+        }
+        // The intent file survived a prior attempt whose kv_state_dir sync
+        // may never have completed: prove the directory entry is durable
+        // before this retry is allowed to mutate the canonical destination.
+        if let Err(error) = super::super::legacy_store_migration::ensure_intent_durable(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "legacy import intent durability is unproven; canonical destination is unmodified: {error}"
+                ),
+            );
+        }
+    }
+    let source = if existing_receipt.is_none() {
+        if let Some(intent) = existing_intent.as_ref() {
+            // Recover the reviewed source from the durable intent instead
+            // of the on-disk legacy store: a retry after a merge-persist or
+            // receipt-append failure finishes the ORIGINAL import even when
+            // the source was edited after review.
+            match recover_intended_legacy_source(&state, &binding.stable_group_id, app, intent)
+                .await
+            {
+                Ok(source) => Some(source),
+                Err(response) => return response,
+            }
+        } else {
+            match load_legacy_page_store(&state, &binding.stable_group_id, app, Some(&source_id))
+                .await
+            {
+                Ok(Some(source)) => Some(source),
+                Ok(None) => return not_found("legacy source is not registered on this device"),
+                Err(response) => return response,
+            }
         }
     } else {
         // Pending retries publish the already-persisted canonical image and
@@ -2389,6 +2656,39 @@ pub(in crate::server) async fn import_legacy_page_store(
             return api_error(
                 StatusCode::CONFLICT,
                 format!("legacy source content is invalid: {error}"),
+            );
+        }
+    }
+    if existing_intent.is_none() && existing_receipt.is_none() {
+        // Durable intent BEFORE any canonical mutation: bind the reviewed
+        // snapshot to this idempotency key first, so a crash or receipt
+        // append failure after the merge can still finish this exact import.
+        let Some(source) = source.as_ref() else {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "legacy source unavailable",
+            );
+        };
+        if let Err(error) = super::super::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            super::super::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: request.idempotency_key.clone(),
+                group_id: binding.stable_group_id.clone(),
+                app: app.to_string(),
+                source_store_id: source.store_id_hex.clone(),
+                source_digest: source.digest.clone(),
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding: authority_binding.clone(),
+                source_snapshot: source.bytes.clone(),
+            },
+        )
+        .await
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "legacy import intent did not persist; canonical destination is unmodified: {error}"
+                ),
             );
         }
     }
@@ -2438,7 +2738,7 @@ pub(in crate::server) async fn import_legacy_page_store(
         let after = handle.retained_content_digest_hex().await;
         let receipt = super::super::legacy_store_migration::new_receipt(
             super::super::legacy_store_migration::LegacyImportReceiptInput {
-                idempotency_key: request.idempotency_key,
+                idempotency_key: request.idempotency_key.clone(),
                 group_id: binding.stable_group_id,
                 app: app.to_string(),
                 source_store_id: source.store_id_hex,
@@ -2458,6 +2758,13 @@ pub(in crate::server) async fn import_legacy_page_store(
                 format!("destination persisted but import receipt did not: {error}"),
             );
         }
+        // The receipt is now the durable binding; the preserved intent
+        // snapshot is redundant. Best-effort — the next retry retries it.
+        let _ = super::super::legacy_store_migration::remove_intent(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await;
         (receipt, conflicts)
     };
     drop(membership_guard);
@@ -2885,6 +3192,7 @@ mod tests {
             State(Arc::clone(&state)),
             Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
             Extension(owner_actor()),
+            Query(LegacyDownloadQuery::default()),
         )
         .await;
         assert_eq!(code, StatusCode::OK, "{download:?}");
@@ -3197,6 +3505,869 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_intent_persist_failure_leaves_destination_unmodified() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "93".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        crate::server::legacy_store_migration::fail_next_intent_for_test("intent-fault");
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest.clone(),
+                idempotency_key: "intent-fault".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent did not persist")),
+            "must fail at the pre-mutation intent boundary: {failed:?}"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination")
+                .is_none(),
+            "failed intent write must not merge any source content"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after intent fault")
+                .is_empty()
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-fault"
+            )
+            .await
+            .expect("intent after fault")
+            .is_none(),
+            "failed intent write leaves no durable binding"
+        );
+
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "intent-fault".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(retried.0["publish_accepted"], true);
+        assert!(handle
+            .get("legacy-only")
+            .await
+            .expect("read after retry")
+            .is_some());
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after retry")
+                .len(),
+            1
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-fault"
+            )
+            .await
+            .expect("intent after retry")
+            .is_none(),
+            "settled intent snapshot is removed once the receipt exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_intent_directory_sync_failure_blocks_canonical_mutation() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "97".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "dir-sync-fault".to_string(),
+        };
+
+        // The atomic intent write succeeds but the kv_state_dir entry sync
+        // fails: the intent file exists yet the route must refuse to mutate
+        // the canonical destination on an unproven intent.
+        crate::server::legacy_store_migration::fail_next_intent_dir_sync_for_test("dir-sync-fault");
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent did not persist")),
+            "fresh import stops at the intent durability boundary: {failed:?}"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "dir-sync-fault"
+            )
+            .await
+            .expect("intent readable")
+            .is_some(),
+            "the intent file itself was written; only its durability is unproven"
+        );
+        // Path-target control: the durability sync must have fsynced
+        // kv_state_dir ITSELF, never its parent — the exact regression
+        // sync_parent_directory(kv_state_dir) would reintroduce.
+        let target = crate::server::legacy_store_migration::intent_dir_sync_target_for_test(
+            "dir-sync-fault",
+        )
+        .expect("sync target recorded");
+        assert_eq!(
+            target, state.kv_store_state_dir,
+            "intent durability must fsync kv_state_dir itself"
+        );
+        assert_ne!(
+            target,
+            state.kv_store_state_dir.parent().expect("state dir parent"),
+            "syncing kv_state_dir's PARENT leaves the intents directory entry unlinked"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination")
+                .is_none(),
+            "unproven intent durability must block the canonical merge"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after dir-sync fault")
+                .is_empty()
+        );
+
+        // Identical-intent retry with the sync still failing: the recovery
+        // path must re-prove durability instead of merging on file presence.
+        crate::server::legacy_store_migration::fail_next_intent_dir_sync_for_test("dir-sync-fault");
+        let (code, retry_failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{retry_failed:?}");
+        assert!(
+            retry_failed.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent durability is unproven")),
+            "recovery retry stops at the durability proof: {retry_failed:?}"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination again")
+                .is_none(),
+            "canonical destination is still untouched"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after failed retry")
+                .is_empty()
+        );
+
+        // With durability provable, the SAME key finishes the original
+        // import exactly once.
+        let (code, done) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done:?}");
+        assert_eq!(done.0["imported_locally"], true);
+        assert_eq!(done.0["publish_accepted"], true);
+        assert!(handle
+            .get("legacy-only")
+            .await
+            .expect("read after completion")
+            .is_some());
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after completion")
+                .len(),
+            1
+        );
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "dir-sync-fault"
+        )
+        .await
+        .expect("intent after completion")
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_import_receipt_fault_intent_recovers_after_source_edit_and_reopen() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "94".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_before_edit = tokio::fs::read(&source_path)
+            .await
+            .expect("reviewed source bytes");
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        // Destination persists, receipt append fails: the exact PR727 window.
+        crate::server::legacy_store_migration::fail_next_append_for_test("intent-recovery");
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "intent-recovery".to_string(),
+        };
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"].as_str().is_some_and(
+                |error| error.contains("destination persisted but import receipt did not")
+            ),
+            "must reach the post-persist receipt append boundary: {failed:?}"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read applied content")
+                .is_some(),
+            "merge applied before the receipt fault"
+        );
+        let intent = crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "intent-recovery",
+        )
+        .await
+        .expect("intent journal readable")
+        .expect("durable intent survived the receipt fault");
+        assert_eq!(intent.source_digest, digest);
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after fault")
+                .is_empty()
+        );
+
+        // The reviewed source changes AFTER the failed import attempt.
+        source_handle
+            .put(
+                "post-review-edit".to_string(),
+                b"edited after review".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("edit legacy source after failed import");
+        let source_after_edit = tokio::fs::read(&source_path)
+            .await
+            .expect("source bytes after edit");
+        let (endorser, authority_binding) = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            let values = (
+                hex::encode(state.agent.agent_id().as_bytes()),
+                migration_authority_binding(info),
+            );
+            info.state_revision = info.state_revision.saturating_add(1);
+            values
+        };
+        crate::server::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            crate::server::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: "intent-recovery-second".to_string(),
+                group_id: group_id.clone(),
+                app: "wiki".to_string(),
+                source_store_id: source_id.clone(),
+                source_digest: digest.clone(),
+                endorser,
+                authority_binding,
+                source_snapshot: source_before_edit.clone(),
+            },
+        )
+        .await
+        .expect("second pending key for the same reviewed source");
+
+        // Daemon-restart seam: drop the live handle so the retry reopens the
+        // destination from its persisted snapshot and the intent from disk.
+        handle.retire();
+        state.kv_stores.write().await.remove(&topic);
+        let (_, pending_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let candidates = pending_listing.0["candidates"]
+            .as_array()
+            .expect("candidate array");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "changed source and both pending keys stay distinct"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate["import_pending"] == true)
+                .count(),
+            2,
+            "each unsettled idempotency key retains a recovery card"
+        );
+        let pending_candidate = candidates
+            .iter()
+            .find(|candidate| candidate["import_idempotency_key"] == "intent-recovery")
+            .expect("original pending reviewed intent candidate");
+        assert_eq!(
+            pending_candidate["imported"], false,
+            "an intent is not a completed local import"
+        );
+        assert_eq!(pending_candidate["source_digest"], digest);
+        assert_eq!(
+            pending_candidate["import_idempotency_key"],
+            "intent-recovery"
+        );
+        let current_candidate = candidates
+            .iter()
+            .find(|candidate| candidate["import_pending"] == false)
+            .expect("changed current-source candidate");
+        assert_ne!(current_candidate["source_digest"], digest);
+
+        let (code, preserved_download) = download_legacy_page_import(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Query(LegacyDownloadQuery {
+                idempotency_key: Some("intent-recovery".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{preserved_download:?}");
+        let preserved_bytes = BASE64
+            .decode(
+                preserved_download.0["snapshot_b64"]
+                    .as_str()
+                    .expect("preserved snapshot"),
+            )
+            .expect("decode preserved snapshot");
+        assert_eq!(preserved_bytes, source_before_edit);
+        assert_eq!(preserved_download.0["source_digest"], digest);
+
+        // Same ORIGINAL key and digest resumes the original import.
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(retried.0["imported_locally"], true);
+        assert_eq!(retried.0["publish_accepted"], true);
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("reopened destination handle");
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read recovered content")
+                .is_some(),
+            "no imported data was lost across the fault and reopen"
+        );
+        assert!(handle.get("shared").await.expect("read shared").is_some(),);
+        assert!(
+            handle
+                .get("post-review-edit")
+                .await
+                .expect("read post-review key")
+                .is_none(),
+            "recovery merges the preserved reviewed snapshot, never the edited source"
+        );
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after recovery")
+                .len(),
+            1,
+            "recovery publishes exactly one receipt for the original key"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-recovery"
+            )
+            .await
+            .expect("intent after recovery")
+            .is_none(),
+            "settled intent snapshot is removed"
+        );
+        assert_eq!(
+            tokio::fs::read(&source_path).await.expect("source after"),
+            source_after_edit,
+            "recovery never mutates the legacy source"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_listing_fails_closed_on_corrupt_or_excess_intents() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "9a".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let corrupt_path = crate::server::legacy_store_migration::intent_path(
+            &state.kv_store_state_dir,
+            "corrupt-listing",
+        );
+        tokio::fs::create_dir_all(corrupt_path.parent().expect("intent directory"))
+            .await
+            .expect("create intent directory");
+        tokio::fs::write(&corrupt_path, b"{}")
+            .await
+            .expect("write corrupt intent");
+        let (code, body) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body:?}");
+        assert!(body.0["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("intent journal is unreadable")));
+
+        let intent_directory = corrupt_path.parent().expect("intent directory");
+        tokio::fs::remove_dir_all(intent_directory)
+            .await
+            .expect("remove corrupt fixture");
+        tokio::fs::create_dir_all(intent_directory)
+            .await
+            .expect("recreate intent directory");
+        for index in 0..=128 {
+            tokio::fs::write(intent_directory.join(format!("{index:064x}.json")), b"{}")
+                .await
+                .expect("write count-bound fixture");
+        }
+        let (code, body) = list_legacy_page_imports(
+            State(state),
+            Path((group_id, "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body:?}");
+        assert!(body.0["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("intent journal is unreadable")));
+    }
+
+    #[tokio::test]
+    async fn legacy_import_pending_intent_conflicts_on_args_and_reauthorizes_writer() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "95".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        crate::server::legacy_store_migration::fail_next_append_for_test("intent-gate");
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "intent-gate".to_string(),
+        };
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "intent-gate"
+        )
+        .await
+        .expect("pending intent")
+        .is_some());
+
+        // Same key, different arguments: conflict, nothing recovered.
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: "different".to_string(),
+                idempotency_key: "intent-gate".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+
+        // Current writer revoked mid-flight: the retry reauthorizes and
+        // refuses without consuming the durable intent.
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            info.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+            info.members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Member;
+        }
+        let (_, revoked_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let pending = revoked_listing.0["candidates"]
+            .as_array()
+            .expect("revoked candidate array")
+            .iter()
+            .find(|candidate| candidate["import_pending"] == true)
+            .expect("pending candidate remains discoverable");
+        assert_eq!(pending["can_import"], false);
+        assert!(pending["import_refusal_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cannot endorse")));
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::FORBIDDEN,
+            "pending-intent retry must reauthorize the current writer"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after refusal")
+                .is_empty()
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-gate"
+            )
+            .await
+            .expect("intent after refusal")
+            .is_some(),
+            "refused retry leaves the durable intent intact"
+        );
+
+        // Writer restored: the same original key still finishes.
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group")
+                .members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Admin;
+        }
+        let (code, done) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done:?}");
+        assert_eq!(done.0["publish_accepted"], true);
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after completion")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_intent_without_merge_is_not_imported_and_finishes_on_retry() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "96".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_bytes = tokio::fs::read(&source_path).await.expect("source bytes");
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        // Emulate a crash after the durable intent write but before the
+        // merge: the durable state is exactly an intent file and nothing
+        // else. Write it through the production journal API.
+        let authority_binding = {
+            let groups = state.named_groups.read().await;
+            migration_authority_binding(groups.get(&group_id).expect("group"))
+        };
+        crate::server::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            crate::server::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: "crash-before-merge".to_string(),
+                group_id: group_id.clone(),
+                app: "wiki".to_string(),
+                source_store_id: source_id.clone(),
+                source_digest: digest.clone(),
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding,
+                source_snapshot: source_bytes,
+            },
+        )
+        .await
+        .expect("durable pre-merge intent");
+
+        let (_, crashed_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(
+            crashed_listing.0["candidates"][0]["imported"], false,
+            "an intent without a merge is not falsely imported"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination")
+                .is_none(),
+            "crash-before-merge never touched the canonical destination"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after crash")
+                .is_empty()
+        );
+
+        let (code, done) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "crash-before-merge".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done:?}");
+        assert_eq!(done.0["imported_locally"], true);
+        assert_eq!(done.0["publish_accepted"], true);
+        assert!(handle
+            .get("legacy-only")
+            .await
+            .expect("read after recovery")
+            .is_some());
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after recovery")
+                .len(),
+            1
+        );
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "crash-before-merge"
+        )
+        .await
+        .expect("intent after recovery")
+        .is_none());
     }
 
     #[cfg(unix)]

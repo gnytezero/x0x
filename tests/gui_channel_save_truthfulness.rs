@@ -268,6 +268,67 @@ globalThis.__done = loadLegacyPageImport('sid1','wiki').then(async () => {{
 }
 
 #[test]
+fn gui_legacy_reload_separates_pending_intent_from_changed_current_source() {
+    let driver = format!(
+        r#"
+{DRIVER_PREAMBLE}
+ROUTES['GET /groups/sid1/stores/wiki/legacy-imports'] = {{ _http_ok: true, ok: true, candidates: [
+  {{ target_group_id: 'sid1', source_store_id: 'source1', source_digest: 'reviewed-digest', keys: ['reviewed-page'], conflicts: [], ambiguous_group_prefix: false, imported: false, import_pending: true, publish_pending: false, publish_accepted: false, import_idempotency_key: 'durable-review-key', can_import: true, import_refusal_reason: null }},
+  {{ target_group_id: 'sid1', source_store_id: 'source1', source_digest: 'changed-digest', keys: ['new-page'], conflicts: [], ambiguous_group_prefix: false, imported: false, import_pending: false, publish_pending: false, publish_accepted: false, import_idempotency_key: null, can_import: true, import_refusal_reason: null }}
+] }};
+ROUTES['GET /groups/sid1/stores/wiki/legacy-imports/source1?idempotency_key=durable-review-key'] = {{ _http_ok: true, ok: true, snapshot_b64: 'eA==' }};
+ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: true, ok: true, imported_locally: true, publish_accepted: true }};
+globalThis.__done = loadLegacyPageImport('sid1','wiki').then(async () => {{
+    const panel = document.getElementById('wiki-legacy').innerHTML;
+    await downloadLegacyPages('sid1','wiki','source1','durable-review-key');
+    await importLegacyPages('sid1','wiki','source1','reviewed-digest');
+    console.log(JSON.stringify({{ panel, calls: CALLS, bodies: CALL_BODIES }}));
+}});
+"#
+    );
+    let (ok, out) = run_driver(&driver, "legacy_intent_and_current");
+    assert!(ok, "driver failed: {out}");
+    let value: serde_json::Value =
+        serde_json::from_str(out.lines().last().expect("driver JSON")).expect("driver JSON");
+    let panel = value["panel"].as_str().expect("panel");
+    assert_eq!(
+        panel.matches("class=\"card\"").count(),
+        2,
+        "pending intent and changed current source need separate cards: {out}"
+    );
+    assert!(
+        panel.contains("Previously reviewed legacy wiki import"),
+        "{out}"
+    );
+    assert!(
+        panel.contains("has not been confirmed as imported locally"),
+        "{out}"
+    );
+    assert!(panel.contains("Resume this reviewed import"), "{out}");
+    assert!(panel.contains("reviewed-digest"), "{out}");
+    assert!(panel.contains("changed-digest"), "{out}");
+    assert!(
+        value["calls"]
+            .as_array()
+            .expect("calls")
+            .iter()
+            .any(|call| call.as_str() == Some("GET /groups/sid1/stores/wiki/legacy-imports/source1?idempotency_key=durable-review-key")),
+        "pending download must address the preserved reviewed snapshot: {out}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(
+        value["bodies"]
+            .as_array()
+            .expect("request bodies")
+            .iter()
+            .find_map(serde_json::Value::as_str)
+            .expect("POST body"),
+    )
+    .expect("POST JSON");
+    assert_eq!(posted["idempotency_key"], "durable-review-key");
+    assert_eq!(posted["source_digest"], "reviewed-digest");
+}
+
+#[test]
 fn gui_legacy_failed_import_is_uncertain_and_reuses_idempotency_key() {
     let driver = format!(
         r#"

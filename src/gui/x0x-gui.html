@@ -3160,15 +3160,17 @@ async function loadLegacyPageImport(sid,app){
     const conflicts=(c.conflicts||[]).map(esc).join(', ');
     const ambiguity=c.ambiguous_group_prefix?' This historical alias is shared by more than one local space. Import will use target '+esc(c.target_group_id)+' and source '+esc(c.source_store_id)+'.':'';
     const conflictText=conflicts?' Conflicting current pages: '+conflicts+'.':'';
-    const imported=c.publish_pending?' Imported on this device; sharing has not been accepted for sync yet.':(c.publish_accepted?' Imported locally and offered for space sync.':(c.imported?' This exact snapshot was already imported.':''));
+    const imported=c.import_pending?' This reviewed snapshot is awaiting completion; it has not been confirmed as imported locally.':(c.publish_pending?' Imported on this device; sharing has not been accepted for sync yet.':(c.publish_accepted?' Imported locally and offered for space sync.':(c.imported?' This exact snapshot was already imported.':'')));
     const refusal=c.import_refusal_reason?' Import unavailable: '+esc(c.import_refusal_reason)+'.':'';
-    const action=c.publish_pending?'Retry sharing this imported snapshot':'Import this snapshot into this shared space';
-    return `<div class="card" style="font-size:12px"><strong>Legacy ${esc(app)} pages found</strong><div class="mt" style="color:var(--tx3)">${keys}.${conflictText}${ambiguity}${esc(imported)}${refusal}</div><div class="mt" style="font-family:var(--mono);font-size:10px;color:var(--tx3)">Target ${esc(c.target_group_id)} · Source ${esc(c.source_store_id)}</div><div class="row mt"><button data-legacy-download="${esc(c.source_store_id)}" onclick="downloadLegacyPages('${sid}','${app}',this.dataset.legacyDownload)">Download snapshot</button><button class="pri" data-legacy-import="${esc(c.source_store_id)}" data-legacy-digest="${esc(c.source_digest)}" onclick="importLegacyPages('${sid}','${app}',this.dataset.legacyImport,this.dataset.legacyDigest)" ${c.publish_accepted||!c.can_import?'disabled':''}>${action}</button></div></div>`;
+    const action=c.import_pending?'Resume this reviewed import':(c.publish_pending?'Retry sharing this imported snapshot':'Import this snapshot into this shared space');
+    const pendingKey=c.import_pending?(c.import_idempotency_key||''):'';
+    return `<div class="card" style="font-size:12px"><strong>${c.import_pending?'Previously reviewed legacy '+esc(app)+' import':'Legacy '+esc(app)+' pages found'}</strong><div class="mt" style="color:var(--tx3)">${keys}.${conflictText}${ambiguity}${esc(imported)}${refusal}</div><div class="mt" style="font-family:var(--mono);font-size:10px;color:var(--tx3)">Target ${esc(c.target_group_id)} · Source ${esc(c.source_store_id)} · Digest ${esc(c.source_digest)}</div><div class="row mt"><button data-legacy-download="${esc(c.source_store_id)}" data-legacy-pending-key="${esc(pendingKey)}" onclick="downloadLegacyPages('${sid}','${app}',this.dataset.legacyDownload,this.dataset.legacyPendingKey)">Download snapshot</button><button class="pri" data-legacy-import="${esc(c.source_store_id)}" data-legacy-digest="${esc(c.source_digest)}" onclick="importLegacyPages('${sid}','${app}',this.dataset.legacyImport,this.dataset.legacyDigest)" ${c.publish_accepted||!c.can_import?'disabled':''}>${action}</button></div></div>`;
   }).join('');
 }
 
-async function downloadLegacyPages(sid,app,sourceId){
-  const r=await api('/groups/'+encSeg(sid)+'/stores/'+encSeg(app)+'/legacy-imports/'+encSeg(sourceId));
+async function downloadLegacyPages(sid,app,sourceId,pendingKey){
+  const pendingQuery=pendingKey?'?idempotency_key='+encodeURIComponent(pendingKey):'';
+  const r=await api('/groups/'+encSeg(sid)+'/stores/'+encSeg(app)+'/legacy-imports/'+encSeg(sourceId)+pendingQuery);
   if(!r||!r._http_ok||!r.snapshot_b64){toast('Legacy snapshot download failed. '+apiError(r),'error');return}
   try{
     const raw=atob(r.snapshot_b64);const bytes=new Uint8Array(raw.length);
