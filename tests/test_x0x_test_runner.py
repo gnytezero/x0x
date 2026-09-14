@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -189,13 +190,24 @@ class X0xTestRunnerTests(unittest.TestCase):
             runner._stop.set()
             publisher.join(timeout=10.0)
         self.assertFalse(publisher.is_alive())
-        self.assertGreaterEqual(len(client.direct), self.runner_mod.PUBLISH_RETRY_MAX)
+        frame_count = len(self.runner_mod.frame_result(
+            json.dumps(large).encode(), "fixture-transfer", "large-413",
+        ))
+        self.assertEqual(
+            frame_count * self.runner_mod.PUBLISH_RETRY_MAX,
+            len(client.direct),
+        )
         self.assertEqual(self.runner_mod.LEGACY_RESULTS_TOPIC, client.published[0][0])
         logs = "\n".join(captured.output)
         self.assertEqual(
-            self.runner_mod.PUBLISH_RETRY_MAX,
+            frame_count * self.runner_mod.PUBLISH_RETRY_MAX,
             logs.count("stage=wire_complete"),
         )
+        for frame_index in range(1, frame_count + 1):
+            self.assertEqual(
+                self.runner_mod.PUBLISH_RETRY_MAX,
+                logs.count(f"wire={frame_index}/{frame_count}"),
+            )
         self.assertIn("outcome=http_413", logs)
         self.assertIn("stage=fallback_complete", logs)
         self.assertNotIn("fake direct rejection", logs)
@@ -668,20 +680,20 @@ class X0xTestRunnerTests(unittest.TestCase):
     def test_chunk_failures_fall_back_within_enqueue_budget(self) -> None:
         from unittest.mock import patch
 
-        clock = [0.0]
-        fallback_started = []
-        timeouts = []
+        fallback_timeouts = []
+        raw_started = threading.Event()
+        delivery_started = [0.0]
 
         class BudgetClient(FakeClient):
             def direct_send(self, _target, _payload, **kwargs):
-                timeout = kwargs["timeout"]
-                timeouts.append(timeout)
-                clock[0] += timeout
+                raw_started.set()
+                threading.Event().wait(0.18)
                 raise TimeoutError("controlled raw timeout")
 
             def publish(self, topic, payload, **kwargs):
-                fallback_started.append(clock[0])
-                clock[0] += min(1.0, kwargs["timeout"])
+                fallback_timeouts.append(
+                    (time.monotonic() - delivery_started[0], kwargs["timeout"])
+                )
                 return super().publish(topic, payload)
 
         client = BudgetClient()
@@ -694,14 +706,10 @@ class X0xTestRunnerTests(unittest.TestCase):
             "details": {"body": "x" * 60_000},
         }
 
-        def fake_sleep(seconds):
-            clock[0] += seconds
-
-        with patch.object(
-            self.runner_mod.time, "monotonic", side_effect=lambda: clock[0],
-        ), patch.object(
-            self.runner_mod.time, "sleep", side_effect=fake_sleep,
-        ):
+        with patch.object(runner, "_sleep_within_deadline", return_value=False), \
+                patch.object(self.runner_mod, "RESULT_RAW_BUDGET_SECS", 0.15), \
+                patch.object(self.runner_mod, "RESULT_TOTAL_BUDGET_SECS", 0.30):
+            delivery_started[0] = time.monotonic()
             runner._enqueue_result(
                 result, target_aid="a" * 64, result_chunks_v2=True,
             )
@@ -717,9 +725,91 @@ class X0xTestRunnerTests(unittest.TestCase):
         self.assertGreater(len(self.runner_mod.frame_result(
             json.dumps(result).encode(), "transfer", "large-budget",
         )), 1)
-        self.assertEqual([15.0, 4.0], timeouts)
-        self.assertEqual([20.0], fallback_started)
-        self.assertLessEqual(clock[0], self.runner_mod.RESULT_TOTAL_BUDGET_SECS)
+        self.assertTrue(raw_started.is_set())
+        self.assertEqual(1, len(fallback_timeouts))
+        fallback_elapsed, fallback_timeout = fallback_timeouts[0]
+        self.assertGreaterEqual(fallback_elapsed, 0.14)
+        self.assertGreater(fallback_timeout, 0)
+        self.assertLessEqual(fallback_timeout, 0.30 - fallback_elapsed + 0.01)
+
+    def test_three_delayed_chunks_start_concurrently_and_finish_in_budget(self) -> None:
+        lock = threading.Lock()
+        all_started = threading.Event()
+        starts = []
+
+        class DelayedClient(FakeClient):
+            def direct_send(self, target_aid, payload, **kwargs):
+                with lock:
+                    starts.append(time.monotonic())
+                    if len(starts) == 3:
+                        all_started.set()
+                if not all_started.wait(timeout=1):
+                    raise TimeoutError("three frames did not overlap")
+                threading.Event().wait(0.05)
+                return super().direct_send(target_aid, payload, **kwargs)
+
+        runner = self.runner_mod.TestRunner("nyc", DelayedClient())
+        result = {
+            "kind": "group_messages_result",
+            "request_id": "three-concurrent-frames",
+            "details": {"body": "x" * 60_000},
+        }
+        payload = json.dumps(result).encode()
+        frames = self.runner_mod.frame_result(
+            payload, "fixture-transfer", result["request_id"],
+        )
+        self.assertEqual(3, len(frames))
+
+        started = time.monotonic()
+        self.assertTrue(runner._send_result_dm(
+            "a" * 64, payload, result, True, started + 1,
+        ))
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertLess(max(starts) - min(starts), 0.2)
+        runner._stop_publisher_workers([])
+
+    def test_expired_chunk_transfer_performs_no_http(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        result = {
+            "kind": "group_messages_result",
+            "request_id": "expired-chunks",
+            "details": {"body": "x" * 60_000},
+        }
+        payload = json.dumps(result).encode()
+
+        self.assertFalse(runner._send_result_dm(
+            "a" * 64, payload, result, True, time.monotonic() - 1,
+        ))
+        self.assertEqual([], client.direct)
+        runner._stop_publisher_workers([])
+
+    def test_queued_chunk_expiring_behind_http_slots_performs_no_http(self) -> None:
+        release = threading.Event()
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+
+        def occupy_slot() -> bool:
+            return release.wait(timeout=2)
+
+        blockers = [
+            runner._submit_http_job(occupy_slot, time.monotonic() + 1)
+            for _ in range(self.runner_mod.RESULT_HTTP_WORKERS)
+        ]
+        self.assertTrue(all(blocker is not None for blocker in blockers))
+        envelope = {"kind": "api_result", "request_id": "queued-expiry"}
+        expires = time.monotonic() + 0.05
+        queued = runner._submit_http_job(
+            runner._send_result_wire,
+            expires,
+            "a" * 64, b"frame", envelope, 1, 1, expires,
+        )
+        self.assertIsNotNone(queued)
+        threading.Event().wait(0.08)
+        release.set()
+        self.assertFalse(queued.result(timeout=1))
+        self.assertEqual([], client.direct)
+        runner._stop_publisher_workers([])
 
     def test_slow_result_does_not_starve_next_result_raw_window(self) -> None:
         slow_entered = threading.Event()
@@ -813,6 +903,137 @@ class X0xTestRunnerTests(unittest.TestCase):
         runner._stop_publisher_workers(workers)
         self.assertFalse(any(worker.is_alive() for worker in workers))
 
+    def test_chunk_http_parallelism_is_globally_bounded_across_results(self) -> None:
+        lock = threading.Lock()
+        release = threading.Event()
+        four_entered = threading.Event()
+        active = 0
+        maximum = 0
+        fallback_entered = threading.Event()
+
+        def enter() -> None:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == self.runner_mod.RESULT_HTTP_WORKERS:
+                    four_entered.set()
+
+        def leave() -> None:
+            nonlocal active
+            with lock:
+                active -= 1
+
+        class BlockingClient(FakeClient):
+            def direct_send(inner_self, target_aid, payload, **kwargs):
+                enter()
+                try:
+                    if not release.wait(timeout=2):
+                        raise TimeoutError("fixture release missing")
+                    return super().direct_send(target_aid, payload, **kwargs)
+                finally:
+                    leave()
+
+            def publish(inner_self, topic, payload, **kwargs):
+                enter()
+                fallback_entered.set()
+                try:
+                    return super().publish(topic, payload, **kwargs)
+                finally:
+                    leave()
+
+        runner = self.runner_mod.TestRunner("nyc", BlockingClient())
+        for index in range(2):
+            runner._enqueue_result(
+                {"kind": "group_messages_result", "request_id": f"large-{index}",
+                 "details": {"body": "x" * 60_000}},
+                f"{index + 1:064x}", True,
+            )
+        workers = runner._start_publisher_workers()
+        self.assertTrue(four_entered.wait(timeout=1))
+        fallback_result = []
+        fallback = threading.Thread(target=lambda: fallback_result.append(
+            runner._publish_result_legacy(
+                b"fallback", {"kind": "api_result", "request_id": "fallback"},
+                time.monotonic() + 1,
+            )
+        ))
+        fallback.start()
+        threading.Event().wait(0.05)
+        self.assertFalse(fallback_entered.is_set())
+        self.assertEqual(self.runner_mod.RESULT_HTTP_WORKERS, maximum)
+        release.set()
+        fallback.join(timeout=1)
+        self.assertFalse(fallback.is_alive())
+        self.assertEqual([True], fallback_result)
+        self.assertTrue(fallback_entered.is_set())
+        self.assertLessEqual(maximum, self.runner_mod.RESULT_HTTP_WORKERS)
+        runner._stop_publisher_workers(workers)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+
+    def test_http_task_admission_is_bounded(self) -> None:
+        release = threading.Event()
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+
+        def blocked() -> bool:
+            return release.wait(timeout=2)
+
+        futures = [
+            runner._submit_http_job(blocked, time.monotonic() + 1)
+            for _ in range(self.runner_mod.RESULT_HTTP_TASKS_MAX)
+        ]
+        self.assertTrue(all(future is not None for future in futures))
+        rejected = runner._submit_http_job(blocked, time.monotonic() + 0.05)
+        self.assertIsNone(rejected)
+        with runner._http_futures_lock:
+            self.assertEqual(
+                self.runner_mod.RESULT_HTTP_TASKS_MAX,
+                len(runner._http_futures),
+            )
+        release.set()
+        for future in futures:
+            self.assertTrue(future.result(timeout=1))
+        runner._stop_publisher_workers([])
+
+    def test_blocked_daemon_http_does_not_hold_process_open(self) -> None:
+        runner_path = Path(__file__).parent / "runners" / "x0x_test_runner.py"
+        script = r'''
+import importlib.util
+import sys
+import threading
+
+spec = importlib.util.spec_from_file_location("exit_runner", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+class Client:
+    pass
+
+runner = module.TestRunner("exit", Client())
+entered = threading.Event()
+blocked = threading.Event()
+
+def never_finishes():
+    entered.set()
+    blocked.wait()
+    return True
+
+future = runner._submit_http_job(never_finishes, None)
+assert future is not None and entered.wait(1)
+runner._stop_publisher_workers([])
+print("stop-returned")
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(runner_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("stop-returned", completed.stdout)
+
     def test_replay_stays_coalesced_during_concurrent_publication(self) -> None:
         from unittest.mock import patch
 
@@ -850,6 +1071,47 @@ class X0xTestRunnerTests(unittest.TestCase):
         replay_key = ("direct:" + ("a" * 64), "pool-replay")
         self.assertFalse(runner._replay[replay_key]["delivery_pending"])
         self.assertFalse(any(worker.is_alive() for worker in workers))
+
+    def test_replay_pin_waits_for_timed_out_http_task_to_finish(self) -> None:
+        from unittest.mock import patch
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class LingeringClient(FakeClient):
+            def direct_send(self, target_aid, payload, **kwargs):
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise TimeoutError("fixture release missing")
+                return super().direct_send(target_aid, payload, **kwargs)
+
+        runner = self.runner_mod.TestRunner("nyc", LingeringClient())
+        command = self._command("lingering-http", invite="one")
+
+        def action(_action, command_id, params, anchor, chunks):
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        with patch.object(runner, "_do_simple_action", side_effect=action), \
+                patch.object(self.runner_mod, "RESULT_RAW_BUDGET_SECS", 0.05), \
+                patch.object(self.runner_mod, "RESULT_TOTAL_BUDGET_SECS", 0.1), \
+                patch.object(runner, "_publish_result_legacy", return_value=False):
+            self._direct_command(runner, "a" * 64, command)
+            workers = runner._start_publisher_workers()
+            self.assertTrue(entered.wait(timeout=1))
+            threading.Event().wait(0.1)
+            replay_key = ("direct:" + ("a" * 64), "lingering-http")
+            self.assertTrue(runner._replay[replay_key]["delivery_pending"])
+            release.set()
+            deadline = time.monotonic() + 1
+            while (runner._replay[replay_key]["delivery_pending"]
+                   and time.monotonic() < deadline):
+                threading.Event().wait(0.01)
+            self.assertFalse(runner._replay[replay_key]["delivery_pending"])
+            runner._stop_publisher_workers(workers)
 
     def test_expired_queued_result_skips_transport_and_releases_pin(self) -> None:
         from unittest.mock import patch
@@ -918,6 +1180,16 @@ class X0xTestRunnerTests(unittest.TestCase):
 
         entered = threading.Event()
         release = threading.Event()
+        coordinator_deadline_read = threading.Event()
+        clock_lock = threading.Lock()
+        clock_values = iter([10.0, 12.0, 13.0, 15.0, 16.0, 18.0, 20.0])
+
+        def controlled_monotonic() -> float:
+            with clock_lock:
+                value = next(clock_values)
+                if value == 15.0:
+                    coordinator_deadline_read.set()
+                return value
 
         class StagedClient(FakeClient):
             def direct_send(self, target_aid, payload, **kwargs):
@@ -927,6 +1199,13 @@ class X0xTestRunnerTests(unittest.TestCase):
                 return super().direct_send(target_aid, payload, **kwargs)
 
         runner = self.runner_mod.TestRunner("sin", StagedClient())
+        send_result_wire = runner._send_result_wire
+
+        def gated_send_result_wire(*args, **kwargs):
+            if not coordinator_deadline_read.wait(timeout=2):
+                raise TimeoutError("coordinator did not calculate its deadline")
+            return send_result_wire(*args, **kwargs)
+
         envelope = {
             "kind": "api_result",
             "request_id": "request-7",
@@ -936,7 +1215,11 @@ class X0xTestRunnerTests(unittest.TestCase):
         with patch.object(
             self.runner_mod.time,
             "monotonic",
-            side_effect=[10.0, 12.0, 13.0, 15.0, 16.0, 17.0],
+            side_effect=controlled_monotonic,
+        ), patch.object(
+            runner,
+            "_send_result_wire",
+            side_effect=gated_send_result_wire,
         ), self.assertLogs("runner[sin]", level="INFO") as captured:
             runner._enqueue_result(envelope, target_aid="a" * 64)
             publisher = threading.Thread(target=runner._publisher_loop)
@@ -955,6 +1238,7 @@ class X0xTestRunnerTests(unittest.TestCase):
         self.assertIn("stage=wire_complete", logs)
         self.assertIn("wire=1/1 attempt=1/3 duration_ms=2000.0 outcome=ok", logs)
         self.assertIn("stage=publish_complete", logs)
+        self.assertIn("mode=v1 duration_ms=8000.0", logs)
         self.assertNotIn("must-not-log", logs)
 
     def test_command_stage_logs_are_timed_and_redact_failure_details(self) -> None:

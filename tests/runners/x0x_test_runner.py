@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -55,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 _LOCAL_TESTS_DIR = os.path.dirname(_SCRIPT_DIR)
@@ -103,6 +104,8 @@ RESULT_TOTAL_BUDGET_SECS = 30.0
 RESULT_RAW_BUDGET_SECS = 20.0
 RESULT_HTTP_TIMEOUT_SECS = 15.0
 RESULT_PUBLISHER_WORKERS = 4
+RESULT_HTTP_WORKERS = 4
+RESULT_HTTP_TASKS_MAX = 16
 COMMAND_REPLAY_MAX_ENTRIES = 256
 COMMAND_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 COMMAND_REPLAY_TTL_SECS = 300
@@ -392,6 +395,14 @@ class TestRunner:
         self._dispatch_context = threading.local()
         self._queued_result_keys: set = set()
         self._queued_result_lock = threading.Lock()
+        self._http_slots = threading.BoundedSemaphore(RESULT_HTTP_TASKS_MAX)
+        self._http_futures: set = set()
+        self._http_futures_lock = threading.Lock()
+        self._http_lifecycle_lock = threading.Lock()
+        self._http_work_q: "queue.Queue[Tuple[concurrent.futures.Future, Callable[..., bool], Tuple[Any, ...]]]" = queue.Queue(
+            maxsize=RESULT_HTTP_TASKS_MAX,
+        )
+        self._http_workers: List[threading.Thread] = []
 
     # ─── lifecycle ─────────────────────────────────────────────────────
     def run(self) -> int:
@@ -508,6 +519,21 @@ class TestRunner:
             except queue.Empty:
                 break
             self._release_dropped_result(item)
+        with self._http_lifecycle_lock:
+            while True:
+                try:
+                    future, _job, _args = self._http_work_q.get_nowait()
+                except queue.Empty:
+                    break
+                future.cancel()
+            with self._http_futures_lock:
+                outstanding = list(self._http_futures)
+        surviving = sum(not future.done() for future in outstanding)
+        if surviving:
+            self.log.warning(
+                "result HTTP shutdown left %d bounded running tasks to finish",
+                surviving,
+            )
 
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
@@ -537,6 +563,7 @@ class TestRunner:
                 envelope, target_aid, result_chunks_v2, replay_key,
             )
             payload = json.dumps(envelope).encode("utf-8")
+            submitted_http: List[concurrent.futures.Future] = []
             try:
                 if target_aid:
                     v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
@@ -557,6 +584,7 @@ class TestRunner:
                         envelope,
                         result_chunks_v2,
                         raw_deadline,
+                        submitted_http,
                     ):
                         self.log.info(
                             "result stage=publish_complete kind=%s request_id=%s "
@@ -575,7 +603,7 @@ class TestRunner:
                         envelope.get("command_id"), mode, len(payload),
                     )
                 if not self._publish_result_legacy(
-                    payload, envelope, total_deadline,
+                    payload, envelope, total_deadline, submitted_http,
                 ):
                     self.log.error(
                         "result delivery failed within budget: kind=%s "
@@ -584,10 +612,9 @@ class TestRunner:
                         envelope.get("command_id"),
                     )
             finally:
-                if delivery_key is not None:
-                    with self._queued_result_lock:
-                        self._queued_result_keys.discard(delivery_key)
-                self._mark_replay_delivery_finished(replay_key)
+                self._finish_result_after_http(
+                    submitted_http, delivery_key, replay_key,
+                )
 
     def _send_result_dm(
         self,
@@ -596,6 +623,7 @@ class TestRunner:
         envelope: Dict[str, Any],
         result_chunks_v2: bool = False,
         deadline: Optional[float] = None,
+        submitted_http: Optional[List[concurrent.futures.Future]] = None,
     ) -> bool:
         # Phase-A result DMs use the raw-QUIC message ACK path so the control
         # plane stays independent of PlumTree. If raw delivery fails, the
@@ -603,8 +631,12 @@ class TestRunner:
         # orchestrator can record the failure details.
         wire = b"x0xtest|res|" + base64.b64encode(payload)
         if len(wire) <= DM_MAX_BYTES:
-            return self._send_result_wire(
-                target_aid, wire, envelope, 1, 1, deadline,
+            return self._run_http_job(
+                lambda: self._send_result_wire(
+                    target_aid, wire, envelope, 1, 1, deadline,
+                ),
+                deadline,
+                submitted_http,
             )
         if result_chunks_v2:
             request_id = envelope.get("request_id")
@@ -616,21 +648,155 @@ class TestRunner:
             except ValueError as exc:
                 self.log.warning("result cannot be chunked: %s", exc)
                 return False
+            futures = []
             for wire_index, frame in enumerate(frames, start=1):
-                if not self._send_result_wire(
-                    target_aid,
-                    frame,
-                    envelope,
-                    wire_index,
-                    len(frames),
+                future = self._submit_http_job(
+                    self._send_result_wire,
                     deadline,
-                ):
+                    target_aid, frame, envelope, wire_index, len(frames), deadline,
+                )
+                if future is None:
+                    for pending in futures:
+                        pending.cancel()
                     return False
-            return True
+                futures.append(future)
+                if submitted_http is not None:
+                    submitted_http.append(future)
+            remaining = None if deadline is None else max(
+                0.0, deadline - time.monotonic(),
+            )
+            done, pending = concurrent.futures.wait(
+                futures,
+                timeout=remaining,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
+            for future in pending:
+                future.cancel()
+            if pending:
+                return False
+            try:
+                return all(future.result() for future in done)
+            except (concurrent.futures.CancelledError, Exception):
+                return False
         # Older orchestrators cannot reassemble chunks. Let the publisher
         # loop use the existing PubSub fallback without attempting an
         # over-limit direct message.
         return False
+
+    def _run_http_job(
+        self,
+        job: Callable[[], bool],
+        deadline: Optional[float],
+        submitted_http: Optional[List[concurrent.futures.Future]] = None,
+    ) -> bool:
+        future = self._submit_http_job(job, deadline)
+        if future is None:
+            return False
+        if submitted_http is not None:
+            submitted_http.append(future)
+        timeout = None if deadline is None else max(
+            0.0, deadline - time.monotonic(),
+        )
+        try:
+            return bool(future.result(timeout=timeout))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return False
+        except (concurrent.futures.CancelledError, Exception):
+            return False
+
+    def _submit_http_job(
+        self,
+        job: Callable[..., bool],
+        deadline: Optional[float],
+        *args: Any,
+    ) -> Optional[concurrent.futures.Future]:
+        if self._stop.is_set():
+            return None
+        timeout = None if deadline is None else max(
+            0.0, deadline - time.monotonic(),
+        )
+        if timeout == 0.0 or not self._http_slots.acquire(timeout=timeout):
+            return None
+        with self._http_lifecycle_lock:
+            if self._stop.is_set():
+                self._http_slots.release()
+                return None
+            self._ensure_http_workers_locked()
+            future: concurrent.futures.Future = concurrent.futures.Future()
+            with self._http_futures_lock:
+                self._http_futures.add(future)
+
+            def terminal(done: concurrent.futures.Future) -> None:
+                with self._http_futures_lock:
+                    self._http_futures.discard(done)
+                self._http_slots.release()
+
+            future.add_done_callback(terminal)
+            try:
+                self._http_work_q.put_nowait((future, job, args))
+            except queue.Full:
+                future.cancel()
+                return None
+        return future
+
+    def _ensure_http_workers_locked(self) -> None:
+        if self._http_workers:
+            return
+        self._http_workers = [
+            threading.Thread(
+                target=self._http_worker_loop,
+                name=f"x0x-result-http-{index + 1}",
+                daemon=True,
+            )
+            for index in range(RESULT_HTTP_WORKERS)
+        ]
+        for worker in self._http_workers:
+            worker.start()
+
+    def _http_worker_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                future, job, args = self._http_work_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(job(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+    def _finish_result_after_http(
+        self,
+        futures: List[concurrent.futures.Future],
+        delivery_key: Optional[Tuple[Any, ...]],
+        replay_key: Optional[Tuple[str, str]],
+    ) -> None:
+        pending = [future for future in futures if not future.done()]
+
+        def release() -> None:
+            if delivery_key is not None:
+                with self._queued_result_lock:
+                    self._queued_result_keys.discard(delivery_key)
+            self._mark_replay_delivery_finished(replay_key)
+
+        if not pending:
+            release()
+            return
+        lock = threading.Lock()
+        remaining = [len(pending)]
+
+        def completed(_future: concurrent.futures.Future) -> None:
+            should_release = False
+            with lock:
+                remaining[0] -= 1
+                should_release = remaining[0] == 0
+            if should_release:
+                release()
+
+        for future in pending:
+            future.add_done_callback(completed)
 
     def _send_result_wire(
         self,
@@ -642,6 +808,8 @@ class TestRunner:
         deadline: Optional[float] = None,
     ) -> bool:
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+            if self._stop.is_set():
+                return False
             attempt_started = time.monotonic()
             if deadline is not None:
                 remaining = deadline - attempt_started
@@ -732,6 +900,21 @@ class TestRunner:
         payload: bytes,
         envelope: Dict[str, Any],
         deadline: Optional[float] = None,
+        submitted_http: Optional[List[concurrent.futures.Future]] = None,
+    ) -> bool:
+        return self._run_http_job(
+            lambda: self._publish_result_legacy_http(
+                payload, envelope, deadline,
+            ),
+            deadline,
+            submitted_http,
+        )
+
+    def _publish_result_legacy_http(
+        self,
+        payload: bytes,
+        envelope: Dict[str, Any],
+        deadline: Optional[float] = None,
     ) -> bool:
         if self._pubsub_disabled_after_discover:
             self.log.error(
@@ -742,6 +925,8 @@ class TestRunner:
             )
             return False
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+            if self._stop.is_set():
+                return False
             attempt_started = time.monotonic()
             if deadline is not None:
                 remaining = deadline - attempt_started
