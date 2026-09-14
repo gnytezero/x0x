@@ -111,8 +111,9 @@ fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
         .map_err(|e| KvError::Gossip(format!("retained group image serialization failed: {e}")))?;
     if bytes.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
         return Err(KvError::Gossip(format!(
-            "complete group history is {} bytes, above the {}-byte indivisible payload limit; paging is required",
-            bytes.len(), MAX_RETAINED_GROUP_IMAGE_BYTES
+            "complete group history is {} bytes, above the {}-byte retained-image resource limit",
+            bytes.len(),
+            MAX_RETAINED_GROUP_IMAGE_BYTES
         )));
     }
     Ok(bytes)
@@ -3497,7 +3498,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_group_history_reports_paging_required() {
+    fn group_history_above_single_frame_serializes_and_pages_losslessly() {
         let owner = agent(1);
         let mut group = crate::groups::GroupInfo::new(
             "public".to_string(),
@@ -3529,8 +3530,34 @@ mod tests {
                 )
                 .expect("large value");
         }
-        let error = serialize_retained_group_image(&store).expect_err("must require paging");
-        assert!(error.to_string().contains("paging is required"), "{error}");
+        let image = serialize_retained_group_image(&store).expect("bounded retained image");
+        let max_wire = crate::gossip::pubsub::max_signed_v3_payload_bytes("store/public-paged")
+            .expect("signed wire budget");
+        assert!(
+            image.len() > max_wire,
+            "fixture must exceed one signed gossip frame"
+        );
+        let encoded_pages = crate::kv::retained_paging::split_image(&image, max_wire)
+            .expect("large retained image must page");
+        assert!(encoded_pages.len() > 2, "manifest plus multiple pages");
+
+        let manifest = crate::kv::retained_paging::decode_page(&encoded_pages[0])
+            .expect("decode manifest")
+            .expect("framed manifest");
+        let mut assembler =
+            crate::kv::retained_paging::RetainedPageAssembler::from_manifest(&manifest)
+                .expect("valid manifest");
+        let mut reassembled = None;
+        for encoded in encoded_pages.iter().skip(1) {
+            let page = crate::kv::retained_paging::decode_page(encoded)
+                .expect("decode page")
+                .expect("framed page");
+            reassembled = assembler.push(page).expect("valid page");
+        }
+        assert!(
+            reassembled.as_deref() == Some(image.as_slice()),
+            "reassembled retained image must match source bytes"
+        );
     }
 
     #[test]
