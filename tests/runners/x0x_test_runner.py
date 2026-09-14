@@ -352,7 +352,7 @@ class TestRunner:
         # target_aid=None means publish on the legacy results topic
         # (last-resort fallback for orchestrators that don't include
         # an anchor address).
-        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool]]" = (
+        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool, float]]" = (
             queue.Queue(maxsize=RESULT_QUEUE_MAX)
         )
         self._agent_id: Optional[str] = None
@@ -456,9 +456,19 @@ class TestRunner:
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                envelope, target_aid, result_chunks_v2 = self._send_q.get(timeout=0.5)
+                envelope, target_aid, result_chunks_v2, enqueued_at = self._send_q.get(
+                    timeout=0.5
+                )
             except queue.Empty:
                 continue
+            publish_started = time.monotonic()
+            self.log.info(
+                "result stage=publish_start kind=%s request_id=%s command_id=%s "
+                "queue_wait_ms=%.1f monotonic=%.6f",
+                envelope.get("kind"), envelope.get("request_id"),
+                envelope.get("command_id"),
+                max(0.0, (publish_started - enqueued_at) * 1000), publish_started,
+            )
             payload = json.dumps(envelope).encode("utf-8")
             if target_aid:
                 v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
@@ -472,6 +482,13 @@ class TestRunner:
                 if self._send_result_dm(
                     target_aid, payload, envelope, result_chunks_v2,
                 ):
+                    self.log.info(
+                        "result stage=publish_complete kind=%s request_id=%s "
+                        "command_id=%s mode=%s duration_ms=%.1f",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"), mode,
+                        (time.monotonic() - publish_started) * 1000,
+                    )
                     continue
                 # DM failed irretrievably — fall through to pubsub so the
                 # orchestrator at least sees the result on the legacy
@@ -497,7 +514,7 @@ class TestRunner:
         # orchestrator can record the failure details.
         wire = b"x0xtest|res|" + base64.b64encode(payload)
         if len(wire) <= DM_MAX_BYTES:
-            return self._send_result_wire(target_aid, wire)
+            return self._send_result_wire(target_aid, wire, envelope, 1, 1)
         if result_chunks_v2:
             request_id = envelope.get("request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -508,14 +525,27 @@ class TestRunner:
             except ValueError as exc:
                 self.log.warning("result cannot be chunked: %s", exc)
                 return False
-            return all(self._send_result_wire(target_aid, frame) for frame in frames)
+            for wire_index, frame in enumerate(frames, start=1):
+                if not self._send_result_wire(
+                    target_aid, frame, envelope, wire_index, len(frames)
+                ):
+                    return False
+            return True
         # Older orchestrators cannot reassemble chunks. Let the publisher
         # loop use the existing PubSub fallback without attempting an
         # over-limit direct message.
         return False
 
-    def _send_result_wire(self, target_aid: str, wire: bytes) -> bool:
+    def _send_result_wire(
+        self,
+        target_aid: str,
+        wire: bytes,
+        envelope: Dict[str, Any],
+        wire_index: int,
+        wire_count: int,
+    ) -> bool:
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+            attempt_started = time.monotonic()
             try:
                 self.client.direct_send(
                     target_aid,
@@ -525,30 +555,49 @@ class TestRunner:
                     raw_quic_receive_ack_ms=RESULT_RAW_QUIC_ACK_MS,
                     stop_fallback_on_raw_error=True,
                 )
+                self.log.info(
+                    "result stage=wire_complete kind=%s request_id=%s command_id=%s "
+                    "wire=%d/%d attempt=%d/%d duration_ms=%.1f outcome=ok",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), wire_index, wire_count, attempt,
+                    PUBLISH_RETRY_MAX,
+                    (time.monotonic() - attempt_started) * 1000,
+                )
                 return True
             except urllib.error.HTTPError as exc:
+                duration_ms = (time.monotonic() - attempt_started) * 1000
+                status = exc.code
                 exc.close()
                 # 404 = recipient_key_unavailable; not transient.
                 if exc.code == 404:
-                    self.log.debug(
-                        "DM result giving up: HTTP 404 %s",
-                        exc.reason,
+                    self.log.info(
+                        "result stage=wire_complete kind=%s request_id=%s "
+                        "command_id=%s wire=%d/%d attempt=%d/%d "
+                        "duration_ms=%.1f outcome=http_%d final=true",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"), wire_index, wire_count,
+                        attempt, PUBLISH_RETRY_MAX, duration_ms, status,
                     )
                     return False
-                self.log.debug(
-                    "DM result attempt %d/%d HTTP %d: %s",
-                    attempt,
-                    PUBLISH_RETRY_MAX,
-                    exc.code,
-                    exc.reason,
+                self.log.warning(
+                    "result stage=wire_complete kind=%s request_id=%s "
+                    "command_id=%s wire=%d/%d attempt=%d/%d "
+                    "duration_ms=%.1f outcome=http_%d",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), wire_index, wire_count,
+                    attempt, PUBLISH_RETRY_MAX, duration_ms, status,
                 )
                 time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
             except Exception as exc:
-                self.log.debug(
-                    "DM result attempt %d/%d failed: %s",
-                    attempt,
-                    PUBLISH_RETRY_MAX,
-                    exc,
+                self.log.warning(
+                    "result stage=wire_complete kind=%s request_id=%s "
+                    "command_id=%s wire=%d/%d attempt=%d/%d "
+                    "duration_ms=%.1f outcome=error error_type=%s",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), wire_index, wire_count,
+                    attempt, PUBLISH_RETRY_MAX,
+                    (time.monotonic() - attempt_started) * 1000,
+                    type(exc).__name__,
                 )
                 time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
         return False
@@ -559,23 +608,39 @@ class TestRunner:
         if self._pubsub_disabled_after_discover:
             self.log.error(
                 "dropping result after DM failure because pubsub fallback is "
-                "disabled after discover: %s",
-                envelope,
+                "disabled after discover: kind=%s request_id=%s command_id=%s",
+                envelope.get("kind"), envelope.get("request_id"),
+                envelope.get("command_id"),
             )
             return
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+            attempt_started = time.monotonic()
             try:
                 self.client.publish(LEGACY_RESULTS_TOPIC, payload)
+                self.log.info(
+                    "result stage=fallback_complete kind=%s request_id=%s "
+                    "command_id=%s attempt=%d/%d duration_ms=%.1f outcome=ok",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), attempt, PUBLISH_RETRY_MAX,
+                    (time.monotonic() - attempt_started) * 1000,
+                )
                 return
             except Exception as exc:
                 self.log.warning(
-                    "publish result attempt %d/%d failed: %s",
-                    attempt,
-                    PUBLISH_RETRY_MAX,
-                    exc,
+                    "result stage=fallback_complete kind=%s request_id=%s "
+                    "command_id=%s attempt=%d/%d duration_ms=%.1f "
+                    "outcome=error error_type=%s",
+                    envelope.get("kind"), envelope.get("request_id"),
+                    envelope.get("command_id"), attempt, PUBLISH_RETRY_MAX,
+                    (time.monotonic() - attempt_started) * 1000,
+                    type(exc).__name__,
                 )
                 time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
-        self.log.error("dropping result after retries: %s", envelope)
+        self.log.error(
+            "dropping result after retries: kind=%s request_id=%s command_id=%s",
+            envelope.get("kind"), envelope.get("request_id"),
+            envelope.get("command_id"),
+        )
 
     def _enqueue_result(
         self,
@@ -592,14 +657,21 @@ class TestRunner:
             current_ms = now_ms()
             body["ts_ms"] = current_ms
         self._prune_stale_results(current_ms)
-        item = (body, target_aid, result_chunks_v2)
+        enqueued_at = time.monotonic()
+        item = (body, target_aid, result_chunks_v2, enqueued_at)
         try:
             self._send_q.put_nowait(item)
+            self.log.info(
+                "result stage=enqueued kind=%s request_id=%s command_id=%s "
+                "monotonic=%.6f queue_depth=%d",
+                body.get("kind"), body.get("request_id"), body.get("command_id"),
+                enqueued_at, self._send_q.qsize(),
+            )
             return
         except queue.Full:
             pass
         try:
-            dropped, _, _ = self._send_q.get_nowait()
+            dropped, _, _, _ = self._send_q.get_nowait()
             self.log.warning(
                 "dropping oldest queued result after result buffer filled: "
                 "kind=%s request_id=%s",
@@ -610,6 +682,12 @@ class TestRunner:
             pass
         try:
             self._send_q.put_nowait(item)
+            self.log.info(
+                "result stage=enqueued kind=%s request_id=%s command_id=%s "
+                "monotonic=%.6f queue_depth=%d",
+                body.get("kind"), body.get("request_id"), body.get("command_id"),
+                enqueued_at, self._send_q.qsize(),
+            )
         except queue.Full:
             self.log.error(
                 "dropping current result because result buffer remained full: "
@@ -627,7 +705,7 @@ class TestRunner:
                 item = self._send_q.get_nowait()
             except queue.Empty:
                 break
-            envelope, _, _ = item
+            envelope, _, _, _ = item
             ts_ms = envelope.get("ts_ms")
             if isinstance(ts_ms, int) and ts_ms < cutoff_ms:
                 dropped += 1
@@ -904,6 +982,14 @@ class TestRunner:
             (anchor_aid or "")[:16],
         )
         result_chunks_v2 = cmd.get("result_chunks_v2") is True
+        request_id = params.get("request_id")
+        command_started = time.monotonic()
+        dispatch_status = "returned"
+        self.log.info(
+            "command stage=start action=%s request_id=%s command_id=%s "
+            "monotonic=%.6f",
+            action, request_id, cmd_id, command_started,
+        )
         try:
             if action == "discover":
                 self._enqueue_result(
@@ -964,7 +1050,12 @@ class TestRunner:
                     result_chunks_v2=result_chunks_v2,
                 )
         except Exception as exc:
-            self.log.exception("command failed: %s", exc)
+            dispatch_status = "raised"
+            self.log.error(
+                "command failed action=%s request_id=%s command_id=%s "
+                "error_type=%s",
+                action, request_id, cmd_id, type(exc).__name__,
+            )
             self._enqueue_result(
                 {
                     "kind": "error",
@@ -974,6 +1065,15 @@ class TestRunner:
                 },
                 target_aid=anchor_aid,
                 result_chunks_v2=result_chunks_v2,
+            )
+        finally:
+            command_ended = time.monotonic()
+            self.log.info(
+                "command stage=end action=%s request_id=%s command_id=%s "
+                "monotonic=%.6f duration_ms=%.1f dispatch_status=%s",
+                action, request_id, cmd_id, command_ended,
+                (command_ended - command_started) * 1000,
+                dispatch_status,
             )
 
     def _should_disable_pubsub_after_discover(

@@ -121,7 +121,12 @@ class X0xTestRunnerTests(unittest.TestCase):
             - ((self.runner_mod.RESULT_QUEUE_MAX_AGE_SECS + 1) * 1000)
         )
         runner._send_q.put_nowait(
-            ({"kind": "send_result", "request_id": "stale", "ts_ms": stale_ts}, None, False)
+            (
+                {"kind": "send_result", "request_id": "stale", "ts_ms": stale_ts},
+                None,
+                False,
+                time.monotonic(),
+            )
         )
 
         runner._enqueue_result({"kind": "send_result", "request_id": "fresh"})
@@ -152,23 +157,35 @@ class X0xTestRunnerTests(unittest.TestCase):
         self.assertTrue(all(len(wire) <= self.runner_mod.DM_MAX_BYTES for wire in chunks))
 
     def test_chunk_413_falls_back_to_legacy_pubsub(self) -> None:
+        from unittest.mock import patch
+
         client = FakeClient()
         client.direct_error_code = 413
         runner = self.runner_mod.TestRunner("nyc", client)
         anchor = "a" * 64
         large = {"kind": "api_result", "request_id": "large-413",
                  "details": {"body": "x" * 60_000}}
-        runner._enqueue_result(large, target_aid=anchor, result_chunks_v2=True)
-        publisher = threading.Thread(target=runner._publisher_loop)
-        publisher.start()
-        deadline = time.monotonic() + 2.0
-        while not client.published and time.monotonic() < deadline:
-            time.sleep(0.01)
-        runner._stop.set()
-        publisher.join(timeout=10.0)
+        with patch.object(self.runner_mod.time, "sleep", return_value=None), \
+                self.assertLogs("runner[nyc]", level="DEBUG") as captured:
+            runner._enqueue_result(large, target_aid=anchor, result_chunks_v2=True)
+            publisher = threading.Thread(target=runner._publisher_loop)
+            publisher.start()
+            deadline = time.monotonic() + 2.0
+            while not client.published and time.monotonic() < deadline:
+                threading.Event().wait(0.01)
+            runner._stop.set()
+            publisher.join(timeout=10.0)
         self.assertFalse(publisher.is_alive())
         self.assertGreaterEqual(len(client.direct), self.runner_mod.PUBLISH_RETRY_MAX)
         self.assertEqual(self.runner_mod.LEGACY_RESULTS_TOPIC, client.published[0][0])
+        logs = "\n".join(captured.output)
+        self.assertEqual(
+            self.runner_mod.PUBLISH_RETRY_MAX,
+            logs.count("stage=wire_complete"),
+        )
+        self.assertIn("outcome=http_413", logs)
+        self.assertIn("stage=fallback_complete", logs)
+        self.assertNotIn("fake direct rejection", logs)
 
     def test_chunk_negotiation_is_scoped_to_each_command(self) -> None:
         client = FakeClient()
@@ -182,6 +199,86 @@ class X0xTestRunnerTests(unittest.TestCase):
         second = runner._send_q.get_nowait()
         self.assertTrue(first[2])
         self.assertFalse(second[2])
+
+    def test_result_stage_logs_queue_wait_and_owned_publish_completion(self) -> None:
+        from unittest.mock import patch
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class StagedClient(FakeClient):
+            def direct_send(self, target_aid, payload, **kwargs):
+                entered.set()
+                if not release.wait(timeout=2.0):
+                    raise TimeoutError("fixture release missing")
+                return super().direct_send(target_aid, payload, **kwargs)
+
+        runner = self.runner_mod.TestRunner("sin", StagedClient())
+        envelope = {
+            "kind": "api_result",
+            "request_id": "request-7",
+            "command_id": "command-7",
+            "details": {"token": "must-not-log"},
+        }
+        with patch.object(
+            self.runner_mod.time,
+            "monotonic",
+            side_effect=[10.0, 12.0, 13.0, 15.0, 16.0],
+        ), self.assertLogs("runner[sin]", level="INFO") as captured:
+            runner._enqueue_result(envelope, target_aid="a" * 64)
+            publisher = threading.Thread(target=runner._publisher_loop)
+            publisher.start()
+            self.assertTrue(entered.wait(timeout=2.0))
+            runner._stop.set()
+            release.set()
+            publisher.join(timeout=2.0)
+
+        self.assertFalse(publisher.is_alive())
+        logs = "\n".join(captured.output)
+        self.assertIn("stage=enqueued kind=api_result", logs)
+        self.assertIn("request_id=request-7 command_id=command-7", logs)
+        self.assertIn("stage=publish_start", logs)
+        self.assertIn("queue_wait_ms=2000.0", logs)
+        self.assertIn("stage=wire_complete", logs)
+        self.assertIn("wire=1/1 attempt=1/3 duration_ms=2000.0 outcome=ok", logs)
+        self.assertIn("stage=publish_complete", logs)
+        self.assertNotIn("must-not-log", logs)
+
+    def test_command_stage_logs_are_timed_and_redact_failure_details(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("sin", FakeClient())
+        command = {
+            "action": "group_list",
+            "command_id": "command-8",
+            "anchor_aid": "a" * 64,
+            "params": {"request_id": "request-8"},
+        }
+        with patch.object(
+            runner,
+            "_do_simple_action",
+            side_effect=RuntimeError("secret response body"),
+        ), patch.object(
+            self.runner_mod.time,
+            "monotonic",
+            side_effect=[20.0, 21.0, 23.0],
+        ), self.assertLogs("runner[sin]", level="INFO") as captured:
+            runner._dispatch_command(command)
+
+        logs = "\n".join(captured.output)
+        self.assertIn(
+            "command stage=start action=group_list request_id=request-8 "
+            "command_id=command-8 monotonic=20.000000",
+            logs,
+        )
+        self.assertIn("error_type=RuntimeError", logs)
+        self.assertIn(
+            "command stage=end action=group_list request_id=request-8 "
+            "command_id=command-8 monotonic=23.000000 "
+            "duration_ms=3000.0 dispatch_status=raised",
+            logs,
+        )
+        self.assertNotIn("secret response body", logs)
 
     def test_runner_does_not_echo_chunked_result_dm(self) -> None:
         client = FakeClient()
