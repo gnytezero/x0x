@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 179,
+  "endpoint_count": 182,
   "endpoints": [
     {
       "category": "status",
@@ -19,6 +19,24 @@
       "path": "/status",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store legacy download",
+      "description": "Download the exact reviewed legacy Wiki/Web snapshot without changing it",
+      "method": "GET",
+      "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "idempotency_key",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
@@ -2823,6 +2841,40 @@
             "cli": "NAME",
             "in": "body",
             "name": "name",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store legacy imports",
+      "description": "List local legacy Wiki/Web snapshots with durable import and local sync-publication status",
+      "method": "GET",
+      "path": "/groups/:id/stores/:app/legacy-imports",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store legacy import",
+      "description": "Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync",
+      "method": "POST",
+      "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "source_digest",
+            "required": true
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "idempotency_key",
             "required": true
           }
         ],

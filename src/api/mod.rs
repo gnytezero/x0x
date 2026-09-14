@@ -247,6 +247,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/stores/:app/legacy-imports/:source_id",
+        cli_name: "group store legacy download",
+        description: "Download the exact reviewed legacy Wiki/Web snapshot without changing it",
+        category: "stores",
+        request: RequestSpec::Fields(&[RequestField::query(
+            "idempotency_key",
+            false,
+        )]),
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/shutdown",
         cli_name: "stop",
@@ -1532,6 +1543,22 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Open a creator-anchored group store: signed plaintext for SignedPublic, encrypted for MlsEncrypted GSS; current group policy gates writes",
         category: "stores",
         request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/stores/:app/legacy-imports",
+        cli_name: "group store legacy imports",
+        description: "List local legacy Wiki/Web snapshots with durable import and local sync-publication status",
+        category: "stores",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/stores/:app/legacy-imports/:source_id",
+        cli_name: "group store legacy import",
+        description: "Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync",
+        category: "stores",
+        request: RequestSpec::Fields(&[RequestField::body("source_digest", true), RequestField::body("idempotency_key", true)]),
     },
     EndpointDef {
         method: Method::Get,

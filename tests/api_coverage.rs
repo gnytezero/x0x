@@ -522,6 +522,21 @@ const COVERED: &[CoveredEndpoint] = &[
         "/groups/:id/stores",
         create_group_kv_store_route_creates_encrypted_store
     ),
+    covered!(
+        Get,
+        "/groups/:id/stores/:app/legacy-imports",
+        legacy_import_endpoint_discovery_authority_digest_and_stale_writer
+    ),
+    covered!(
+        Get,
+        "/groups/:id/stores/:app/legacy-imports/:source_id",
+        legacy_import_endpoint_discovery_authority_digest_and_stale_writer
+    ),
+    covered!(
+        Post,
+        "/groups/:id/stores/:app/legacy-imports/:source_id",
+        legacy_import_endpoint_discovery_authority_digest_and_stale_writer
+    ),
     covered!(Post, "/stores/:id/join", "POST /stores/:id/join"),
     covered!(Get, "/stores/:id/keys", "GET /stores/:id/keys"),
     covered!(Put, "/stores/:id/:key", "PUT /stores/:id/:key"),

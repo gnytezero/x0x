@@ -26,8 +26,10 @@ pub mod delta;
 pub mod encrypted;
 pub mod entry;
 pub mod error;
+pub(crate) mod retained_paging;
 pub mod store;
 pub mod sync;
+pub mod treekem;
 
 pub use delta::KvStoreDelta;
 pub use encrypted::{
@@ -42,3 +44,4 @@ pub use store::{
     OwnershipStatus, MAX_SELFKEYED_BYTES_PER_AGENT, MAX_SELFKEYED_KEYS_PER_AGENT,
 };
 pub use sync::KvStoreSync;
+pub use treekem::{SharedTreeKemKvProtector, TreeKemKvProtector, TreeKemKvStoreRecordV1};

@@ -605,6 +605,73 @@ pub async fn group_store_create(client: &DaemonClient, group_id: &str, name: &st
     Ok(())
 }
 
+/// `x0x group store legacy imports` — enumerate exact local migration sources.
+pub async fn legacy_store_imports(client: &DaemonClient, group_id: &str, app: &str) -> Result<()> {
+    client
+        .run_get(&format!("/groups/{group_id}/stores/{app}/legacy-imports"))
+        .await
+}
+
+/// `x0x group store legacy download` — retrieve an unchanged source snapshot.
+pub async fn legacy_store_download(
+    client: &DaemonClient,
+    group_id: &str,
+    app: &str,
+    source_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
+    client
+        .run_get(&legacy_download_path(
+            group_id,
+            app,
+            source_id,
+            idempotency_key,
+        )?)
+        .await
+}
+
+fn legacy_download_path(
+    group_id: &str,
+    app: &str,
+    source_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<String> {
+    let mut path = format!("/groups/{group_id}/stores/{app}/legacy-imports/{source_id}");
+    if let Some(key) = idempotency_key {
+        let mut url = reqwest::Url::parse("http://localhost")?;
+        url.query_pairs_mut().append_pair("idempotency_key", key);
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+    }
+    Ok(path)
+}
+
+/// `x0x group store legacy import` — endorse and merge one reviewed source.
+pub async fn legacy_store_import(
+    client: &DaemonClient,
+    group_id: &str,
+    app: &str,
+    source_id: &str,
+    source_digest: &str,
+    idempotency_key: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({
+        "source_digest": source_digest,
+        "idempotency_key": idempotency_key,
+    });
+    let response = client
+        .post(
+            &format!("/groups/{group_id}/stores/{app}/legacy-imports/{source_id}"),
+            &body,
+        )
+        .await?;
+    print_value(client.format(), &response);
+    Ok(())
+}
+
 pub async fn state(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_get(&format!("/groups/{group_id}/state")).await
 }
@@ -1097,5 +1164,16 @@ mod tests {
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = secure_reseal(&client, "group-123", "agent-456").await;
         assert!(result.is_ok(), "secure_reseal should succeed: {:?}", result);
+    }
+
+    #[test]
+    fn legacy_download_path_preserves_legacy_and_encodes_pending_key() -> anyhow::Result<()> {
+        let base = "/groups/group/stores/wiki/legacy-imports/source";
+        assert_eq!(legacy_download_path("group", "wiki", "source", None)?, base);
+        assert_eq!(
+            legacy_download_path("group", "wiki", "source", Some("retry key&digest"))?,
+            format!("{base}?idempotency_key=retry+key%26digest")
+        );
+        Ok(())
     }
 }

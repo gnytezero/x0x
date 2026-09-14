@@ -41,7 +41,9 @@ pub use self::discovery::{
     DEFAULT_MAX_ENTRIES_PER_SHARD, DEFAULT_MAX_SUBSCRIPTIONS, DIRECTORY_TOPIC_PREFIX,
     MAX_NAME_WORDS, MAX_TAGS_PER_GROUP, SHARD_COUNT,
 };
-pub use self::kv_context::{GssKvSecureContext, PublicGroupKvContext};
+pub use self::kv_context::{
+    GssKvSecureContext, PublicGroupKvContext, TreeKemKvAuthorizationContext,
+};
 pub use self::member::{GroupMember, GroupMemberState, GroupRole};
 pub use self::owner_cert::{
     failing_active_members, verify_owner_certified_member, OwnerCertEvidence, OwnerCertFailure,

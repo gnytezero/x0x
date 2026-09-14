@@ -10,11 +10,12 @@ use super::super::{
 };
 use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use crate as x0x;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,48 @@ use x0x::contacts::TrustLevel;
 use x0x::identity::AgentId;
 use x0x::kv::encrypted::KvSecureContext;
 use x0x::logging::LogHexId;
+
+const LEGACY_PAGE_SNAPSHOT_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct ImportLegacyStoreRequest {
+    source_digest: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LegacyStoreCandidate {
+    target_group_id: String,
+    source_store_id: String,
+    topic: String,
+    owner: String,
+    source_digest: String,
+    active_keys: usize,
+    keys: Vec<String>,
+    ambiguous_group_prefix: bool,
+    conflicts: Vec<String>,
+    imported: bool,
+    import_pending: bool,
+    publish_pending: bool,
+    publish_accepted: bool,
+    import_idempotency_key: Option<String>,
+    can_import: bool,
+    import_refusal_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(in crate::server) struct LegacyDownloadQuery {
+    idempotency_key: Option<String>,
+}
+
+struct LoadedLegacyStore {
+    store: x0x::kv::KvStore,
+    store_id_hex: String,
+    topic: String,
+    owner: AgentId,
+    digest: String,
+    bytes: Vec<u8>,
+}
 
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
 
@@ -721,6 +764,346 @@ struct GssGroupStoreBinding {
     topic: String,
 }
 
+/// Live TreeKEM adapter for one deterministic group store.
+///
+/// The group mutex covers crypto and the durable snapshot write. A failed
+/// write restores the pre-operation ratchet before releasing the mutex, so a
+/// record is never acknowledged or published from state that only existed in
+/// memory.
+struct TreeKemGroupStoreProtector {
+    state: Arc<AppState>,
+    group_key: String,
+    stable_group_id: String,
+    authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
+    invalid: std::sync::atomic::AtomicBool,
+}
+
+impl TreeKemGroupStoreProtector {
+    fn new(
+        state: &Arc<AppState>,
+        binding: &GssGroupStoreBinding,
+        authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
+    ) -> Self {
+        Self {
+            state: Arc::clone(state),
+            group_key: binding.group_key.clone(),
+            stable_group_id: binding.stable_group_id.clone(),
+            authorization,
+            invalid: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn current_info(&self) -> x0x::kv::Result<x0x::groups::GroupInfo> {
+        if self.invalid.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM group store is retired".to_string(),
+            ));
+        }
+        let groups = self.state.named_groups.read().await;
+        let info = groups.get(&self.group_key).cloned().ok_or_else(|| {
+            x0x::kv::KvError::Unauthorized("TreeKEM group is unavailable".to_string())
+        })?;
+        if info.withdrawn
+            || info.is_fork_quarantined()
+            || info.stable_group_id() != self.stable_group_id
+            || info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted
+            || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM group binding is no longer eligible".to_string(),
+            ));
+        }
+        self.authorization.update_from_group(&info);
+        Ok(info)
+    }
+
+    fn permits(info: &x0x::groups::GroupInfo, agent: &AgentId, writer: bool) -> bool {
+        let Some(member) = info.members_v2.get(&hex::encode(agent.as_bytes())) else {
+            return false;
+        };
+        if !member.is_active() {
+            return false;
+        }
+        if !writer {
+            return true;
+        }
+        match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly => true,
+            x0x::groups::GroupWriteAccess::AdminOnly => {
+                member.role.at_least(x0x::groups::GroupRole::Admin)
+            }
+            x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+        }
+    }
+
+    fn authorization_binding(info: &x0x::groups::GroupInfo) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.kv.treekem-roster-policy.v1");
+        hasher.update(info.stable_group_id().as_bytes());
+        hasher.update(&info.state_revision.to_le_bytes());
+        hasher.update(x0x::groups::compute_roster_root(&info.members_v2).as_bytes());
+        if let Some(binding) = info.security_binding.as_deref() {
+            hasher.update(binding.as_bytes());
+        }
+        hasher.update(&[match info.policy.read_access {
+            x0x::groups::GroupReadAccess::Public => 0,
+            x0x::groups::GroupReadAccess::MembersOnly => 1,
+        }]);
+        hasher.update(&[match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly => 0,
+            x0x::groups::GroupWriteAccess::ModeratedPublic => 1,
+            x0x::groups::GroupWriteAccess::AdminOnly => 2,
+        }]);
+        *hasher.finalize().as_bytes()
+    }
+
+    async fn live_group(
+        &self,
+    ) -> x0x::kv::Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
+        self.state
+            .treekem_groups
+            .read()
+            .await
+            .get(&self.group_key)
+            .cloned()
+            .ok_or_else(|| {
+                x0x::kv::KvError::SecureRecord("live TreeKEM ratchet is unavailable".to_string())
+            })
+    }
+
+    fn map_crypto_error(error: impl std::fmt::Display) -> x0x::kv::KvError {
+        x0x::kv::KvError::SecureRecord(format!("TreeKEM group-store crypto failed: {error}"))
+    }
+
+    async fn rollback(
+        &self,
+        info: &x0x::groups::GroupInfo,
+        snapshot: &[u8],
+        group: &mut x0x::mls::TreeKemMlsGroup,
+    ) {
+        match super::named_groups::restore_local_treekem_group_from_snapshot(
+            &self.state,
+            info,
+            snapshot,
+        ) {
+            Ok(restored) => *group = restored,
+            Err(error) => {
+                self.invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!("failed to rollback TreeKEM store ratchet: {error}");
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
+    fn group_id(&self) -> Vec<u8> {
+        self.stable_group_id.as_bytes().to_vec()
+    }
+
+    async fn seal_record(
+        &self,
+        signing: &x0x::kv::AuthorSigning,
+        kind: x0x::kv::KvMutationKind,
+        store_id: &x0x::kv::KvStoreId,
+        payload: &[u8],
+        reader_only: bool,
+    ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
+        let membership =
+            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let _membership_guard = membership.lock().await;
+        let live = self.live_group().await?;
+        let mut group = live.lock().await;
+        // Re-read authority only after acquiring the ratchet mutex. Membership
+        // commits use the same mutex, so this snapshot cannot predate a commit
+        // that won while this operation was waiting.
+        let info = self.current_info().await?;
+        let reader_admission = kind == x0x::kv::KvMutationKind::Control && reader_only;
+        if !Self::permits(&info, &signing.agent_id, !reader_admission) {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM mutation author is not currently authorized".to_string(),
+            ));
+        }
+        let rollback = group.to_snapshot_bytes().map_err(Self::map_crypto_error)?;
+        let epoch = group.epoch();
+        let inner = x0x::kv::treekem::sign_inner_mutation(
+            signing,
+            kind,
+            payload,
+            x0x::kv::treekem::TreeKemInnerBinding {
+                group_id: self.group_id(),
+                epoch,
+                store_id,
+                authorization_binding: Self::authorization_binding(&info),
+                reader_only,
+            },
+        )?;
+        let ciphertext = match group.encrypt_message(&inner) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => {
+                self.rollback(&info, &rollback, &mut group).await;
+                return Err(Self::map_crypto_error(error));
+            }
+        };
+        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
+            &self.state,
+            &self.group_key,
+            &group,
+        )
+        .await
+        {
+            self.rollback(&info, &rollback, &mut group).await;
+            return Err(x0x::kv::KvError::Gossip(format!(
+                "persist TreeKEM send ratchet: {error}"
+            )));
+        }
+        Ok(x0x::kv::TreeKemKvStoreRecordV1 {
+            version: 1,
+            group_id: self.group_id(),
+            store_id: *store_id.as_bytes(),
+            epoch,
+            reader_only,
+            ciphertext,
+        })
+    }
+
+    async fn open_record(
+        &self,
+        store_id: &x0x::kv::KvStoreId,
+        record: &x0x::kv::TreeKemKvStoreRecordV1,
+    ) -> x0x::kv::Result<x0x::kv::treekem::OpenedTreeKemKvRecord> {
+        if record.version != 1
+            || record.group_id != self.group_id()
+            || record.store_id != *store_id.as_bytes()
+        {
+            return Err(x0x::kv::KvError::SecureRecord(
+                "TreeKEM record binding mismatch".to_string(),
+            ));
+        }
+        let membership =
+            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let _membership_guard = membership.lock().await;
+        let live = self.live_group().await?;
+        let mut group = live.lock().await;
+        let info = self.current_info().await?;
+        if record.epoch != group.epoch() {
+            return Err(x0x::kv::KvError::SecureRecord(
+                "TreeKEM record epoch is stale or ahead".to_string(),
+            ));
+        }
+        let rollback = group.to_snapshot_bytes().map_err(Self::map_crypto_error)?;
+        let plaintext = match group.decrypt_message(&record.ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                self.rollback(&info, &rollback, &mut group).await;
+                return Err(Self::map_crypto_error(error));
+            }
+        };
+        let opened = match x0x::kv::treekem::open_inner_mutation(
+            self.stable_group_id.as_bytes(),
+            record.epoch,
+            store_id,
+            &plaintext,
+            Self::authorization_binding(&info),
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.rollback(&info, &rollback, &mut group).await;
+                return Err(error);
+            }
+        };
+        if opened.reader_only != record.reader_only
+            || opened.reader_only && opened.mutation.kind != x0x::kv::KvMutationKind::Control
+            || !Self::permits(&info, &opened.mutation.author_id, !opened.reader_only)
+        {
+            self.rollback(&info, &rollback, &mut group).await;
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM mutation author is not currently authorized".to_string(),
+            ));
+        }
+        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
+            &self.state,
+            &self.group_key,
+            &group,
+        )
+        .await
+        {
+            self.rollback(&info, &rollback, &mut group).await;
+            return Err(x0x::kv::KvError::Gossip(format!(
+                "persist TreeKEM receive ratchet: {error}"
+            )));
+        }
+        Ok(opened)
+    }
+
+    async fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+        self.current_info()
+            .await
+            .is_ok_and(|info| Self::permits(&info, agent, false))
+    }
+
+    async fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+        self.current_info()
+            .await
+            .is_ok_and(|info| Self::permits(&info, agent, true))
+    }
+
+    async fn merge_main_record(
+        &self,
+        opened: x0x::kv::treekem::OpenedTreeKemKvRecord,
+        sender_peer: saorsa_gossip_types::PeerId,
+        local_peer: saorsa_gossip_types::PeerId,
+        store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
+        retained_image: Option<Vec<u8>>,
+    ) -> x0x::kv::Result<()> {
+        if opened.reader_only || opened.mutation.kind == x0x::kv::KvMutationKind::Control {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "read-side TreeKEM record cannot mutate a store".to_string(),
+            ));
+        }
+        let membership =
+            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let _membership_guard = membership.lock().await;
+        let info = self.current_info().await?;
+        if opened.authorization_binding != Self::authorization_binding(&info)
+            || !Self::permits(&info, &opened.mutation.author_id, true)
+        {
+            return Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM record authority changed before merge".to_string(),
+            ));
+        }
+        let mut target = store.write().await;
+        match opened.mutation.kind {
+            x0x::kv::KvMutationKind::Delta | x0x::kv::KvMutationKind::FullState => {
+                let delta: x0x::kv::KvStoreDelta =
+                    bincode::deserialize(&opened.mutation.payload)
+                        .map_err(|e| x0x::kv::KvError::Gossip(format!("bad TreeKEM delta: {e}")))?;
+                target.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+            }
+            x0x::kv::KvMutationKind::RetainedState => {
+                let image: x0x::kv::KvStore =
+                    bincode::deserialize(retained_image.as_deref().ok_or_else(|| {
+                        x0x::kv::KvError::Gossip(
+                            "complete TreeKEM retained image required".to_string(),
+                        )
+                    })?)
+                    .map_err(|e| x0x::kv::KvError::Gossip(format!("bad retained image: {e}")))?;
+                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+            }
+            x0x::kv::KvMutationKind::Control => Err(x0x::kv::KvError::Unauthorized(
+                "TreeKEM control record on main topic".to_string(),
+            )),
+        }
+    }
+
+    fn invalidate(&self) {
+        self.invalid
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.authorization.invalidate();
+    }
+}
+
 fn find_store_group<'a>(
     groups: &'a std::collections::HashMap<String, x0x::groups::GroupInfo>,
     id: &str,
@@ -782,6 +1165,40 @@ fn resolve_gss_group_store(
     }
     let (group_key, info) = find_store_group(groups, id)?;
     validate_gss_store_group(info, caller)?;
+    let stable_group_id = info.stable_group_id().to_string();
+    let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
+    Ok(GssGroupStoreBinding {
+        group_key: group_key.clone(),
+        stable_group_id,
+        creator: info.creator,
+        name: name.to_string(),
+        store_id,
+        topic,
+    })
+}
+
+fn resolve_treekem_group_store(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    id: &str,
+    name: &str,
+    caller: &AgentId,
+) -> Result<GssGroupStoreBinding, GroupStoreResponse> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("store name must not be empty"));
+    }
+    let (group_key, info) = find_store_group(groups, id)?;
+    if info.withdrawn || info.is_fork_quarantined() {
+        return Err(api_error(StatusCode::CONFLICT, "group is unavailable"));
+    }
+    if !info.has_active_member(&hex::encode(caller.as_bytes())) {
+        return Err(forbidden("not a member"));
+    }
+    if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted
+        || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+    {
+        return Err(bad_request("store requires a real-TreeKEM encrypted group"));
+    }
     let stable_group_id = info.stable_group_id().to_string();
     let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
     Ok(GssGroupStoreBinding {
@@ -1057,6 +1474,80 @@ async fn open_bound_gss_store(
     Ok((handle, secure, true))
 }
 
+async fn open_bound_treekem_store(
+    state: &Arc<AppState>,
+    expected: &GssGroupStoreBinding,
+) -> Result<(x0x::KvStoreHandle, u64, bool), GroupStoreResponse> {
+    let authorization = {
+        let groups = state.named_groups.read().await;
+        let current = resolve_treekem_group_store(
+            &groups,
+            &expected.group_key,
+            &expected.name,
+            &state.agent.agent_id(),
+        )?;
+        if &current != expected {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "TreeKEM group store binding changed during open",
+            ));
+        }
+        let info = groups
+            .get(&current.group_key)
+            .ok_or_else(|| not_found("group not found"))?;
+        let authorization = x0x::groups::TreeKemKvAuthorizationContext::from_group(info)
+            .ok_or_else(|| api_error(StatusCode::CONFLICT, "TreeKEM group unavailable"))?;
+        Arc::new(authorization)
+    };
+    let live = state
+        .treekem_groups
+        .read()
+        .await
+        .get(&expected.group_key)
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "TreeKEM ratchet unavailable"))?;
+    let epoch = live.lock().await.epoch();
+    let cached = { state.kv_stores.read().await.get(&expected.topic).cloned() };
+    if let Some(handle) = cached {
+        if handle
+            .validate_group_binding(
+                &expected.name,
+                &expected.stable_group_id,
+                expected.creator,
+                x0x::GroupStoreProtection::TreeKemEncrypted,
+            )
+            .await
+            .is_ok()
+        {
+            return Ok((handle, epoch, false));
+        }
+        handle.retire();
+        state.kv_stores.write().await.remove(&expected.topic);
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "cached TreeKEM group store binding mismatch",
+        ));
+    }
+    let protector: x0x::kv::SharedTreeKemKvProtector = Arc::new(TreeKemGroupStoreProtector::new(
+        state,
+        expected,
+        Arc::clone(&authorization),
+    ));
+    let handle = state
+        .agent
+        .open_treekem_group_kv_store_persistent(
+            &expected.name,
+            &expected.stable_group_id,
+            expected.creator,
+            authorization,
+            protector,
+            &state.kv_store_state_dir,
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok((handle, epoch, true))
+}
+
 async fn open_bound_public_store(
     state: &Arc<AppState>,
     expected: &GssGroupStoreBinding,
@@ -1184,21 +1675,40 @@ pub(in crate::server) async fn create_group_kv_store(
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<CreateGroupStoreRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (binding, public) = {
+    #[derive(Clone, Copy)]
+    enum StorePlane {
+        Gss,
+        TreeKem,
+        Public,
+    }
+    let (binding, plane) = {
         let groups = state.named_groups.read().await;
-        let is_public = match find_store_group(&groups, &id) {
-            Ok((_, info)) => {
-                info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+        let plane = match find_store_group(&groups, &id) {
+            Ok((_, info))
+                if info.policy.confidentiality
+                    == x0x::groups::GroupConfidentiality::SignedPublic =>
+            {
+                StorePlane::Public
             }
+            Ok((_, info)) if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem => {
+                StorePlane::TreeKem
+            }
+            Ok(_) => StorePlane::Gss,
             Err(response) => return response,
         };
-        let resolved = if is_public {
-            resolve_public_group_store(&groups, &id, &req.name, &state.agent.agent_id())
-        } else {
-            resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+        let resolved = match plane {
+            StorePlane::Public => {
+                resolve_public_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+            }
+            StorePlane::TreeKem => {
+                resolve_treekem_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+            }
+            StorePlane::Gss => {
+                resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id())
+            }
         };
         match resolved {
-            Ok(binding) => (binding, is_public),
+            Ok(binding) => (binding, plane),
             Err(response) => return response,
         }
     };
@@ -1215,16 +1725,19 @@ pub(in crate::server) async fn create_group_kv_store(
     // Use the same alias-canonicalizing mutex as all group membership writers.
     let membership = super::named_groups::group_membership_lock(&state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
-    let (handle, epoch, created) = if public {
-        match open_bound_public_store(&state, &binding).await {
+    let (handle, epoch, created) = match plane {
+        StorePlane::Public => match open_bound_public_store(&state, &binding).await {
             Ok((handle, context, created)) => (handle, context.current_epoch(), created),
             Err(response) => return response,
-        }
-    } else {
-        match open_bound_gss_store(&state, &binding).await {
+        },
+        StorePlane::TreeKem => match open_bound_treekem_store(&state, &binding).await {
+            Ok(opened) => opened,
+            Err(response) => return response,
+        },
+        StorePlane::Gss => match open_bound_gss_store(&state, &binding).await {
             Ok((handle, context, created)) => (handle, context.current_epoch(), created),
             Err(response) => return response,
-        }
+        },
     };
     if created {
         state
@@ -1235,7 +1748,7 @@ pub(in crate::server) async fn create_group_kv_store(
         let mut extra = serde_json::Map::new();
         extra.insert(
             "policy".into(),
-            serde_json::Value::String(if public {
+            serde_json::Value::String(if matches!(plane, StorePlane::Public) {
                 "group_signed".into()
             } else {
                 "encrypted".into()
@@ -1249,6 +1762,15 @@ pub(in crate::server) async fn create_group_kv_store(
             "stable_group_id".into(),
             serde_json::Value::String(binding.stable_group_id.clone()),
         );
+        if !matches!(plane, StorePlane::Public) {
+            extra.insert(
+                "secure_plane".into(),
+                serde_json::Value::String(match plane {
+                    StorePlane::TreeKem => "treekem".into(),
+                    StorePlane::Gss | StorePlane::Public => "gss".into(),
+                }),
+            );
+        }
         if let Err(e) = crdt_subscriptions::record(
             &state,
             crdt_subscriptions::CrdtSubscriptionEntry {
@@ -1283,7 +1805,11 @@ pub(in crate::server) async fn create_group_kv_store(
                 &binding.store_id,
                 &binding.stable_group_id,
                 epoch,
-                if public { "group_signed" } else { "encrypted" },
+                if matches!(plane, StorePlane::Public) {
+                    "group_signed"
+                } else {
+                    "encrypted"
+                },
             )
             .await,
         ),
@@ -1295,7 +1821,14 @@ fn validate_gss_store_manifest(
     entry: &crdt_subscriptions::CrdtSubscriptionEntry,
     binding: &GssGroupStoreBinding,
     expected_policy: &str,
+    expected_secure_plane: Option<&str>,
 ) -> Result<(), GroupStoreResponse> {
+    let recorded_plane = entry.extra.get("secure_plane").and_then(|v| v.as_str());
+    let plane_matches = match expected_secure_plane {
+        Some("gss") => recorded_plane.is_none() || recorded_plane == Some("gss"),
+        Some(expected) => recorded_plane == Some(expected),
+        None => recorded_plane.is_none(),
+    };
     if entry.id != binding.topic
         || entry.topic != binding.topic
         || entry.name != binding.name
@@ -1308,6 +1841,7 @@ fn validate_gss_store_manifest(
             .and_then(|owner| parse_agent_id_hex(owner).ok())
             != Some(binding.creator)
         || entry.extra.get("policy").and_then(|v| v.as_str()) != Some(expected_policy)
+        || !plane_matches
     {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -1330,23 +1864,52 @@ pub(in crate::server) async fn restore_bound_gss_store(
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("encrypted store manifest has no stable group ID"))?;
     let public = entry.extra.get("policy").and_then(|v| v.as_str()) == Some("group_signed");
-    let binding = {
+    let (binding, treekem) = {
         let groups = state.named_groups.read().await;
         if public {
-            resolve_public_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+            (
+                resolve_public_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?,
+                false,
+            )
         } else {
-            resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+            let (_, info) = find_store_group(&groups, stable)?;
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                (
+                    resolve_treekem_group_store(
+                        &groups,
+                        stable,
+                        &entry.name,
+                        &state.agent.agent_id(),
+                    )?,
+                    true,
+                )
+            } else {
+                (
+                    resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?,
+                    false,
+                )
+            }
         }
     };
     validate_gss_store_manifest(
         entry,
         &binding,
         if public { "group_signed" } else { "encrypted" },
+        if public {
+            None
+        } else if treekem {
+            Some("treekem")
+        } else {
+            Some("gss")
+        },
     )?;
     let membership = super::named_groups::group_membership_lock(state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
     let (handle, created) = if public {
         let (handle, _, created) = open_bound_public_store(state, &binding).await?;
+        (handle, created)
+    } else if treekem {
+        let (handle, _, created) = open_bound_treekem_store(state, &binding).await?;
         (handle, created)
     } else {
         let (handle, _, created) = open_bound_gss_store(state, &binding).await?;
@@ -1360,6 +1923,892 @@ pub(in crate::server) async fn restore_bound_gss_store(
             .insert(binding.topic.clone(), handle);
     }
     Ok(created)
+}
+
+fn legacy_page_app(app: &str) -> Result<&'static str, GroupStoreResponse> {
+    match app.trim().to_ascii_lowercase().as_str() {
+        "wiki" => Ok("wiki"),
+        "web" => Ok("web"),
+        _ => Err(bad_request("legacy import app must be wiki or web")),
+    }
+}
+
+fn legacy_page_topic(stable_group_id: &str, app: &str) -> Result<String, GroupStoreResponse> {
+    let prefix = stable_group_id
+        .get(..16)
+        .ok_or_else(|| bad_request("stable group id is too short for a legacy alias"))?;
+    Ok(format!("x0x-{app}-{prefix}"))
+}
+
+async fn load_legacy_page_store(
+    state: &AppState,
+    stable_group_id: &str,
+    app: &str,
+    requested_source_id: Option<&str>,
+) -> Result<Option<LoadedLegacyStore>, GroupStoreResponse> {
+    let topic = legacy_page_topic(stable_group_id, app)?;
+    let owner = state.agent.agent_id();
+    let owner_hex = hex::encode(owner.as_bytes());
+    let store_id = x0x::kv::KvStoreId::for_topic_owner(&topic, &owner);
+    let store_id_hex = hex::encode(store_id.as_bytes());
+    if requested_source_id.is_some_and(|requested| requested != store_id_hex) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "source id does not match the exact legacy manifest binding",
+        ));
+    }
+    let manifest = crdt_subscriptions::probe_manifest_strict(&state.crdt_subscriptions_path)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::CONFLICT,
+                format!("legacy subscription manifest is unreadable: {error}"),
+            )
+        })?
+        .unwrap_or_default();
+    let Some(entry) = manifest.entries.iter().find(|entry| {
+        entry.kind == crdt_subscriptions::KIND_KV_STORE && entry.id == topic && entry.topic == topic
+    }) else {
+        return Ok(None);
+    };
+    if entry.role != crdt_subscriptions::ROLE_CREATED
+        || !entry.name.eq_ignore_ascii_case(app)
+        || entry.extra.get("policy").and_then(|value| value.as_str()) != Some("signed")
+        || entry
+            .extra
+            .get("expected_owner")
+            .and_then(|value| value.as_str())
+            != Some(owner_hex.as_str())
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "legacy source manifest authority binding is invalid",
+        ));
+    }
+    let snapshot_path = state.kv_store_state_dir.join(format!("{store_id_hex}.bin"));
+    let metadata = tokio::fs::metadata(&snapshot_path).await.map_err(|error| {
+        api_error(
+            StatusCode::CONFLICT,
+            format!("legacy source snapshot is unavailable: {error}"),
+        )
+    })?;
+    if metadata.len() > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "legacy source snapshot exceeds the migration limit",
+        ));
+    }
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(&snapshot_path)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::CONFLICT,
+                format!("legacy source snapshot cannot be read: {error}"),
+            )
+        })?;
+    let mut bytes = Vec::new();
+    file.take(LEGACY_PAGE_SNAPSHOT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::CONFLICT,
+                format!("legacy source snapshot cannot be read: {error}"),
+            )
+        })?;
+    if bytes.len() as u64 > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "legacy source snapshot exceeds the migration limit",
+        ));
+    }
+    let store = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+        api_error(
+            StatusCode::CONFLICT,
+            format!("legacy source snapshot is invalid: {error}"),
+        )
+    })?;
+    if store.id() != &store_id
+        || store.owner() != Some(&owner)
+        || store.policy() != &x0x::kv::AccessPolicy::Signed
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "legacy source snapshot binding is invalid",
+        ));
+    }
+    Ok(Some(LoadedLegacyStore {
+        store,
+        store_id_hex,
+        topic,
+        owner,
+        digest: hex::encode(blake3::hash(&bytes).as_bytes()),
+        bytes,
+    }))
+}
+
+fn group_writer(info: &x0x::groups::GroupInfo, agent: &AgentId) -> bool {
+    TreeKemGroupStoreProtector::permits(info, agent, true)
+        && !info.withdrawn
+        && !info.is_fork_quarantined()
+}
+
+fn migration_authority_binding(info: &x0x::groups::GroupInfo) -> String {
+    format!(
+        "{}:{}:{}",
+        info.state_revision,
+        info.state_hash,
+        info.security_binding.as_deref().unwrap_or("")
+    )
+}
+
+async fn preview_legacy_import_conflicts(
+    state: &AppState,
+    destination_topic: &str,
+    destination_store_id: &x0x::kv::KvStoreId,
+    source: &x0x::kv::KvStore,
+) -> Result<Vec<String>, GroupStoreResponse> {
+    if let Some(handle) = state.kv_stores.read().await.get(destination_topic).cloned() {
+        return Ok(handle.legacy_import_conflicts(source).await);
+    }
+    let path = state.kv_store_state_dir.join(format!(
+        "{}.bin",
+        hex::encode(destination_store_id.as_bytes())
+    ));
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("destination snapshot cannot be previewed: {error}"),
+            ))
+        }
+    };
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    file.take(LEGACY_PAGE_SNAPSHOT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::CONFLICT,
+                format!("destination snapshot cannot be previewed: {error}"),
+            )
+        })?;
+    if bytes.len() as u64 > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "destination snapshot exceeds the migration preview limit",
+        ));
+    }
+    let destination = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+        api_error(
+            StatusCode::CONFLICT,
+            format!("destination snapshot cannot be previewed: {error}"),
+        )
+    })?;
+    Ok(destination.legacy_import_conflicts(source))
+}
+
+pub(in crate::server) async fn list_legacy_page_imports(
+    State(state): State<Arc<AppState>>,
+    Path((id, app)): Path<(String, String)>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let app = match legacy_page_app(&app) {
+        Ok(app) => app,
+        Err(response) => return response,
+    };
+    let (stable_group_id, ambiguous, binding, can_import) = {
+        let groups = state.named_groups.read().await;
+        let (_, info) = match find_store_group(&groups, &id) {
+            Ok(found) => found,
+            Err(response) => return response,
+        };
+        let stable = info.stable_group_id().to_string();
+        if id != stable {
+            return bad_request("legacy imports require the full canonical group id");
+        }
+        if !matches!(
+            &actor,
+            crate::server::rider_auth::ActorContext::Owner { .. }
+        ) {
+            return forbidden("legacy source export requires the local owner authority");
+        }
+        if !actor.rider_allows_group(&stable) {
+            return forbidden("rider token is not granted this group");
+        }
+        let Some(prefix) = stable.get(..16) else {
+            return bad_request("stable group id is too short for a legacy alias");
+        };
+        let matches = groups
+            .values()
+            .filter(|candidate| candidate.stable_group_id().starts_with(prefix))
+            .count();
+        let public = info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic;
+        let treekem = !public && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem;
+        let binding = if public {
+            resolve_public_group_store(&groups, &id, app, &state.agent.agent_id())
+        } else if treekem {
+            resolve_treekem_group_store(&groups, &id, app, &state.agent.agent_id())
+        } else {
+            resolve_gss_group_store(&groups, &id, app, &state.agent.agent_id())
+        };
+        let binding = match binding {
+            Ok(binding) => binding,
+            Err(response) => return response,
+        };
+        let can_import = group_writer(info, &state.agent.agent_id());
+        (stable, matches > 1, binding, can_import)
+    };
+    let source = match load_legacy_page_store(&state, &stable_group_id, app, None).await {
+        Ok(source) => source,
+        Err(response) => return response,
+    };
+    let receipts = match super::super::legacy_store_migration::read_receipts(
+        &super::super::legacy_store_migration::journal_path(&state.kv_store_state_dir),
+    )
+    .await
+    {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("legacy import receipt journal is unreadable: {error}"),
+            )
+        }
+    };
+    let intents =
+        match super::super::legacy_store_migration::read_intents(&state.kv_store_state_dir).await {
+            Ok(intents) => intents,
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("legacy import intent journal is unreadable: {error}"),
+                )
+            }
+        };
+    let local_endorser = hex::encode(state.agent.agent_id().as_bytes());
+    let mut relevant_intents = Vec::new();
+    for intent in intents {
+        if receipts
+            .iter()
+            .any(|receipt| receipt.idempotency_key == intent.idempotency_key)
+        {
+            continue;
+        }
+        if intent.group_id != stable_group_id || intent.app != app {
+            continue;
+        }
+        if intent.endorser != local_endorser {
+            return api_error(
+                StatusCode::CONFLICT,
+                "legacy import intent owner binding is invalid",
+            );
+        }
+        relevant_intents.push(intent);
+    }
+    let conflicts = match source.as_ref() {
+        Some(source) => match preview_legacy_import_conflicts(
+            &state,
+            &binding.topic,
+            &binding.store_id,
+            &source.store,
+        )
+        .await
+        {
+            Ok(conflicts) => conflicts,
+            Err(response) => return response,
+        },
+        None => Vec::new(),
+    };
+    let mut candidates = source
+        .into_iter()
+        .map(|source| {
+            let receipt = receipts.iter().find(|receipt| {
+                receipt.group_id == stable_group_id
+                    && receipt.app == app
+                    && receipt.source_store_id == source.store_id_hex
+                    && receipt.source_digest == source.digest
+            });
+            LegacyStoreCandidate {
+                target_group_id: stable_group_id.clone(),
+                imported: receipt.is_some(),
+                import_pending: false,
+                publish_pending: receipt
+                    .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_none()),
+                publish_accepted: receipt
+                    .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_some()),
+                import_idempotency_key: receipt.map(|receipt| receipt.idempotency_key.clone()),
+                source_store_id: source.store_id_hex,
+                topic: source.topic,
+                owner: hex::encode(source.owner.as_bytes()),
+                source_digest: source.digest,
+                active_keys: source.store.active_keys().len(),
+                keys: {
+                    let mut keys = source
+                        .store
+                        .active_keys()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    keys.sort();
+                    keys
+                },
+                ambiguous_group_prefix: ambiguous,
+                conflicts: conflicts.clone(),
+                can_import,
+                import_refusal_reason: (!can_import)
+                    .then(|| "your current group role cannot endorse legacy history".to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+    for intent in relevant_intents {
+        let recovered =
+            match recover_intended_legacy_source(&state, &stable_group_id, app, &intent).await {
+                Ok(source) => source,
+                Err(response) => return response,
+            };
+        candidates.retain(|candidate| {
+            candidate.source_store_id != intent.source_store_id
+                || candidate.source_digest != intent.source_digest
+                || candidate.import_pending
+        });
+        let conflicts = match preview_legacy_import_conflicts(
+            &state,
+            &binding.topic,
+            &binding.store_id,
+            &recovered.store,
+        )
+        .await
+        {
+            Ok(conflicts) => conflicts,
+            Err(response) => return response,
+        };
+        let mut keys = recovered
+            .store
+            .active_keys()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        candidates.push(LegacyStoreCandidate {
+            target_group_id: stable_group_id.clone(),
+            source_store_id: recovered.store_id_hex,
+            topic: recovered.topic,
+            owner: hex::encode(recovered.owner.as_bytes()),
+            source_digest: recovered.digest,
+            active_keys: keys.len(),
+            keys,
+            ambiguous_group_prefix: ambiguous,
+            conflicts,
+            imported: false,
+            import_pending: true,
+            publish_pending: false,
+            publish_accepted: false,
+            import_idempotency_key: Some(intent.idempotency_key),
+            can_import,
+            import_refusal_reason: (!can_import)
+                .then(|| "your current group role cannot endorse legacy history".to_string()),
+        });
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "candidates": candidates})),
+    )
+}
+
+pub(in crate::server) async fn download_legacy_page_import(
+    State(state): State<Arc<AppState>>,
+    Path((id, app, source_id)): Path<(String, String, String)>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    Query(query): Query<LegacyDownloadQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let app = match legacy_page_app(&app) {
+        Ok(app) => app,
+        Err(response) => return response,
+    };
+    let stable = {
+        let groups = state.named_groups.read().await;
+        let (_, info) = match find_store_group(&groups, &id) {
+            Ok(found) => found,
+            Err(response) => return response,
+        };
+        let stable = info.stable_group_id().to_string();
+        if id != stable {
+            return bad_request("legacy imports require the full canonical group id");
+        }
+        if !matches!(
+            &actor,
+            crate::server::rider_auth::ActorContext::Owner { .. }
+        ) {
+            return forbidden("legacy source export requires the local owner authority");
+        }
+        stable
+    };
+    if let Some(idempotency_key) = query.idempotency_key.as_deref() {
+        let intent = match super::super::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            idempotency_key,
+        )
+        .await
+        {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return not_found("legacy import intent is not registered on this device"),
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("legacy import intent is unreadable: {error}"),
+                )
+            }
+        };
+        if intent.group_id != stable
+            || intent.app != app
+            || intent.source_store_id != source_id
+            || intent.endorser != hex::encode(state.agent.agent_id().as_bytes())
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "legacy import intent does not match the requested source",
+            );
+        }
+        let source = match recover_intended_legacy_source(&state, &stable, app, &intent).await {
+            Ok(source) => source,
+            Err(response) => return response,
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "source_store_id": source.store_id_hex,
+                "source_digest": source.digest,
+                "snapshot_b64": BASE64.encode(source.bytes),
+            })),
+        );
+    }
+    match load_legacy_page_store(&state, &stable, app, Some(&source_id)).await {
+        Ok(Some(source)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "source_store_id": source.store_id_hex,
+                "source_digest": source.digest,
+                "snapshot_b64": BASE64.encode(source.bytes),
+            })),
+        ),
+        Ok(None) => not_found("legacy source is not registered on this device"),
+        Err(response) => response,
+    }
+}
+
+/// Rebuild the reviewed legacy source from a durable pre-merge intent.
+///
+/// The preserved bytes must still match the intent's recorded digest and the
+/// deterministic (topic, owner, policy, store id) binding, so a corrupt or
+/// tampered journal cannot inject foreign content into the canonical
+/// destination. This NEVER reads the live legacy store — recovery replays
+/// exactly what was reviewed.
+async fn recover_intended_legacy_source(
+    state: &AppState,
+    stable_group_id: &str,
+    app: &str,
+    intent: &super::super::legacy_store_migration::LegacyImportIntent,
+) -> Result<LoadedLegacyStore, GroupStoreResponse> {
+    let topic = legacy_page_topic(stable_group_id, app)?;
+    let owner = state.agent.agent_id();
+    let store_id = x0x::kv::KvStoreId::for_topic_owner(&topic, &owner);
+    let bytes = intent.source_snapshot().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import intent snapshot is unreadable: {error}"),
+        )
+    })?;
+    if bytes.len() as u64 > LEGACY_PAGE_SNAPSHOT_MAX_BYTES {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy import intent snapshot exceeds the migration limit",
+        ));
+    }
+    let digest = hex::encode(blake3::hash(&bytes).as_bytes());
+    if digest != intent.source_digest {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy import intent snapshot does not match its recorded digest",
+        ));
+    }
+    let store = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import intent snapshot is invalid: {error}"),
+        )
+    })?;
+    if hex::encode(store_id.as_bytes()) != intent.source_store_id
+        || store.id() != &store_id
+        || store.owner() != Some(&owner)
+        || store.policy() != &x0x::kv::AccessPolicy::Signed
+    {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy import intent source binding is invalid",
+        ));
+    }
+    Ok(LoadedLegacyStore {
+        store,
+        store_id_hex: intent.source_store_id.clone(),
+        topic,
+        owner,
+        digest,
+        bytes,
+    })
+}
+
+pub(in crate::server) async fn import_legacy_page_store(
+    State(state): State<Arc<AppState>>,
+    Path((id, app, source_id)): Path<(String, String, String)>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    Json(request): Json<ImportLegacyStoreRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let app = match legacy_page_app(&app) {
+        Ok(app) => app,
+        Err(response) => return response,
+    };
+    if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 128 {
+        return bad_request("idempotency_key must contain 1 to 128 characters");
+    }
+    let reservation = crdt_subscriptions::handle_reservation(
+        &state,
+        "legacy_page_import",
+        &request.idempotency_key,
+    )
+    .await;
+    let _reservation_guard = reservation.lock().await;
+    let membership = super::named_groups::group_membership_lock(&state, &id).await;
+    let membership_guard = membership.lock().await;
+    let (binding, authority_binding, public, treekem) = {
+        let groups = state.named_groups.read().await;
+        let (_, info) = match find_store_group(&groups, &id) {
+            Ok(found) => found,
+            Err(response) => return response,
+        };
+        let stable = info.stable_group_id();
+        if id != stable {
+            return bad_request("legacy imports require the full canonical group id");
+        }
+        if !matches!(
+            &actor,
+            crate::server::rider_auth::ActorContext::Owner { .. }
+        ) {
+            return forbidden("legacy source export requires the local owner authority");
+        }
+        if !actor.rider_allows_group(stable) {
+            return forbidden("rider token is not granted this group");
+        }
+        if !group_writer(info, &state.agent.agent_id()) {
+            return forbidden("current group role cannot endorse legacy history");
+        }
+        let public = info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic;
+        let treekem = !public && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem;
+        let resolved = if public {
+            resolve_public_group_store(&groups, &id, app, &state.agent.agent_id())
+        } else if treekem {
+            resolve_treekem_group_store(&groups, &id, app, &state.agent.agent_id())
+        } else {
+            resolve_gss_group_store(&groups, &id, app, &state.agent.agent_id())
+        };
+        let binding = match resolved {
+            Ok(binding) => binding,
+            Err(response) => return response,
+        };
+        (binding, migration_authority_binding(info), public, treekem)
+    };
+    let receipt_path =
+        super::super::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+    let receipts = match super::super::legacy_store_migration::read_receipts(&receipt_path).await {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("legacy import receipt journal is unreadable: {error}"),
+            )
+        }
+    };
+    let existing_receipt = receipts
+        .iter()
+        .find(|receipt| receipt.idempotency_key == request.idempotency_key)
+        .cloned();
+    if let Some(existing) = existing_receipt.as_ref() {
+        let same = existing.group_id == binding.stable_group_id
+            && existing.app == app
+            && existing.source_store_id == source_id
+            && existing.source_digest == request.source_digest;
+        if !same {
+            return api_error(
+                StatusCode::CONFLICT,
+                "idempotency key already binds different import arguments",
+            );
+        }
+        // The receipt is the durable idempotency binding, so a pre-merge
+        // intent snapshot left by a crash between the receipt append and the
+        // intent removal is redundant. Best-effort: a failed removal must
+        // not fail an otherwise durable import, and the next retry retries.
+        let _ = super::super::legacy_store_migration::remove_intent(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await;
+        if existing.publish_accepted_at_ms.is_some() {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true, "receipt": existing,
+                    "imported_locally": true, "publish_accepted": true
+                })),
+            );
+        }
+    }
+    let existing_intent = if existing_receipt.is_none() {
+        match super::super::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await
+        {
+            Ok(intent) => intent,
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("legacy import intent journal is unreadable: {error}"),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(intent) = existing_intent.as_ref() {
+        let same = intent.group_id == binding.stable_group_id
+            && intent.app == app
+            && intent.source_store_id == source_id
+            && intent.source_digest == request.source_digest;
+        if !same {
+            return api_error(
+                StatusCode::CONFLICT,
+                "idempotency key already binds different import arguments",
+            );
+        }
+        // The intent file survived a prior attempt whose kv_state_dir sync
+        // may never have completed: prove the directory entry is durable
+        // before this retry is allowed to mutate the canonical destination.
+        if let Err(error) = super::super::legacy_store_migration::ensure_intent_durable(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "legacy import intent durability is unproven; canonical destination is unmodified: {error}"
+                ),
+            );
+        }
+    }
+    let source = if existing_receipt.is_none() {
+        if let Some(intent) = existing_intent.as_ref() {
+            // Recover the reviewed source from the durable intent instead
+            // of the on-disk legacy store: a retry after a merge-persist or
+            // receipt-append failure finishes the ORIGINAL import even when
+            // the source was edited after review.
+            match recover_intended_legacy_source(&state, &binding.stable_group_id, app, intent)
+                .await
+            {
+                Ok(source) => Some(source),
+                Err(response) => return response,
+            }
+        } else {
+            match load_legacy_page_store(&state, &binding.stable_group_id, app, Some(&source_id))
+                .await
+            {
+                Ok(Some(source)) => Some(source),
+                Ok(None) => return not_found("legacy source is not registered on this device"),
+                Err(response) => return response,
+            }
+        }
+    } else {
+        // Pending retries publish the already-persisted canonical image and
+        // never remerge or create a duplicate receipt.
+        None
+    };
+    if source
+        .as_ref()
+        .is_some_and(|source| source.digest != request.source_digest)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "legacy source changed after it was reviewed",
+        );
+    }
+    if let Some(source) = source.as_ref() {
+        if let Err(error) =
+            x0x::kv::KvStore::validate_legacy_signed_source(&source.store, source.owner)
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("legacy source content is invalid: {error}"),
+            );
+        }
+    }
+    if existing_intent.is_none() && existing_receipt.is_none() {
+        // Durable intent BEFORE any canonical mutation: bind the reviewed
+        // snapshot to this idempotency key first, so a crash or receipt
+        // append failure after the merge can still finish this exact import.
+        let Some(source) = source.as_ref() else {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "legacy source unavailable",
+            );
+        };
+        if let Err(error) = super::super::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            super::super::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: request.idempotency_key.clone(),
+                group_id: binding.stable_group_id.clone(),
+                app: app.to_string(),
+                source_store_id: source.store_id_hex.clone(),
+                source_digest: source.digest.clone(),
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding: authority_binding.clone(),
+                source_snapshot: source.bytes.clone(),
+            },
+        )
+        .await
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "legacy import intent did not persist; canonical destination is unmodified: {error}"
+                ),
+            );
+        }
+    }
+    let (handle, created) = if public {
+        match open_bound_public_store(&state, &binding).await {
+            Ok((handle, _, created)) => (handle, created),
+            Err(response) => return response,
+        }
+    } else if treekem {
+        match open_bound_treekem_store(&state, &binding).await {
+            Ok((handle, _, created)) => (handle, created),
+            Err(response) => return response,
+        }
+    } else {
+        match open_bound_gss_store(&state, &binding).await {
+            Ok((handle, _, created)) => (handle, created),
+            Err(response) => return response,
+        }
+    };
+    if created {
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+    }
+    let (receipt, conflicts) = if let Some(existing) = existing_receipt {
+        (existing, Vec::new())
+    } else {
+        let Some(source) = source else {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "legacy source unavailable",
+            );
+        };
+        let conflicts = handle.legacy_import_conflicts(&source.store).await;
+        let before = handle.retained_content_digest_hex().await;
+        if let Err(error) = handle
+            .import_legacy_signed_history(&source.store, source.owner)
+            .await
+        {
+            return match error {
+                x0x::error::IdentityError::Unauthorized(message) => forbidden(message),
+                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            };
+        }
+        let after = handle.retained_content_digest_hex().await;
+        let receipt = super::super::legacy_store_migration::new_receipt(
+            super::super::legacy_store_migration::LegacyImportReceiptInput {
+                idempotency_key: request.idempotency_key.clone(),
+                group_id: binding.stable_group_id,
+                app: app.to_string(),
+                source_store_id: source.store_id_hex,
+                source_digest: source.digest,
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding,
+                destination_digest_before: before,
+                destination_digest_after: after,
+            },
+        );
+        if let Err(error) =
+            super::super::legacy_store_migration::append_receipt(&receipt_path, receipt.clone())
+                .await
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("destination persisted but import receipt did not: {error}"),
+            );
+        }
+        // The receipt is now the durable binding; the preserved intent
+        // snapshot is redundant. Best-effort — the next retry retries it.
+        let _ = super::super::legacy_store_migration::remove_intent(
+            &state.kv_store_state_dir,
+            &request.idempotency_key,
+        )
+        .await;
+        (receipt, conflicts)
+    };
+    drop(membership_guard);
+    if let Err(error) = handle.publish_retained_group_history().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("import persisted locally but sync publication is pending: {error}"),
+                "receipt": receipt,
+                "idempotency_key": receipt.idempotency_key,
+                "imported_locally": true,
+                "publish_accepted": false,
+            })),
+        );
+    }
+    let accepted = match super::super::legacy_store_migration::mark_publish_accepted(
+        &receipt_path,
+        &receipt.idempotency_key,
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("import persisted and publication was accepted, but receipt status remains pending: {error}"),
+                    "receipt": receipt,
+                    "idempotency_key": receipt.idempotency_key,
+                    "imported_locally": true,
+                    "publish_accepted": false,
+                })),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true, "receipt": accepted, "conflicts": conflicts,
+            "imported_locally": true, "publish_accepted": true
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,7 +3004,7 @@ mod tests {
                 ),
             ]),
         };
-        assert!(validate_gss_store_manifest(&good, &binding, "encrypted").is_ok());
+        assert!(validate_gss_store_manifest(&good, &binding, "encrypted", Some("gss")).is_ok());
         let mut hex_binding = binding.clone();
         hex_binding.creator = AgentId([0xab; 32]);
         let mut upper_owner = good.clone();
@@ -1564,7 +3013,8 @@ mod tests {
             serde_json::Value::String("AB".repeat(32)),
         );
         assert!(
-            validate_gss_store_manifest(&upper_owner, &hex_binding, "encrypted").is_ok(),
+            validate_gss_store_manifest(&upper_owner, &hex_binding, "encrypted", Some("gss"))
+                .is_ok(),
             "preserve parsed owner-ID spelling compatibility"
         );
         for case in 0..6 {
@@ -1592,7 +3042,7 @@ mod tests {
                 _ => entry.name = " Wiki ".into(),
             }
             assert!(
-                validate_gss_store_manifest(&entry, &binding, "encrypted").is_err(),
+                validate_gss_store_manifest(&entry, &binding, "encrypted", Some("gss")).is_err(),
                 "case {case}"
             );
         }
@@ -1636,6 +3086,1523 @@ mod tests {
         (state, dir)
     }
 
+    fn owner_actor() -> crate::server::rider_auth::ActorContext {
+        crate::server::rider_auth::ActorContext::Owner { durable: false }
+    }
+
+    async fn seed_legacy_page_source(
+        state: &AppState,
+        group_id: &str,
+        app: &str,
+    ) -> (String, x0x::KvStoreHandle) {
+        let topic = legacy_page_topic(group_id, app).expect("legacy topic");
+        let handle = state
+            .agent
+            .create_kv_store_persistent(
+                app,
+                &topic,
+                x0x::kv::AccessPolicy::Signed,
+                &state.kv_store_state_dir,
+            )
+            .await
+            .expect("legacy store");
+        handle
+            .put(
+                "shared".to_string(),
+                b"legacy".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("legacy value");
+        handle
+            .put(
+                "legacy-only".to_string(),
+                b"history".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("legacy-only value");
+        let source_id = hex::encode(
+            x0x::kv::KvStoreId::for_topic_owner(&topic, &state.agent.agent_id()).as_bytes(),
+        );
+        crdt_subscriptions::record(
+            state,
+            crdt_subscriptions::CrdtSubscriptionEntry {
+                kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
+                id: topic.clone(),
+                name: app.to_string(),
+                topic,
+                role: crdt_subscriptions::ROLE_CREATED.to_string(),
+                extra: serde_json::Map::from_iter([
+                    ("policy".to_string(), serde_json::json!("signed")),
+                    (
+                        "expected_owner".to_string(),
+                        serde_json::json!(hex::encode(state.agent.agent_id().as_bytes())),
+                    ),
+                ]),
+            },
+        )
+        .await
+        .expect("legacy manifest");
+        (source_id, handle)
+    }
+
+    async fn seed_public_migration_group(state: &AppState, group_id: &str) {
+        let mut info = GroupInfo::new(
+            "migration".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_endpoint_discovery_authority_digest_and_stale_writer() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "91".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+
+        let (code, body) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body:?}");
+        let candidate = &body.0["candidates"][0];
+        assert_eq!(candidate["source_store_id"], source_id);
+        assert_eq!(
+            candidate["keys"],
+            serde_json::json!(["legacy-only", "shared"])
+        );
+        let digest = candidate["source_digest"]
+            .as_str()
+            .expect("digest")
+            .to_string();
+
+        let (code, download) = download_legacy_page_import(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Query(LegacyDownloadQuery::default()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{download:?}");
+        assert_eq!(download.0["source_store_id"], source_id);
+        assert_eq!(download.0["source_digest"], digest);
+        assert!(
+            download.0["snapshot_b64"]
+                .as_str()
+                .is_some_and(|snapshot| !snapshot.is_empty()),
+            "download returns the reviewed immutable source snapshot: {download:?}"
+        );
+
+        let rider = crate::server::rider_auth::ActorContext::Rider {
+            sub_agent_id: "rider".to_string(),
+            token_id: 1,
+            token_hash: "hash".to_string(),
+            groups: vec![group_id.clone()],
+        };
+        let (code, _) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(rider),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+
+        let manifest_before = tokio::fs::read(&state.crdt_subscriptions_path)
+            .await
+            .expect("manifest bytes");
+        let mut forged_manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_before).expect("manifest json");
+        let legacy_entry = forged_manifest["entries"]
+            .as_array_mut()
+            .expect("manifest entries")
+            .iter_mut()
+            .find(|entry| entry["id"] == legacy_page_topic(&group_id, "wiki").expect("topic"))
+            .expect("legacy entry");
+        // `CrdtSubscriptionEntry::extra` is flattened into the entry object.
+        legacy_entry["expected_owner"] = serde_json::json!("00".repeat(32));
+        // Hold the production manifest-writer lock while installing the
+        // deliberately forged durable image. A concurrent registration must
+        // not repair the fixture before the strict disk probe observes it.
+        let manifest_guard = state.crdt_subscriptions_persistence_lock.lock().await;
+        let forged_bytes = serde_json::to_vec(&forged_manifest).expect("forged manifest bytes");
+        tokio::fs::write(&state.crdt_subscriptions_path, &forged_bytes)
+            .await
+            .expect("write forged manifest");
+        assert_eq!(
+            tokio::fs::read(&state.crdt_subscriptions_path)
+                .await
+                .expect("read forged manifest"),
+            forged_bytes,
+            "strict probe fixture is the durable manifest actually read"
+        );
+        let probed = crdt_subscriptions::probe_manifest_strict(&state.crdt_subscriptions_path)
+            .await
+            .expect("typed forged manifest probe")
+            .expect("forged manifest exists");
+        let probed_legacy = probed
+            .entries
+            .iter()
+            .find(|entry| entry.id == legacy_page_topic(&group_id, "wiki").expect("topic"))
+            .expect("typed legacy entry");
+        assert_eq!(
+            probed_legacy.extra.get("expected_owner"),
+            Some(&serde_json::json!("00".repeat(32))),
+            "typed production probe observes the forged authority binding"
+        );
+        let (code, _) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        tokio::fs::write(&state.crdt_subscriptions_path, manifest_before)
+            .await
+            .expect("restore manifest");
+        drop(manifest_guard);
+
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: "forged".to_string(),
+                idempotency_key: "forged-digest".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            info.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+            info.members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Member;
+        }
+        let (code, _) = import_legacy_page_store(
+            State(state),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "stale-writer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_partial_publication_is_pending_and_exact_retry_marks_accepted() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "92".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .expect("group")
+            .policy
+            .write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        for index in 0..17 {
+            source_handle
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                )
+                .await
+                .expect("large retained source entry");
+        }
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic");
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(topic)
+            .cloned()
+            .expect("destination handle");
+        handle.fail_retained_publish_after_for_test(1);
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "partial-publish".to_string(),
+        };
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{failed:?}");
+        assert_eq!(failed.0["imported_locally"], true);
+        assert_eq!(failed.0["publish_accepted"], false);
+        assert_eq!(handle.retained_publish_accepted_for_test(), 1);
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("imported read")
+                .is_some(),
+            "partial publication never rolls back the persisted import"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        let pending = crate::server::legacy_store_migration::read_receipts(&receipt_path)
+            .await
+            .expect("pending receipt");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].publish_accepted_at_ms, None);
+        let (_, pending_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let pending_candidate = &pending_listing.0["candidates"][0];
+        assert_eq!(pending_candidate["imported"], true);
+        assert_eq!(pending_candidate["publish_pending"], true);
+        assert_eq!(pending_candidate["publish_accepted"], false);
+        assert_eq!(
+            pending_candidate["import_idempotency_key"],
+            "partial-publish"
+        );
+        source_handle
+            .put(
+                "after-reviewed-snapshot".to_string(),
+                b"must not merge on retry".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("mutate source after reviewed import");
+
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group")
+                .members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Member;
+        }
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::FORBIDDEN,
+            "pending retry must reauthorize"
+        );
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("still pending")[0]
+                .publish_accepted_at_ms,
+            None
+        );
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group")
+                .members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Admin;
+        }
+        handle.clear_retained_publish_failure_for_test();
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(retried.0["publish_accepted"], true);
+        let accepted = crate::server::legacy_store_migration::read_receipts(&receipt_path)
+            .await
+            .expect("accepted receipt");
+        assert_eq!(accepted.len(), 1, "retry must not duplicate receipt");
+        assert!(accepted[0].publish_accepted_at_ms.is_some());
+        assert!(
+            handle
+                .get("after-reviewed-snapshot")
+                .await
+                .expect("read canonical after retry")
+                .is_none(),
+            "pending retry republishes the persisted canonical image without remerging source"
+        );
+        let accepted_frames = handle.retained_publish_accepted_for_test();
+        let (code, accepted_repeat) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{accepted_repeat:?}");
+        assert_eq!(accepted_repeat.0["publish_accepted"], true);
+        assert_eq!(
+            handle.retained_publish_accepted_for_test(),
+            accepted_frames,
+            "accepted retry does not publish again"
+        );
+
+        let (code, _) = import_legacy_page_store(
+            State(state),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: "changed".to_string(),
+                idempotency_key: "partial-publish".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_intent_persist_failure_leaves_destination_unmodified() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "93".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        crate::server::legacy_store_migration::fail_next_intent_for_test("intent-fault");
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest.clone(),
+                idempotency_key: "intent-fault".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent did not persist")),
+            "must fail at the pre-mutation intent boundary: {failed:?}"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination")
+                .is_none(),
+            "failed intent write must not merge any source content"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after intent fault")
+                .is_empty()
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-fault"
+            )
+            .await
+            .expect("intent after fault")
+            .is_none(),
+            "failed intent write leaves no durable binding"
+        );
+
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "intent-fault".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(retried.0["publish_accepted"], true);
+        assert!(handle
+            .get("legacy-only")
+            .await
+            .expect("read after retry")
+            .is_some());
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after retry")
+                .len(),
+            1
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-fault"
+            )
+            .await
+            .expect("intent after retry")
+            .is_none(),
+            "settled intent snapshot is removed once the receipt exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_intent_directory_sync_failure_blocks_canonical_mutation() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "97".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "dir-sync-fault".to_string(),
+        };
+
+        // The atomic intent write succeeds but the kv_state_dir entry sync
+        // fails: the intent file exists yet the route must refuse to mutate
+        // the canonical destination on an unproven intent.
+        crate::server::legacy_store_migration::fail_next_intent_dir_sync_for_test("dir-sync-fault");
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent did not persist")),
+            "fresh import stops at the intent durability boundary: {failed:?}"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "dir-sync-fault"
+            )
+            .await
+            .expect("intent readable")
+            .is_some(),
+            "the intent file itself was written; only its durability is unproven"
+        );
+        // Path-target control: the durability sync must have fsynced
+        // kv_state_dir ITSELF, never its parent — the exact regression
+        // sync_parent_directory(kv_state_dir) would reintroduce.
+        let target = crate::server::legacy_store_migration::intent_dir_sync_target_for_test(
+            "dir-sync-fault",
+        )
+        .expect("sync target recorded");
+        assert_eq!(
+            target, state.kv_store_state_dir,
+            "intent durability must fsync kv_state_dir itself"
+        );
+        assert_ne!(
+            target,
+            state.kv_store_state_dir.parent().expect("state dir parent"),
+            "syncing kv_state_dir's PARENT leaves the intents directory entry unlinked"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination")
+                .is_none(),
+            "unproven intent durability must block the canonical merge"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after dir-sync fault")
+                .is_empty()
+        );
+
+        // Identical-intent retry with the sync still failing: the recovery
+        // path must re-prove durability instead of merging on file presence.
+        crate::server::legacy_store_migration::fail_next_intent_dir_sync_for_test("dir-sync-fault");
+        let (code, retry_failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{retry_failed:?}");
+        assert!(
+            retry_failed.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent durability is unproven")),
+            "recovery retry stops at the durability proof: {retry_failed:?}"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination again")
+                .is_none(),
+            "canonical destination is still untouched"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after failed retry")
+                .is_empty()
+        );
+
+        // With durability provable, the SAME key finishes the original
+        // import exactly once.
+        let (code, done) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done:?}");
+        assert_eq!(done.0["imported_locally"], true);
+        assert_eq!(done.0["publish_accepted"], true);
+        assert!(handle
+            .get("legacy-only")
+            .await
+            .expect("read after completion")
+            .is_some());
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after completion")
+                .len(),
+            1
+        );
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "dir-sync-fault"
+        )
+        .await
+        .expect("intent after completion")
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_import_receipt_fault_intent_recovers_after_source_edit_and_reopen() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "94".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_before_edit = tokio::fs::read(&source_path)
+            .await
+            .expect("reviewed source bytes");
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        // Destination persists, receipt append fails: the exact PR727 window.
+        crate::server::legacy_store_migration::fail_next_append_for_test("intent-recovery");
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "intent-recovery".to_string(),
+        };
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"].as_str().is_some_and(
+                |error| error.contains("destination persisted but import receipt did not")
+            ),
+            "must reach the post-persist receipt append boundary: {failed:?}"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read applied content")
+                .is_some(),
+            "merge applied before the receipt fault"
+        );
+        let intent = crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "intent-recovery",
+        )
+        .await
+        .expect("intent journal readable")
+        .expect("durable intent survived the receipt fault");
+        assert_eq!(intent.source_digest, digest);
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after fault")
+                .is_empty()
+        );
+
+        // The reviewed source changes AFTER the failed import attempt.
+        source_handle
+            .put(
+                "post-review-edit".to_string(),
+                b"edited after review".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("edit legacy source after failed import");
+        let source_after_edit = tokio::fs::read(&source_path)
+            .await
+            .expect("source bytes after edit");
+        let (endorser, authority_binding) = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            let values = (
+                hex::encode(state.agent.agent_id().as_bytes()),
+                migration_authority_binding(info),
+            );
+            info.state_revision = info.state_revision.saturating_add(1);
+            values
+        };
+        crate::server::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            crate::server::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: "intent-recovery-second".to_string(),
+                group_id: group_id.clone(),
+                app: "wiki".to_string(),
+                source_store_id: source_id.clone(),
+                source_digest: digest.clone(),
+                endorser,
+                authority_binding,
+                source_snapshot: source_before_edit.clone(),
+            },
+        )
+        .await
+        .expect("second pending key for the same reviewed source");
+
+        // Daemon-restart seam: drop the live handle so the retry reopens the
+        // destination from its persisted snapshot and the intent from disk.
+        handle.retire();
+        state.kv_stores.write().await.remove(&topic);
+        let (_, pending_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let candidates = pending_listing.0["candidates"]
+            .as_array()
+            .expect("candidate array");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "changed source and both pending keys stay distinct"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate["import_pending"] == true)
+                .count(),
+            2,
+            "each unsettled idempotency key retains a recovery card"
+        );
+        let pending_candidate = candidates
+            .iter()
+            .find(|candidate| candidate["import_idempotency_key"] == "intent-recovery")
+            .expect("original pending reviewed intent candidate");
+        assert_eq!(
+            pending_candidate["imported"], false,
+            "an intent is not a completed local import"
+        );
+        assert_eq!(pending_candidate["source_digest"], digest);
+        assert_eq!(
+            pending_candidate["import_idempotency_key"],
+            "intent-recovery"
+        );
+        let current_candidate = candidates
+            .iter()
+            .find(|candidate| candidate["import_pending"] == false)
+            .expect("changed current-source candidate");
+        assert_ne!(current_candidate["source_digest"], digest);
+
+        let (code, preserved_download) = download_legacy_page_import(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Query(LegacyDownloadQuery {
+                idempotency_key: Some("intent-recovery".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{preserved_download:?}");
+        let preserved_bytes = BASE64
+            .decode(
+                preserved_download.0["snapshot_b64"]
+                    .as_str()
+                    .expect("preserved snapshot"),
+            )
+            .expect("decode preserved snapshot");
+        assert_eq!(preserved_bytes, source_before_edit);
+        assert_eq!(preserved_download.0["source_digest"], digest);
+
+        // Same ORIGINAL key and digest resumes the original import.
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(retried.0["imported_locally"], true);
+        assert_eq!(retried.0["publish_accepted"], true);
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("reopened destination handle");
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read recovered content")
+                .is_some(),
+            "no imported data was lost across the fault and reopen"
+        );
+        assert!(handle.get("shared").await.expect("read shared").is_some(),);
+        assert!(
+            handle
+                .get("post-review-edit")
+                .await
+                .expect("read post-review key")
+                .is_none(),
+            "recovery merges the preserved reviewed snapshot, never the edited source"
+        );
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after recovery")
+                .len(),
+            1,
+            "recovery publishes exactly one receipt for the original key"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-recovery"
+            )
+            .await
+            .expect("intent after recovery")
+            .is_none(),
+            "settled intent snapshot is removed"
+        );
+        assert_eq!(
+            tokio::fs::read(&source_path).await.expect("source after"),
+            source_after_edit,
+            "recovery never mutates the legacy source"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_listing_fails_closed_on_corrupt_or_excess_intents() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "9a".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let corrupt_path = crate::server::legacy_store_migration::intent_path(
+            &state.kv_store_state_dir,
+            "corrupt-listing",
+        );
+        tokio::fs::create_dir_all(corrupt_path.parent().expect("intent directory"))
+            .await
+            .expect("create intent directory");
+        tokio::fs::write(&corrupt_path, b"{}")
+            .await
+            .expect("write corrupt intent");
+        let (code, body) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body:?}");
+        assert!(body.0["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("intent journal is unreadable")));
+
+        let intent_directory = corrupt_path.parent().expect("intent directory");
+        tokio::fs::remove_dir_all(intent_directory)
+            .await
+            .expect("remove corrupt fixture");
+        tokio::fs::create_dir_all(intent_directory)
+            .await
+            .expect("recreate intent directory");
+        for index in 0..=128 {
+            tokio::fs::write(intent_directory.join(format!("{index:064x}.json")), b"{}")
+                .await
+                .expect("write count-bound fixture");
+        }
+        let (code, body) = list_legacy_page_imports(
+            State(state),
+            Path((group_id, "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body:?}");
+        assert!(body.0["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("intent journal is unreadable")));
+    }
+
+    #[tokio::test]
+    async fn legacy_import_pending_intent_conflicts_on_args_and_reauthorizes_writer() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "95".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        crate::server::legacy_store_migration::fail_next_append_for_test("intent-gate");
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "intent-gate".to_string(),
+        };
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "intent-gate"
+        )
+        .await
+        .expect("pending intent")
+        .is_some());
+
+        // Same key, different arguments: conflict, nothing recovered.
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: "different".to_string(),
+                idempotency_key: "intent-gate".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+
+        // Current writer revoked mid-flight: the retry reauthorizes and
+        // refuses without consuming the durable intent.
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            info.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+            info.members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Member;
+        }
+        let (_, revoked_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let pending = revoked_listing.0["candidates"]
+            .as_array()
+            .expect("revoked candidate array")
+            .iter()
+            .find(|candidate| candidate["import_pending"] == true)
+            .expect("pending candidate remains discoverable");
+        assert_eq!(pending["can_import"], false);
+        assert!(pending["import_refusal_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cannot endorse")));
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::FORBIDDEN,
+            "pending-intent retry must reauthorize the current writer"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after refusal")
+                .is_empty()
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "intent-gate"
+            )
+            .await
+            .expect("intent after refusal")
+            .is_some(),
+            "refused retry leaves the durable intent intact"
+        );
+
+        // Writer restored: the same original key still finishes.
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group")
+                .members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Admin;
+        }
+        let (code, done) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done:?}");
+        assert_eq!(done.0["publish_accepted"], true);
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after completion")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_intent_without_merge_is_not_imported_and_finishes_on_retry() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "96".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_bytes = tokio::fs::read(&source_path).await.expect("source bytes");
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+
+        // Emulate a crash after the durable intent write but before the
+        // merge: the durable state is exactly an intent file and nothing
+        // else. Write it through the production journal API.
+        let authority_binding = {
+            let groups = state.named_groups.read().await;
+            migration_authority_binding(groups.get(&group_id).expect("group"))
+        };
+        crate::server::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            crate::server::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: "crash-before-merge".to_string(),
+                group_id: group_id.clone(),
+                app: "wiki".to_string(),
+                source_store_id: source_id.clone(),
+                source_digest: digest.clone(),
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding,
+                source_snapshot: source_bytes,
+            },
+        )
+        .await
+        .expect("durable pre-merge intent");
+
+        let (_, crashed_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(
+            crashed_listing.0["candidates"][0]["imported"], false,
+            "an intent without a merge is not falsely imported"
+        );
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read destination")
+                .is_none(),
+            "crash-before-merge never touched the canonical destination"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after crash")
+                .is_empty()
+        );
+
+        let (code, done) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "crash-before-merge".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done:?}");
+        assert_eq!(done.0["imported_locally"], true);
+        assert_eq!(done.0["publish_accepted"], true);
+        assert!(handle
+            .get("legacy-only")
+            .await
+            .expect("read after recovery")
+            .is_some());
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts after recovery")
+                .len(),
+            1
+        );
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "crash-before-merge"
+        )
+        .await
+        .expect("intent after recovery")
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_import_unloaded_preview_ambiguity_and_receipt_retry_preserve_state() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let prefix = "ab".repeat(8);
+        let group_id = format!("{prefix}{}", "11".repeat(8));
+        let colliding_id = format!("{prefix}{}", "22".repeat(8));
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_before = tokio::fs::read(&source_path).await.expect("source bytes");
+
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{opened:?}");
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let destination_snapshot_path = state.kv_store_state_dir.join(format!(
+            "{}.bin",
+            opened.0["store_id"].as_str().expect("destination store id")
+        ));
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        handle
+            .put(
+                "shared".to_string(),
+                b"current".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("destination conflict");
+        handle.retire();
+        state.kv_stores.write().await.remove(&topic);
+
+        seed_public_migration_group(&state, &colliding_id).await;
+        let (code, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{listing:?}");
+        let candidate = &listing.0["candidates"][0];
+        assert_eq!(candidate["ambiguous_group_prefix"], true);
+        assert_eq!(candidate["conflicts"], serde_json::json!(["shared"]));
+        let digest = candidate["source_digest"]
+            .as_str()
+            .expect("digest")
+            .to_string();
+
+        // Restore the already-open handle after exercising the unloaded GET
+        // preview, then make only its final snapshot rename fail. The handle
+        // remains readable and writable through the merge, so this reaches
+        // the post-mutation persist boundary rather than failing during open.
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(topic.clone(), handle.clone());
+        tokio::fs::remove_file(&destination_snapshot_path)
+            .await
+            .expect("remove prior destination snapshot");
+        tokio::fs::create_dir(&destination_snapshot_path)
+            .await
+            .expect("block destination snapshot rename");
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest.clone(),
+                idempotency_key: "persist-fault".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"].as_str().is_some_and(
+                |error| error.contains("applied in memory but destination persistence failed")
+            ),
+            "must reach the post-mutation destination persist boundary: {failed:?}"
+        );
+        tokio::fs::remove_dir(&destination_snapshot_path)
+            .await
+            .expect("heal destination persistence");
+        let (code, persisted_retry) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest.clone(),
+                idempotency_key: "persist-fault".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{persisted_retry:?}");
+        assert_eq!(
+            tokio::fs::read(&source_path)
+                .await
+                .expect("source after persist retry"),
+            source_before,
+            "persistence failure and retry never mutate the source"
+        );
+
+        source_handle
+            .put(
+                "receipt-wave".to_string(),
+                b"new history".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("new legacy source wave");
+        let source_before_receipt = tokio::fs::read(&source_path)
+            .await
+            .expect("source bytes before receipt-fault import");
+        let (_, refreshed) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let receipt_digest = refreshed.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("refreshed digest")
+            .to_string();
+
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        crate::server::legacy_store_migration::fail_next_append_for_test(
+            "retry-after-receipt-fault",
+        );
+        let request = || ImportLegacyStoreRequest {
+            source_digest: receipt_digest.clone(),
+            idempotency_key: "retry-after-receipt-fault".to_string(),
+        };
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        assert!(
+            failed.0["error"].as_str().is_some_and(
+                |error| error.contains("destination persisted but import receipt did not")
+            ),
+            "must reach the post-persist receipt append boundary: {failed:?}"
+        );
+
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("restored destination");
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("read applied content")
+                .is_some(),
+            "receipt failure occurs after the import was applied"
+        );
+        assert!(
+            handle
+                .get("receipt-wave")
+                .await
+                .expect("read newly applied content")
+                .is_some(),
+            "new source bytes were applied before receipt append failed"
+        );
+        let destination_id = x0x::kv::encrypted::group_store_identity(&group_id, "wiki").0;
+        let persisted = x0x::kv::sync::load_snapshot(
+            &state
+                .kv_store_state_dir
+                .join(format!("{}.bin", hex::encode(destination_id.as_bytes()))),
+        )
+        .expect("load persisted destination")
+        .expect("persisted destination exists");
+        assert!(persisted.get("legacy-only").is_some());
+        assert!(persisted.get("receipt-wave").is_some());
+        handle
+            .put(
+                "concurrent".to_string(),
+                b"keep".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("concurrent destination write");
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(
+            handle
+                .get("concurrent")
+                .await
+                .expect("read concurrent")
+                .expect("concurrent preserved")
+                .value,
+            b"keep"
+        );
+        assert_eq!(
+            tokio::fs::read(source_path).await.expect("source after"),
+            source_before_receipt,
+            "legacy source snapshot is never mutated"
+        );
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipt journal")
+                .len(),
+            2
+        );
+    }
+
     /// Seed an MlsEncrypted/GSS group owned by the DAEMON AGENT (the caller),
     /// unless a foreign creator is requested.
     async fn seed_group(state: &AppState, group_key: &str, creator: x0x::identity::AgentId) {
@@ -1652,6 +4619,264 @@ mod tests {
             .write()
             .await
             .insert(group_key.to_string(), info);
+    }
+
+    async fn seed_treekem_group(state: &AppState, group_key: &str) {
+        let group_id = hex::decode(group_key).expect("hex group id");
+        let creator = state.agent.agent_id();
+        let seed = crate::server::routes::named_groups::agent_treekem_seed(
+            state.agent.as_ref(),
+            &group_id,
+        );
+        let live =
+            x0x::mls::TreeKemMlsGroup::create(group_id, creator, &seed).expect("TreeKEM group");
+        let mut info = GroupInfo::new(
+            "treekem".to_string(),
+            String::new(),
+            creator,
+            group_key.to_string(),
+        );
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        info.secret_epoch = live.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", live.epoch()));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.to_string(), info);
+        state.treekem_groups.write().await.insert(
+            group_key.to_string(),
+            Arc::new(tokio::sync::Mutex::new(live)),
+        );
+    }
+
+    #[tokio::test]
+    async fn treekem_non_owner_endorses_retained_history_and_revocation_fences_merge() {
+        use x0x::kv::TreeKemKvProtector;
+
+        let (writer_state, _writer_dir) = encrypted_store_test_state().await;
+        let (reader_state, _reader_dir) = encrypted_store_test_state().await;
+        let owner = AgentId([77; 32]);
+        let writer = writer_state.agent.agent_id();
+        let reader = reader_state.agent.agent_id();
+        let group_key = "45".repeat(16);
+        let group_id = hex::decode(&group_key).expect("group id");
+        let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            writer_state.agent.as_ref(),
+            &group_id,
+        );
+        let reader_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            reader_state.agent.as_ref(),
+            &group_id,
+        );
+        let mut owner_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id, owner, &[77; 32]).expect("owner group");
+        let writer_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(reader, &reader_seed).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances for reader");
+        let reader_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+
+        let mut info = GroupInfo::new(
+            "private".to_string(),
+            String::new(),
+            owner,
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        info.policy.write_access = x0x::groups::GroupWriteAccess::AdminOnly;
+        info.add_member(
+            hex::encode(writer.as_bytes()),
+            x0x::groups::GroupRole::Admin,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        info.add_member(
+            hex::encode(reader.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        info.secret_epoch = writer_group.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", writer_group.epoch()));
+        info.recompute_state_hash();
+        writer_state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        reader_state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        writer_state.treekem_groups.write().await.insert(
+            group_key.clone(),
+            Arc::new(tokio::sync::Mutex::new(writer_group)),
+        );
+        reader_state.treekem_groups.write().await.insert(
+            group_key.clone(),
+            Arc::new(tokio::sync::Mutex::new(reader_group)),
+        );
+        let writer_binding = {
+            let groups = writer_state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &group_key, "Home", &writer)
+                .expect("writer binding")
+        };
+        let reader_binding = {
+            let groups = reader_state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &group_key, "Home", &reader)
+                .expect("reader binding")
+        };
+        assert_eq!(writer_binding.store_id, reader_binding.store_id);
+        let writer_auth = Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(&info).expect("writer auth"),
+        );
+        let reader_auth = Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(&info).expect("reader auth"),
+        );
+        let writer_protector = TreeKemGroupStoreProtector::new(
+            &writer_state,
+            &writer_binding,
+            Arc::clone(&writer_auth),
+        );
+        let reader_protector = TreeKemGroupStoreProtector::new(
+            &reader_state,
+            &reader_binding,
+            Arc::clone(&reader_auth),
+        );
+        assert!(reader_protector.is_authorized_reader(&reader).await);
+        assert!(!reader_protector.is_authorized_writer(&reader).await);
+
+        let group_id = group_key.as_bytes().to_vec();
+        let mut source = x0x::kv::KvStore::new_treekem_encrypted(
+            writer_binding.store_id,
+            "Home".to_string(),
+            owner,
+            group_id.clone(),
+            writer_auth,
+        )
+        .expect("source store");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                saorsa_gossip_types::PeerId::new([1; 32]),
+            )
+            .expect("seed removed key");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    saorsa_gossip_types::PeerId::new([1; 32]),
+                )
+                .expect("large retained value");
+        }
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_auth)
+            .expect("reader context");
+        source.remove("removed").expect("retained tombstone");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                saorsa_gossip_types::PeerId::new([2; 32]),
+            )
+            .expect("concurrent reader state");
+        let retained = bincode::serialize(&source).expect("retained image");
+        assert!(retained.len() > 1024 * 1024, "history requires paging");
+        let signing =
+            x0x::kv::AuthorSigning::from_keypair(writer_state.agent.identity().agent_keypair())
+                .expect("writer signing");
+        let record = writer_protector
+            .seal_record(
+                &signing,
+                x0x::kv::KvMutationKind::RetainedState,
+                &writer_binding.store_id,
+                b"paged-image-complete",
+                false,
+            )
+            .await
+            .expect("non-owner writer endorsement");
+        let opened = reader_protector
+            .open_record(&reader_binding.store_id, &record)
+            .await
+            .expect("reader opens endorsed history");
+        let target = Arc::new(tokio::sync::RwLock::new(target));
+        reader_protector
+            .merge_main_record(
+                opened,
+                saorsa_gossip_types::PeerId::new([1; 32]),
+                saorsa_gossip_types::PeerId::new([2; 32]),
+                &target,
+                Some(retained),
+            )
+            .await
+            .expect("current writer retained merge");
+        let merged = target.read().await;
+        assert!(merged.get("removed").is_none());
+        assert_eq!(
+            merged.get("concurrent").expect("concurrent").value,
+            b"local"
+        );
+        assert_eq!(merged.last_history_endorser(), Some(&writer));
+        drop(merged);
+
+        let stale_record = writer_protector
+            .seal_record(
+                &signing,
+                x0x::kv::KvMutationKind::RetainedState,
+                &writer_binding.store_id,
+                b"paged-image-complete",
+                false,
+            )
+            .await
+            .expect("record before removal");
+        let stale_opened = reader_protector
+            .open_record(&reader_binding.store_id, &stale_record)
+            .await
+            .expect("opened before removal");
+        {
+            let mut groups = reader_state.named_groups.write().await;
+            groups
+                .get_mut(&group_key)
+                .expect("reader group")
+                .remove_member(&hex::encode(writer.as_bytes()), None);
+        }
+        assert!(reader_protector
+            .merge_main_record(
+                stale_opened,
+                saorsa_gossip_types::PeerId::new([1; 32]),
+                saorsa_gossip_types::PeerId::new([2; 32]),
+                &target,
+                Some(bincode::serialize(&source).expect("stale image")),
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1911,33 +5136,65 @@ mod tests {
         assert_eq!(code, StatusCode::CREATED, "{resp:?}");
         assert_eq!(resp.0["policy"], "group_signed");
 
-        // TreeKEM-plane group -> 400 (v1 encrypted stores are GSS-backed).
+        // TreeKEM-plane group uses the distinct mutable-ratchet backend.
         let treekem_key = "12".repeat(16);
-        {
-            let mut info = GroupInfo::new(
-                "treekem".to_string(),
-                String::new(),
-                state.agent.agent_id(),
-                treekem_key.clone(),
-            );
-            info.migrate_from_v1();
-            info.secure_plane = SecureGroupPlane::TreeKem;
-            state
-                .named_groups
-                .write()
-                .await
-                .insert(treekem_key.clone(), info);
-        }
+        seed_treekem_group(&state, &treekem_key).await;
         let (code, resp) = create_group_kv_store(
-            State(state),
-            Path(treekem_key),
+            State(Arc::clone(&state)),
+            Path(treekem_key.clone()),
             Extension(owner_actor.clone()),
             Json(CreateGroupStoreRequest {
                 name: "n".to_string(),
             }),
         )
         .await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "{resp:?}");
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        assert_eq!(resp.0["policy"], "encrypted");
+        let topic = resp.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("TreeKEM handle");
+        handle
+            .validate_group_binding(
+                "n",
+                &treekem_key,
+                state.agent.agent_id(),
+                x0x::GroupStoreProtection::TreeKemEncrypted,
+            )
+            .await
+            .expect("distinct TreeKEM binding");
+        handle
+            .put_with_delta("k".into(), b"v".to_vec(), "text/plain".into())
+            .await
+            .expect("TreeKEM store write");
+        assert_eq!(
+            handle.get("k").await.expect("read").expect("stored").value,
+            b"v"
+        );
+        handle.retire();
+        state.kv_stores.write().await.remove(&topic);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &treekem_key, "n", &state.agent.agent_id())
+                .expect("restart binding")
+        };
+        let (restored, _, _) = open_bound_treekem_store(&state, &binding)
+            .await
+            .expect("restore TreeKEM store snapshot");
+        assert_eq!(
+            restored
+                .get("k")
+                .await
+                .expect("restored read")
+                .expect("restored value")
+                .value,
+            b"v",
+            "restart must retain the durable store image"
+        );
         let _ = GssKvSecureContext::from_group; // keep backend import referenced
         let _ = GroupPolicy::default();
     }

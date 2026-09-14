@@ -1659,6 +1659,58 @@ enum GroupStoreSub {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Review and explicitly import viewer-owned legacy Wiki/Web stores.
+    Legacy {
+        #[command(subcommand)]
+        sub: GroupStoreLegacySub,
+    },
+}
+
+/// `x0x group store legacy` subcommands (#565 migration gate).
+#[derive(Subcommand)]
+enum GroupStoreLegacySub {
+    /// List exact local legacy snapshots available for review and import.
+    Imports {
+        /// Canonical stable group ID (short aliases are rejected).
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Legacy application name: `wiki` or `web`.
+        #[arg(value_name = "APP")]
+        app: String,
+    },
+    /// Download one exact legacy snapshot without changing it.
+    Download {
+        /// Canonical stable group ID (short aliases are rejected).
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Legacy application name: `wiki` or `web`.
+        #[arg(value_name = "APP")]
+        app: String,
+        /// Exact source store ID returned by `legacy imports`.
+        #[arg(value_name = "SOURCE_ID")]
+        source_id: String,
+        /// Stable key returned for a pending import snapshot.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Import one reviewed snapshot under the current writer's endorsement.
+    Import {
+        /// Canonical stable group ID (short aliases are rejected).
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Legacy application name: `wiki` or `web`.
+        #[arg(value_name = "APP")]
+        app: String,
+        /// Exact source store ID returned by `legacy imports`.
+        #[arg(value_name = "SOURCE_ID")]
+        source_id: String,
+        /// Digest returned by `legacy imports` or `legacy download`.
+        #[arg(long)]
+        source_digest: String,
+        /// Stable retry key for these exact import arguments.
+        #[arg(long)]
+        idempotency_key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2397,7 +2449,9 @@ async fn run(
                     commands::exec::cancel(&client, &request_id, agent_id.as_deref()).await
                 } else {
                     let Some(agent_id) = agent_id else {
-                        anyhow::bail!("usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>");
+                        anyhow::bail!(
+                            "usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>"
+                        );
                     };
                     commands::exec::run(
                         &client,
@@ -2680,6 +2734,56 @@ async fn run(
             Some(GroupSub::Store {
                 sub: GroupStoreSub::Create { group_id, name },
             }) => commands::group::group_store_create(&client, &group_id, &name).await,
+            Some(GroupSub::Store {
+                sub:
+                    GroupStoreSub::Legacy {
+                        sub: GroupStoreLegacySub::Imports { group_id, app },
+                    },
+            }) => commands::group::legacy_store_imports(&client, &group_id, &app).await,
+            Some(GroupSub::Store {
+                sub:
+                    GroupStoreSub::Legacy {
+                        sub:
+                            GroupStoreLegacySub::Download {
+                                group_id,
+                                app,
+                                source_id,
+                                idempotency_key,
+                            },
+                    },
+            }) => {
+                commands::group::legacy_store_download(
+                    &client,
+                    &group_id,
+                    &app,
+                    &source_id,
+                    idempotency_key.as_deref(),
+                )
+                .await
+            }
+            Some(GroupSub::Store {
+                sub:
+                    GroupStoreSub::Legacy {
+                        sub:
+                            GroupStoreLegacySub::Import {
+                                group_id,
+                                app,
+                                source_id,
+                                source_digest,
+                                idempotency_key,
+                            },
+                    },
+            }) => {
+                commands::group::legacy_store_import(
+                    &client,
+                    &group_id,
+                    &app,
+                    &source_id,
+                    &source_digest,
+                    &idempotency_key,
+                )
+                .await
+            }
             Some(GroupSub::State { group_id }) => commands::group::state(&client, &group_id).await,
             Some(GroupSub::StateCommits {
                 group_id,
@@ -3351,6 +3455,40 @@ mod tests {
                 Ok(())
             }
             _ => anyhow::bail!("expected group update with --new-name"),
+        }
+    }
+
+    #[test]
+    fn legacy_download_pending_key_requires_and_retains_value() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "x0x",
+            "group",
+            "store",
+            "legacy",
+            "download",
+            "group",
+            "wiki",
+            "source",
+            "--idempotency-key",
+            "retry-key",
+        ])?;
+        match cli.command {
+            Commands::Group {
+                sub:
+                    Some(GroupSub::Store {
+                        sub:
+                            GroupStoreSub::Legacy {
+                                sub:
+                                    GroupStoreLegacySub::Download {
+                                        idempotency_key, ..
+                                    },
+                            },
+                    }),
+            } => {
+                assert_eq!(idempotency_key.as_deref(), Some("retry-key"));
+                Ok(())
+            }
+            _ => anyhow::bail!("expected legacy download with a valued retry key"),
         }
     }
 }

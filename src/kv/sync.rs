@@ -13,7 +13,11 @@ use crate::kv::encrypted::{
     AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, SharedKvSecureContext,
     SignedKvMutation,
 };
+use crate::kv::retained_paging::{
+    decode_page, RetainedPageBinding, RetainedPagePool, RetainedPageV1,
+};
 use crate::kv::store::{AccessPolicy, MergeOutcome};
+use crate::kv::treekem::{SharedTreeKemKvProtector, TreeKemKvStoreRecordV1};
 use crate::kv::{KvError, KvStore, KvStoreDelta, KvStoreId, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -41,6 +45,24 @@ const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 pub type SecureRefreshFn = std::sync::Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
 >;
+
+struct GroupHistorySeal<'a> {
+    store: &'a Arc<RwLock<KvStore>>,
+    treekem: Option<&'a SharedTreeKemKvProtector>,
+    secure: Option<&'a SharedKvSecureContext>,
+    refresh: Option<&'a SecureRefreshFn>,
+    signing: &'a Arc<AuthorSigning>,
+    encrypted: bool,
+    local_peer_id: PeerId,
+}
+
+struct RetainedHistoryPublish<'a> {
+    seal: GroupHistorySeal<'a>,
+    pubsub: &'a PubSubManager,
+    topic: &'a str,
+    #[cfg(test)]
+    test_state: Option<&'a std::sync::Mutex<RetainedPublishTestState>>,
+}
 
 /// Delays between state-request retries for a first-time joiner whose
 /// store is still empty. Spread out so a slow mesh (peer discovery,
@@ -82,18 +104,53 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
 /// main topic); a request that lands inside the window is served by the
 /// requester's next scheduled attempt.
 const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
-const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
 
 fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
     let bytes = bincode::serialize(store)
         .map_err(|e| KvError::Gossip(format!("retained group image serialization failed: {e}")))?;
     if bytes.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
         return Err(KvError::Gossip(format!(
-            "complete group history is {} bytes, above the {}-byte indivisible payload limit; paging is required",
-            bytes.len(), MAX_RETAINED_GROUP_IMAGE_BYTES
+            "complete group history is {} bytes, above the {}-byte retained-image resource limit",
+            bytes.len(),
+            MAX_RETAINED_GROUP_IMAGE_BYTES
         )));
     }
     Ok(bytes)
+}
+
+fn assemble_retained_group_image(
+    payload: &[u8],
+    store_id: &KvStoreId,
+    endorser: &AgentId,
+    authorization: [u8; 32],
+    pool: &Arc<std::sync::Mutex<RetainedPagePool>>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(frame) = decode_page(payload)? else {
+        return Ok(Some(payload.to_vec()));
+    };
+    let image_id = match &frame {
+        RetainedPageV1::Manifest { image_id, .. } | RetainedPageV1::Page { image_id, .. } => {
+            *image_id
+        }
+    };
+    let binding = RetainedPageBinding {
+        store_id: *store_id.as_bytes(),
+        endorser: *endorser.as_bytes(),
+        authorization,
+        image_id,
+    };
+    pool.lock()
+        .map_err(|_| KvError::Gossip("retained page pool lock poisoned".to_string()))?
+        .push(binding, frame)
+}
+
+fn treekem_page_authorization(binding: [u8; 32], epoch: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"x0x.kv.treekem-retained-pages.v1");
+    hasher.update(&binding);
+    hasher.update(&epoch.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
@@ -328,6 +385,10 @@ pub struct KvStoreSync {
     /// author-verified, and membership-checked before merge.
     secure: Option<SharedKvSecureContext>,
 
+    /// Async real-TreeKEM record protector. Mutually exclusive with `secure`;
+    /// the daemon adapter owns the live ratchet and durable snapshot.
+    treekem_secure: Option<SharedTreeKemKvProtector>,
+
     /// Async hook refreshing `secure` before each seal/open decision (see
     /// [`SecureRefreshFn`]). Optional: contexts that cannot go stale (test
     /// fixtures) need no refresh.
@@ -337,6 +398,16 @@ pub struct KvStoreSync {
     /// stores (every member signs its own mutations; the design doc's
     /// sign-then-encrypt flow).
     author_signing: Option<std::sync::Arc<AuthorSigning>>,
+    retained_pages: Arc<std::sync::Mutex<RetainedPagePool>>,
+    #[cfg(test)]
+    retained_publish_test: Arc<std::sync::Mutex<RetainedPublishTestState>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RetainedPublishTestState {
+    fail_after: Option<usize>,
+    accepted: usize,
 }
 
 /// Structural teardown (parallel-review finding): the background loops hold
@@ -398,8 +469,14 @@ impl KvStoreSync {
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
             secure: None,
+            treekem_secure: None,
             secure_refresh: None,
             author_signing: None,
+            retained_pages: Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
+            #[cfg(test)]
+            retained_publish_test: Arc::new(std::sync::Mutex::new(
+                RetainedPublishTestState::default(),
+            )),
         })
     }
 
@@ -432,6 +509,22 @@ impl KvStoreSync {
         self.secure_refresh = refresh;
     }
 
+    /// Attach a real-TreeKEM protector before starting an encrypted store.
+    pub fn set_treekem_context(&mut self, protector: SharedTreeKemKvProtector) {
+        debug_assert!(self.secure.is_none(), "group protector attached twice");
+        debug_assert!(
+            self.treekem_secure.is_none(),
+            "TreeKEM protector attached twice"
+        );
+        if let Ok(store) = self.store.try_read() {
+            debug_assert!(
+                store.is_treekem_encrypted(),
+                "TreeKEM protector requires a TreeKemEncrypted store"
+            );
+        }
+        self.treekem_secure = Some(protector);
+    }
+
     /// Attach the local agent's signing material, required to publish to an
     /// encrypted store. MUST be called before
     /// [`start`](Self::start) for encrypted stores.
@@ -449,6 +542,9 @@ impl KvStoreSync {
     /// `KvStoreHandle::retire` does.
     pub fn invalidate_secure_context(&self) {
         if let Some(ctx) = self.secure.as_ref() {
+            ctx.invalidate();
+        }
+        if let Some(ctx) = self.treekem_secure.as_ref() {
             ctx.invalidate();
         }
     }
@@ -479,6 +575,129 @@ impl KvStoreSync {
             .map_err(|e| KvError::Gossip(format!("sealed delta encode failed: {e}")))
     }
 
+    async fn seal_treekem_payload(
+        store: &Arc<RwLock<KvStore>>,
+        protector: &SharedTreeKemKvProtector,
+        signing: &Arc<AuthorSigning>,
+        kind: KvMutationKind,
+        local_peer_id: PeerId,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let store_id = { *store.read().await.id() };
+        let record = protector
+            .seal_record(signing, kind, &store_id, payload, false)
+            .await?;
+        encode_delta(local_peer_id, &record)
+            .map_err(|e| KvError::Gossip(format!("TreeKEM record encode failed: {e}")))
+    }
+
+    async fn merge_treekem_record(
+        protector: &SharedTreeKemKvProtector,
+        store: &Arc<RwLock<KvStore>>,
+        store_id: &KvStoreId,
+        local_peer: PeerId,
+        payload: &[u8],
+        pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
+    ) -> bool {
+        let (sender_peer, record) = match decode_delta::<TreeKemKvStoreRecordV1>(payload) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!("rejected malformed TreeKEM record for store {store_id}: {error}");
+                return false;
+            }
+        };
+        let opened = match protector.open_record(store_id, &record).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::warn!("rejected TreeKEM record for store {store_id}: {error}");
+                return false;
+            }
+        };
+        if opened.reader_only {
+            tracing::warn!("rejected read-only TreeKEM record on main store topic");
+            return false;
+        }
+        let retained_image = if opened.mutation.kind == KvMutationKind::RetainedState {
+            match assemble_retained_group_image(
+                &opened.mutation.payload,
+                store_id,
+                &opened.mutation.author_id,
+                treekem_page_authorization(opened.authorization_binding, opened.epoch),
+                pages,
+            ) {
+                Ok(Some(image)) => Some(image),
+                Ok(None) => return false,
+                Err(error) => {
+                    tracing::warn!(%error, "rejected retained TreeKEM page");
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        protector
+            .merge_main_record(opened, sender_peer, local_peer, store, retained_image)
+            .await
+            .is_ok()
+    }
+
+    async fn seal_treekem_control(
+        protector: &SharedTreeKemKvProtector,
+        signing: &Arc<AuthorSigning>,
+        store_id: &KvStoreId,
+        local_peer_id: PeerId,
+        msg: &KvSyncMessage,
+    ) -> Option<Vec<u8>> {
+        let authorized = match msg {
+            KvSyncMessage::StateRequest { .. } => {
+                protector.is_authorized_reader(&signing.agent_id).await
+            }
+            KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
+                protector.is_authorized_writer(&signing.agent_id).await
+            }
+            KvSyncMessage::OwnerAnnounce { .. } => false,
+        };
+        if !authorized {
+            return None;
+        }
+        let payload = bincode::serialize(msg).ok()?;
+        let record = protector
+            .seal_record(
+                signing,
+                KvMutationKind::Control,
+                store_id,
+                &payload,
+                matches!(msg, KvSyncMessage::StateRequest { .. }),
+            )
+            .await
+            .ok()?;
+        encode_delta(local_peer_id, &record).ok()
+    }
+
+    async fn open_treekem_control(
+        protector: &SharedTreeKemKvProtector,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> Option<(AgentId, KvSyncMessage)> {
+        let (_, record) = decode_delta::<TreeKemKvStoreRecordV1>(payload).ok()?;
+        let opened = protector.open_record(store_id, &record).await.ok()?;
+        let mutation = opened.mutation;
+        if mutation.kind != KvMutationKind::Control {
+            return None;
+        }
+        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload).ok()?;
+        let authorized = match msg {
+            KvSyncMessage::StateRequest { .. } => {
+                opened.reader_only && protector.is_authorized_reader(&mutation.author_id).await
+            }
+            KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
+                !opened.reader_only && protector.is_authorized_writer(&mutation.author_id).await
+            }
+            KvSyncMessage::OwnerAnnounce { .. } => false,
+        };
+        authorized.then_some((mutation.author_id, msg))
+    }
+
     async fn sign_publication(
         store: &Arc<RwLock<KvStore>>,
         ctx: &SharedKvSecureContext,
@@ -497,6 +716,109 @@ impl KvStoreSync {
             .map_err(|e| KvError::Gossip(format!("signed mutation encode failed: {e}")))
     }
 
+    async fn seal_group_history_payload(
+        seal: GroupHistorySeal<'_>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if let Some(protector) = seal.treekem {
+            return Self::seal_treekem_payload(
+                seal.store,
+                protector,
+                seal.signing,
+                KvMutationKind::RetainedState,
+                seal.local_peer_id,
+                &payload,
+            )
+            .await;
+        }
+        let ctx = seal.secure.ok_or_else(|| {
+            KvError::SecureRecord("group history requires a security context".to_string())
+        })?;
+        if seal.encrypted {
+            if let Some(refresh) = seal.refresh {
+                refresh().await;
+            }
+            let store_id = { *seal.store.read().await.id() };
+            let record = ctx.seal_authorized(
+                seal.signing,
+                KvMutationKind::RetainedState,
+                &store_id,
+                &payload,
+            )?;
+            encode_delta(seal.local_peer_id, &record)
+                .map_err(|e| KvError::Gossip(format!("sealed retained image encode failed: {e}")))
+        } else {
+            Self::sign_publication(
+                seal.store,
+                ctx,
+                seal.refresh,
+                seal.signing,
+                KvMutationKind::RetainedState,
+                seal.local_peer_id,
+                payload,
+            )
+            .await
+        }
+    }
+
+    async fn publish_retained_history_frames(
+        publish: RetainedHistoryPublish<'_>,
+        retained: &[u8],
+    ) -> Result<()> {
+        let max_wire = crate::gossip::pubsub::max_signed_v3_payload_bytes(publish.topic)
+            .ok_or_else(|| {
+                KvError::Gossip("group history topic is too large for signed V3".to_string())
+            })?;
+        let frames =
+            crate::kv::retained_paging::split_image(retained, max_wire.saturating_sub(16 * 1024))?;
+        for frame in frames {
+            #[cfg(test)]
+            if let Some(state) = publish.test_state {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.fail_after == Some(state.accepted) {
+                    return Err(KvError::Gossip(
+                        "injected retained image publication failure".to_string(),
+                    ));
+                }
+            }
+            let serialized = Self::seal_group_history_payload(
+                GroupHistorySeal {
+                    store: publish.seal.store,
+                    treekem: publish.seal.treekem,
+                    secure: publish.seal.secure,
+                    refresh: publish.seal.refresh,
+                    signing: publish.seal.signing,
+                    encrypted: publish.seal.encrypted,
+                    local_peer_id: publish.seal.local_peer_id,
+                },
+                frame,
+            )
+            .await?;
+            if serialized.len() > max_wire {
+                return Err(KvError::Gossip(
+                    "sealed retained image frame exceeds signed V3 wire limit".to_string(),
+                ));
+            }
+            publish
+                .pubsub
+                .publish(publish.topic.to_string(), bytes::Bytes::from(serialized))
+                .await
+                .map_err(|error| {
+                    KvError::Gossip(format!("retained image publish failed: {error}"))
+                })?;
+            #[cfg(test)]
+            if let Some(state) = publish.test_state {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .accepted += 1;
+            }
+        }
+        Ok(())
+    }
+
     async fn merge_group_signed_record(
         ctx: &SharedKvSecureContext,
         refresh: Option<&SecureRefreshFn>,
@@ -504,6 +826,7 @@ impl KvStoreSync {
         store_id: &KvStoreId,
         local_peer: PeerId,
         payload: &[u8],
+        pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
     ) -> bool {
         if let Some(refresh) = refresh {
             refresh().await;
@@ -529,6 +852,30 @@ impl KvStoreSync {
                 return false;
             }
         };
+        let retained_image = if mutation.kind == KvMutationKind::RetainedState {
+            let authorization = ctx.authorization_binding().unwrap_or_else(|| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&ctx.group_id());
+                hasher.update(&ctx.current_epoch().to_le_bytes());
+                *hasher.finalize().as_bytes()
+            });
+            match assemble_retained_group_image(
+                mutation_payload,
+                store_id,
+                &mutation.author_id,
+                authorization,
+                pages,
+            ) {
+                Ok(Some(image)) => Some(image),
+                Ok(None) => return false,
+                Err(error) => {
+                    tracing::warn!(%error, "rejected retained group page");
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         let mut target = store.write().await;
         let result = match mutation.kind {
             KvMutationKind::Delta => bincode::deserialize::<KvStoreDelta>(mutation_payload)
@@ -544,6 +891,7 @@ impl KvStoreSync {
                         })
                 }),
             KvMutationKind::RetainedState => {
+                let mutation_payload = retained_image.as_deref().unwrap_or_default();
                 if mutation_payload.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
                     Err(KvError::Gossip(
                         "retained group image exceeds size limit".to_string(),
@@ -552,7 +900,11 @@ impl KvStoreSync {
                     bincode::deserialize::<KvStore>(mutation_payload)
                         .map_err(|e| KvError::Gossip(format!("bad retained group image: {e}")))
                         .and_then(|image| {
-                            target.merge_group_signed_image(&image, mutation.author_id, local_peer)
+                            target.merge_group_retained_image(
+                                &image,
+                                mutation.author_id,
+                                local_peer,
+                            )
                         })
                 }
             }
@@ -577,7 +929,9 @@ impl KvStoreSync {
         refresh: Option<&SecureRefreshFn>,
         store: &Arc<RwLock<KvStore>>,
         store_id: &KvStoreId,
+        local_peer: PeerId,
         payload: &[u8],
+        pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
     ) -> bool {
         if let Some(refresh) = refresh {
             refresh().await;
@@ -604,7 +958,7 @@ impl KvStoreSync {
         };
         if !matches!(
             mutation.kind,
-            KvMutationKind::Delta | KvMutationKind::FullState
+            KvMutationKind::Delta | KvMutationKind::FullState | KvMutationKind::RetainedState
         ) {
             tracing::warn!(
                 "rejected sealed main-topic record for store {store_id}: wrong kind {:?}",
@@ -612,26 +966,55 @@ impl KvStoreSync {
             );
             return false;
         }
-        // Membership IS the v1 write rule — enforce before merge, with the
-        // verified author identity (never the transport sender).
-        if !ctx.is_active_member(&mutation.author_id) {
+        if !ctx.is_authorized_writer(&mutation.author_id) {
             tracing::warn!(
-                "rejected sealed record for store {store_id}: author {} is not an active group member",
+                "rejected sealed record for store {store_id}: author {} is not a current authorized writer",
                 hex::encode(mutation.author_id.as_bytes())
             );
             return false;
         }
-        let delta: KvStoreDelta = match bincode::deserialize(&mutation.payload) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    "rejected sealed record for store {store_id}: bad delta payload: {e}"
-                );
-                return false;
+        let retained_image = if mutation.kind == KvMutationKind::RetainedState {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&ctx.group_id());
+            hasher.update(&ctx.current_epoch().to_le_bytes());
+            let authorization = *hasher.finalize().as_bytes();
+            match assemble_retained_group_image(
+                &mutation.payload,
+                store_id,
+                &mutation.author_id,
+                authorization,
+                pages,
+            ) {
+                Ok(Some(image)) => Some(image),
+                Ok(None) => return false,
+                Err(error) => {
+                    tracing::warn!(%error, "rejected retained encrypted page");
+                    return false;
+                }
             }
+        } else {
+            None
         };
         let mut s = store.write().await;
-        match s.merge_delta(&delta, sender_peer, Some(&mutation.author_id)) {
+        let result = if mutation.kind == KvMutationKind::RetainedState {
+            let payload = retained_image.as_deref().unwrap_or_default();
+            if payload.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
+                Err(KvError::Gossip(
+                    "retained encrypted group image exceeds size limit".to_string(),
+                ))
+            } else {
+                bincode::deserialize::<KvStore>(payload)
+                    .map_err(|e| KvError::Gossip(format!("bad retained encrypted image: {e}")))
+                    .and_then(|image| {
+                        s.merge_group_retained_image(&image, mutation.author_id, local_peer)
+                    })
+            }
+        } else {
+            bincode::deserialize::<KvStoreDelta>(&mutation.payload)
+                .map_err(|e| KvError::Gossip(format!("bad sealed delta payload: {e}")))
+                .and_then(|delta| s.merge_delta(&delta, sender_peer, Some(&mutation.author_id)))
+        };
+        match result {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!("failed to merge sealed delta for store {store_id}: {e}");
@@ -653,9 +1036,14 @@ impl KvStoreSync {
         if let Some(refresh) = refresh {
             refresh().await;
         }
-        if matches!(msg, KvSyncMessage::StateRequest { .. })
-            && !ctx.is_authorized_reader(&signing.agent_id)
-        {
+        let authorized = match msg {
+            KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&signing.agent_id),
+            KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
+                ctx.is_authorized_writer(&signing.agent_id)
+            }
+            KvSyncMessage::OwnerAnnounce { .. } => false,
+        };
+        if !authorized {
             return None;
         }
         let payload = bincode::serialize(msg).ok()?;
@@ -700,14 +1088,21 @@ impl KvStoreSync {
             );
             return None;
         }
-        if !ctx.is_active_member(&mutation.author_id) {
+        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload).ok()?;
+        let authorized = match &msg {
+            KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&mutation.author_id),
+            KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
+                ctx.is_authorized_writer(&mutation.author_id)
+            }
+            KvSyncMessage::OwnerAnnounce { .. } => false,
+        };
+        if !authorized {
             tracing::warn!(
-                "rejected sealed control message for store {store_id}: author {} is not an active group member",
+                "rejected sealed control message for store {store_id}: author {} is not authorized for this control kind",
                 hex::encode(mutation.author_id.as_bytes())
             );
             return None;
         }
-        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload).ok()?;
         Some((mutation.author_id, msg))
     }
 
@@ -796,6 +1191,13 @@ impl KvStoreSync {
                 ));
             }
         }
+        if let Some(ctx) = self.treekem_secure.as_ref() {
+            if !ctx.is_authorized_reader(reader).await {
+                return Err(KvError::Unauthorized(
+                    "current TreeKEM group read policy denies access".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -809,6 +1211,13 @@ impl KvStoreSync {
             if !ctx.is_authorized_writer(writer) {
                 return Err(KvError::Unauthorized(
                     "current group writer policy denies mutation".to_string(),
+                ));
+            }
+        }
+        if let Some(ctx) = self.treekem_secure.as_ref() {
+            if !ctx.is_authorized_writer(writer).await {
+                return Err(KvError::Unauthorized(
+                    "current TreeKEM group writer policy denies mutation".to_string(),
                 ));
             }
         }
@@ -909,12 +1318,21 @@ impl KvStoreSync {
         // through the sealed path, which requires the secure context and the
         // author signing material. Refusing to start here can never degrade
         // into plaintext publication.
-        let (store_is_encrypted, store_is_group_signed) = {
+        let (store_is_encrypted, store_is_group_signed, store_is_treekem) = {
             let store = store.read().await;
-            (store.is_encrypted(), store.is_group_signed())
+            (
+                store.is_encrypted(),
+                store.is_group_signed(),
+                store.is_treekem_encrypted(),
+            )
+        };
+        let backend_mismatch = if store_is_treekem {
+            self.treekem_secure.is_none() || self.secure.is_some()
+        } else {
+            self.secure.is_none() || self.treekem_secure.is_some()
         };
         if (store_is_encrypted || store_is_group_signed)
-            && (self.secure.is_none() || self.author_signing.is_none())
+            && (backend_mismatch || self.author_signing.is_none())
         {
             return Err(KvError::SecureRecord(
                 "encrypted store sync requires an attached secure context and author \
@@ -925,6 +1343,8 @@ impl KvStoreSync {
         // Capture the encrypted-path handles once: the policy is
         // creation-fixed, so a stale snapshot cannot drift mid-life.
         let listener_secure = self.secure.clone();
+        let listener_treekem = self.treekem_secure.clone();
+        let listener_pages = Arc::clone(&self.retained_pages);
         let listener_refresh = self.secure_refresh.clone();
         let listener_is_encrypted = store_is_encrypted;
         // Capture the bootstrap decision BEFORE any listener can merge a
@@ -943,7 +1363,7 @@ impl KvStoreSync {
             let s = store.read().await;
             let local_is_owner =
                 self.local_agent_id.is_some() && s.owner() == self.local_agent_id.as_ref();
-            store_is_group_signed || !local_is_owner || s.is_empty()
+            store_is_encrypted || store_is_group_signed || !local_is_owner || s.is_empty()
         };
         // Defense in depth against cross-topic replay: the v2 signature covers
         // the embedded topic, but pub/sub delivery does not re-check it against
@@ -1001,14 +1421,31 @@ impl KvStoreSync {
                 // #341 Phase B: an encrypted store takes the SEALED path —
                 // the payload is an EncryptedKvStoreRecordV1, and a plaintext
                 // delta can never decode, verify, or merge here.
-                if let Some(ctx) = listener_secure.as_ref() {
+                if let Some(protector) = listener_treekem.as_ref() {
+                    if Self::merge_treekem_record(
+                        protector,
+                        &store,
+                        &listener_store_id,
+                        listener_local_peer_id,
+                        &msg.payload,
+                        &listener_pages,
+                    )
+                    .await
+                    {
+                        if let Some(ctx) = loop_persist_ctx.as_ref() {
+                            let _ = persist_snapshot(&store, ctx).await;
+                        }
+                    }
+                } else if let Some(ctx) = listener_secure.as_ref() {
                     let merged = if listener_is_encrypted {
                         Self::merge_encrypted_record(
                             ctx,
                             listener_refresh.as_ref(),
                             &store,
                             &listener_store_id,
+                            listener_local_peer_id,
                             &msg.payload,
+                            &listener_pages,
                         )
                         .await
                     } else {
@@ -1019,6 +1456,7 @@ impl KvStoreSync {
                             &listener_store_id,
                             listener_local_peer_id,
                             &msg.payload,
+                            &listener_pages,
                         )
                         .await
                     };
@@ -1182,10 +1620,12 @@ impl KvStoreSync {
         // Encrypted-path handles (#341 Phase B): Some together whenever the
         // store is encrypted (enforced by the startup guard above).
         let responder_secure = self.secure.clone();
+        let responder_treekem = self.treekem_secure.clone();
         let responder_refresh = self.secure_refresh.clone();
         let responder_signing = self.author_signing.clone();
         let responder_is_encrypted = store_is_encrypted;
         let responder_is_group_signed = store_is_group_signed;
+        let responder_uses_retained = responder_is_encrypted || responder_is_group_signed;
         let responder_store_id = { *self.store.read().await.id() };
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
@@ -1215,7 +1655,16 @@ impl KvStoreSync {
                 // too. The verified identity is then the INNER signature's
                 // author (a relay's transport sender proves nothing); the
                 // plaintext path keeps the pub/sub-verified sender.
-                let (sync_msg, verified_sender) = if let Some(ctx) = responder_secure.as_ref() {
+                let (sync_msg, verified_sender) = if let Some(protector) =
+                    responder_treekem.as_ref()
+                {
+                    match Self::open_treekem_control(protector, &responder_store_id, &msg.payload)
+                        .await
+                    {
+                        Some((author, message)) => (message, Some(author)),
+                        None => continue,
+                    }
+                } else if let Some(ctx) = responder_secure.as_ref() {
                     let opened = if responder_is_encrypted {
                         Self::open_control_message(
                             ctx,
@@ -1252,7 +1701,8 @@ impl KvStoreSync {
                         // joiners can refresh policy / confirm ownership.
                         // (Ownership itself is never learned from this — a
                         // joiner anchors its owner at construction.)
-                        let announce = if responder_is_group_signed {
+                        let announce = if responder_secure.is_some() || responder_treekem.is_some()
+                        {
                             None
                         } else {
                             let s = responder_store.read().await;
@@ -1354,13 +1804,12 @@ impl KvStoreSync {
                                 local_agent_id.is_some() && s.owner() == local_agent_id.as_ref();
                             let cp =
                                 (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
-                            let has_payload = if responder_is_group_signed {
+                            let has_payload = if responder_uses_retained {
                                 s.has_retained_group_history()
                             } else {
                                 !s.is_empty() || s.latest_checkpoint.is_some()
                             };
-                            let full = if has_payload && !cooled_down && !responder_is_group_signed
-                            {
+                            let full = if has_payload && !cooled_down && !responder_uses_retained {
                                 match s.full_delta() {
                                     Ok(delta) => Some(delta),
                                     Err(error) => {
@@ -1371,9 +1820,7 @@ impl KvStoreSync {
                             } else {
                                 None
                             };
-                            let retained = if has_payload
-                                && !cooled_down
-                                && responder_is_group_signed
+                            let retained = if has_payload && !cooled_down && responder_uses_retained
                             {
                                 match serialize_retained_group_image(&s) {
                                     Ok(bytes) => Some(bytes),
@@ -1398,58 +1845,37 @@ impl KvStoreSync {
                         };
                         let mut markers: Vec<KvSyncMessage> = Vec::new();
                         if let Some(retained) = retained {
-                            let serialized =
-                                match (responder_secure.as_ref(), responder_signing.as_ref()) {
-                                    (Some(ctx), Some(signing)) => {
-                                        Self::sign_publication(
-                                            &responder_store,
-                                            ctx,
-                                            responder_refresh.as_ref(),
-                                            signing,
-                                            KvMutationKind::RetainedState,
-                                            local_peer_id,
-                                            retained,
-                                        )
-                                        .await
-                                    }
-                                    _ => Err(KvError::SecureRecord(
-                                        "group history requires signing context".to_string(),
-                                    )),
-                                };
-                            if let Ok(serialized) = serialized {
-                                let Some(max_payload) =
-                                    crate::gossip::pubsub::max_signed_v3_payload_bytes(
-                                        &responder_topic,
-                                    )
-                                else {
-                                    tracing::warn!(
-                                        "group history topic is too large for signed V3"
-                                    );
-                                    continue;
-                                };
-                                if serialized.len() > max_payload {
-                                    tracing::warn!(
-                                        encoded_bytes = serialized.len(),
-                                        max_payload,
-                                        "complete group history exceeds the indivisible signed V3 payload bound; paging is required"
-                                    );
-                                    continue;
-                                }
-                                if responder_pubsub
-                                    .publish(
-                                        responder_topic.clone(),
-                                        bytes::Bytes::from(serialized),
-                                    )
-                                    .await
-                                    .is_ok()
-                                {
-                                    last_full_response = Some(tokio::time::Instant::now());
-                                    markers.push(KvSyncMessage::StateServedV2 {
-                                        responder: local_peer_id,
-                                        digest: served.0,
-                                        entry_count: served.1,
-                                    });
-                                }
+                            let Some(signing) = responder_signing.as_ref() else {
+                                continue;
+                            };
+                            let published = Self::publish_retained_history_frames(
+                                RetainedHistoryPublish {
+                                    seal: GroupHistorySeal {
+                                        store: &responder_store,
+                                        treekem: responder_treekem.as_ref(),
+                                        secure: responder_secure.as_ref(),
+                                        refresh: responder_refresh.as_ref(),
+                                        signing,
+                                        encrypted: responder_is_encrypted,
+                                        local_peer_id,
+                                    },
+                                    pubsub: responder_pubsub.as_ref(),
+                                    topic: &responder_topic,
+                                    #[cfg(test)]
+                                    test_state: None,
+                                },
+                                &retained,
+                            )
+                            .await;
+                            if published.is_ok() {
+                                last_full_response = Some(tokio::time::Instant::now());
+                                markers.push(KvSyncMessage::StateServedV2 {
+                                    responder: local_peer_id,
+                                    digest: served.0,
+                                    entry_count: served.1,
+                                });
+                            } else if let Err(error) = published {
+                                tracing::warn!(%error, "cannot publish complete group history");
                             }
                         } else if let Some(full) = full {
                             // #341 Phase B: the full-state serve on the main
@@ -1526,7 +1952,19 @@ impl KvStoreSync {
                             }
                         }
                         for marker in markers {
-                            let serialized = if let (Some(ctx), Some(signing)) =
+                            let serialized = if let (Some(protector), Some(signing)) =
+                                (responder_treekem.as_ref(), responder_signing.as_ref())
+                            {
+                                Self::seal_treekem_control(
+                                    protector,
+                                    signing,
+                                    &responder_store_id,
+                                    local_peer_id,
+                                    &marker,
+                                )
+                                .await
+                                .ok_or_else(|| "TreeKEM control seal failed".to_string())
+                            } else if let (Some(ctx), Some(signing)) =
                                 (responder_secure.as_ref(), responder_signing.as_ref())
                             {
                                 if responder_is_encrypted {
@@ -1743,6 +2181,7 @@ impl KvStoreSync {
             // Encrypted-path handles: StateRequest is SEALED for encrypted
             // stores, so only members can trigger full-state broadcasts.
             let requester_secure = self.secure.clone();
+            let requester_treekem = self.treekem_secure.clone();
             let requester_refresh = self.secure_refresh.clone();
             let requester_signing = self.author_signing.clone();
             let requester_store_id = { *self.store.read().await.id() };
@@ -1792,7 +2231,18 @@ impl KvStoreSync {
                     let request = KvSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
-                    let serialized = if let (Some(ctx), Some(signing)) =
+                    let serialized = if let (Some(protector), Some(signing)) =
+                        (requester_treekem.as_ref(), requester_signing.as_ref())
+                    {
+                        Self::seal_treekem_control(
+                            protector,
+                            signing,
+                            &requester_store_id,
+                            local_peer_id,
+                            &request,
+                        )
+                        .await
+                    } else if let (Some(ctx), Some(signing)) =
                         (requester_secure.as_ref(), requester_signing.as_ref())
                     {
                         // #341 Phase B: sealed state request — non-members
@@ -1893,17 +2343,42 @@ impl KvStoreSync {
         // the background loops): a sync constructed for an encrypted store
         // but never configured (or not yet started) must hard-error here —
         // falling through to the plaintext branch would leak the delta.
-        let (store_is_encrypted, store_is_group_signed) = {
+        let (store_is_encrypted, store_is_group_signed, store_is_treekem) = {
             let store = self.store.read().await;
-            (store.is_encrypted(), store.is_group_signed())
+            (
+                store.is_encrypted(),
+                store.is_group_signed(),
+                store.is_treekem_encrypted(),
+            )
         };
-        if (store_is_encrypted || store_is_group_signed) && self.secure.is_none() {
+        if (store_is_encrypted || store_is_group_signed)
+            && self.secure.is_none()
+            && self.treekem_secure.is_none()
+        {
             return Err(KvError::SecureRecord(
                 "encrypted store publish refused: no secure context attached                  (set_secure_context) — plaintext publication is unreachable for encrypted stores"
                     .to_string(),
             ));
         }
-        let serialized = if store_is_encrypted {
+        let serialized = if store_is_treekem {
+            let payload = bincode::serialize(&delta)
+                .map_err(|e| KvError::Gossip(format!("TreeKEM delta serialize failed: {e}")))?;
+            Self::seal_treekem_payload(
+                &self.store,
+                self.treekem_secure.as_ref().ok_or_else(|| {
+                    KvError::SecureRecord("encrypted store has no TreeKEM protector".to_string())
+                })?,
+                self.author_signing.as_ref().ok_or_else(|| {
+                    KvError::SecureRecord(
+                        "TreeKEM store publish requires author signing material".to_string(),
+                    )
+                })?,
+                KvMutationKind::Delta,
+                local_peer_id,
+                &payload,
+            )
+            .await?
+        } else if store_is_encrypted {
             let ctx = self.secure.as_ref().ok_or_else(|| {
                 KvError::SecureRecord("encrypted store has no context".to_string())
             })?;
@@ -1952,6 +2427,76 @@ impl KvStoreSync {
             .map_err(|e| KvError::Gossip(format!("publish delta failed: {e}")))?;
 
         Ok(())
+    }
+
+    /// Publish the current complete retained group history through the same
+    /// authenticated, bounded frame path used by reactive state responses.
+    pub(crate) async fn publish_retained_group_history(&self) -> Result<()> {
+        let (retained, encrypted, group_policy) = {
+            let store = self.store.read().await;
+            (
+                serialize_retained_group_image(&store)?,
+                store.is_encrypted(),
+                store.is_encrypted() || store.is_group_signed(),
+            )
+        };
+        if !group_policy {
+            return Err(KvError::SecureRecord(
+                "retained group history publication requires a group store".to_string(),
+            ));
+        }
+        let signing = self.author_signing.as_ref().ok_or_else(|| {
+            KvError::SecureRecord(
+                "retained group history publication requires author signing material".to_string(),
+            )
+        })?;
+        Self::publish_retained_history_frames(
+            RetainedHistoryPublish {
+                seal: GroupHistorySeal {
+                    store: &self.store,
+                    treekem: self.treekem_secure.as_ref(),
+                    secure: self.secure.as_ref(),
+                    refresh: self.secure_refresh.as_ref(),
+                    signing,
+                    encrypted,
+                    local_peer_id: self.local_peer_id,
+                },
+                pubsub: &self.pubsub,
+                topic: &self.topic,
+                #[cfg(test)]
+                test_state: Some(&self.retained_publish_test),
+            },
+            &retained,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_retained_publish_after_for_test(&self, accepted_frames: usize) {
+        let mut state = self
+            .retained_publish_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.fail_after = Some(accepted_frames);
+        state.accepted = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_publish_accepted_for_test(&self) -> usize {
+        self.retained_publish_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_retained_publish_failure_for_test(&self) {
+        let mut state = self
+            .retained_publish_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.fail_after = None;
+        state.accepted = 0;
     }
 
     /// Get a read-only reference to the store.
@@ -2111,6 +2656,14 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    load_snapshot_bytes(&bytes).map(Some)
+}
+
+/// Decode one already-bounded snapshot buffer.
+///
+/// This is used by explicit import paths that must hash and validate the
+/// exact bytes they decode, without reopening a mutable filesystem path.
+pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
     let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC.as_slice()) else {
         return Err(std::io::Error::other(
             "unrecognized kv snapshot format (missing v1 magic) — corrupt or foreign file; \
@@ -2134,7 +2687,7 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
         );
     }
     store.restore_seq_counter(body.seq_counter.max(store.current_version()));
-    Ok(Some(store))
+    Ok(store)
 }
 
 #[cfg(test)]
@@ -2143,9 +2696,157 @@ mod tests {
     use crate::identity::AgentId;
     use crate::kv::encrypted::seal_mutation;
     use crate::kv::store::AccessPolicy;
+    use crate::kv::TreeKemKvProtector;
     use crate::kv::{KvEntry, KvStoreId};
     use crate::network::{NetworkConfig, NetworkNode};
     use std::time::Duration;
+
+    struct TestTreeKemProtector {
+        group_id: Vec<u8>,
+        group: tokio::sync::Mutex<crate::mls::TreeKemMlsGroup>,
+        readers: std::collections::HashSet<AgentId>,
+        writers: std::sync::Mutex<std::collections::HashSet<AgentId>>,
+        authorization: [u8; 32],
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kv::TreeKemKvProtector for TestTreeKemProtector {
+        fn group_id(&self) -> Vec<u8> {
+            self.group_id.clone()
+        }
+
+        async fn seal_record(
+            &self,
+            signing: &AuthorSigning,
+            kind: KvMutationKind,
+            store_id: &KvStoreId,
+            payload: &[u8],
+            reader_only: bool,
+        ) -> Result<TreeKemKvStoreRecordV1> {
+            let admitted = if reader_only {
+                self.readers.contains(&signing.agent_id)
+            } else {
+                self.writers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&signing.agent_id)
+            };
+            if !admitted {
+                return Err(KvError::Unauthorized("test TreeKEM role denied".into()));
+            }
+            let mut group = self.group.lock().await;
+            let epoch = group.epoch();
+            let inner = crate::kv::treekem::sign_inner_mutation(
+                signing,
+                kind,
+                payload,
+                crate::kv::treekem::TreeKemInnerBinding {
+                    group_id: self.group_id.clone(),
+                    epoch,
+                    store_id,
+                    authorization_binding: self.authorization,
+                    reader_only,
+                },
+            )?;
+            let ciphertext = group
+                .encrypt_message(&inner)
+                .map_err(|error| KvError::SecureRecord(error.to_string()))?;
+            Ok(TreeKemKvStoreRecordV1 {
+                version: 1,
+                group_id: self.group_id.clone(),
+                store_id: *store_id.as_bytes(),
+                epoch,
+                reader_only,
+                ciphertext,
+            })
+        }
+
+        async fn open_record(
+            &self,
+            store_id: &KvStoreId,
+            record: &TreeKemKvStoreRecordV1,
+        ) -> Result<crate::kv::treekem::OpenedTreeKemKvRecord> {
+            if record.group_id != self.group_id || record.store_id != *store_id.as_bytes() {
+                return Err(KvError::SecureRecord(
+                    "test TreeKEM binding mismatch".into(),
+                ));
+            }
+            let mut group = self.group.lock().await;
+            let plaintext = group
+                .decrypt_message(&record.ciphertext)
+                .map_err(|error| KvError::SecureRecord(error.to_string()))?;
+            let opened = crate::kv::treekem::open_inner_mutation(
+                &self.group_id,
+                record.epoch,
+                store_id,
+                &plaintext,
+                self.authorization,
+            )?;
+            let admitted = if opened.reader_only {
+                self.readers.contains(&opened.mutation.author_id)
+            } else {
+                self.writers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&opened.mutation.author_id)
+            };
+            if !admitted {
+                return Err(KvError::Unauthorized("test TreeKEM role denied".into()));
+            }
+            Ok(opened)
+        }
+
+        async fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+            self.readers.contains(agent)
+        }
+
+        async fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+            self.writers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(agent)
+        }
+
+        async fn merge_main_record(
+            &self,
+            opened: crate::kv::treekem::OpenedTreeKemKvRecord,
+            sender_peer: PeerId,
+            local_peer: PeerId,
+            store: &Arc<RwLock<KvStore>>,
+            retained_image: Option<Vec<u8>>,
+        ) -> Result<()> {
+            if !self.is_authorized_writer(&opened.mutation.author_id).await
+                || opened.authorization_binding != self.authorization
+            {
+                return Err(KvError::Unauthorized("test TreeKEM merge denied".into()));
+            }
+            let mut store = store.write().await;
+            match opened.mutation.kind {
+                KvMutationKind::RetainedState => {
+                    let image: KvStore = bincode::deserialize(
+                        retained_image
+                            .as_deref()
+                            .ok_or_else(|| KvError::Gossip("missing retained image".into()))?,
+                    )?;
+                    store.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+                }
+                KvMutationKind::Delta | KvMutationKind::FullState => {
+                    let delta: KvStoreDelta = bincode::deserialize(&opened.mutation.payload)?;
+                    store.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+                }
+                KvMutationKind::Control => {
+                    Err(KvError::Unauthorized("control on main topic".into()))
+                }
+            }
+        }
+
+        fn invalidate(&self) {
+            self.writers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
 
     fn agent(n: u8) -> AgentId {
         AgentId([n; 32])
@@ -2193,8 +2894,8 @@ mod tests {
         // Simulate the handle-layer double seq mint: the counter can run
         // ahead of `version`. The persisted counter — not a version-derived
         // floor — must be the restore ceiling.
-        let _ = store.next_seq();
-        let _ = store.next_seq();
+        let _ = store.next_seq().expect("sequence");
+        let _ = store.next_seq().expect("sequence");
         let counter_before = store.seq_counter_value();
         let bytes = encode_snapshot(&store).expect("encode");
         write_snapshot_atomic(&path, &bytes).expect("atomic write");
@@ -2276,7 +2977,7 @@ mod tests {
         let mut target = KvStore::new_group_signed(id, "Wiki".to_string(), owner, group_id, ctx)
             .expect("fresh target");
         target
-            .merge_group_signed_image(&source, owner, local_peer)
+            .merge_group_retained_image(&source, owner, local_peer)
             .expect("authenticated import");
         target
             .put(
@@ -2505,15 +3206,34 @@ mod tests {
             .await
             .expect("publish request");
 
-        let response = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
-            .await
-            .expect("retained response timeout")
-            .expect("retained response");
-        let (_, mutation) = decode_delta::<SignedKvMutation>(&response.payload).expect("decode");
-        assert_eq!(mutation.kind, KvMutationKind::RetainedState);
-        let mutation = open_signed_mutation(context.as_ref(), &id, mutation).expect("verify");
-        let payload = open_public_payload(context.as_ref(), &mutation.payload).expect("binding");
-        let image: KvStore = bincode::deserialize(payload).expect("image");
+        let authorization = context.authorization_binding().expect("roster binding");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let image_bytes = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = main_probe.recv().await.expect("retained response");
+                let (_, mutation) =
+                    decode_delta::<SignedKvMutation>(&response.payload).expect("decode");
+                assert_eq!(mutation.kind, KvMutationKind::RetainedState);
+                let mutation =
+                    open_signed_mutation(context.as_ref(), &id, mutation).expect("verify");
+                let payload =
+                    open_public_payload(context.as_ref(), &mutation.payload).expect("binding");
+                if let Some(image) = assemble_retained_group_image(
+                    payload,
+                    &id,
+                    &mutation.author_id,
+                    authorization,
+                    &pages,
+                )
+                .expect("assemble retained image")
+                {
+                    break image;
+                }
+            }
+        })
+        .await
+        .expect("retained response timeout");
+        let image: KvStore = bincode::deserialize(&image_bytes).expect("image");
         assert!(image.is_empty());
         assert!(image.has_retained_group_history());
         sync.stop().await.expect("stop");
@@ -2643,6 +3363,7 @@ mod tests {
                 &id,
                 peer(1),
                 &encoded,
+                &Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
             )
             .await,
             "non-content authority rejects the whole authenticated delta"
@@ -2777,7 +3498,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_group_history_reports_paging_required() {
+    fn group_history_above_single_frame_serializes_and_pages_losslessly() {
         let owner = agent(1);
         let mut group = crate::groups::GroupInfo::new(
             "public".to_string(),
@@ -2809,8 +3530,44 @@ mod tests {
                 )
                 .expect("large value");
         }
-        let error = serialize_retained_group_image(&store).expect_err("must require paging");
-        assert!(error.to_string().contains("paging is required"), "{error}");
+        let image = serialize_retained_group_image(&store).expect("bounded retained image");
+        let max_wire = crate::gossip::pubsub::max_signed_v3_payload_bytes("store/public-paged")
+            .expect("signed wire budget");
+        assert!(
+            image.len() > max_wire,
+            "fixture must exceed one signed gossip frame"
+        );
+        let encoded_pages = crate::kv::retained_paging::split_image(&image, max_wire)
+            .expect("large retained image must page");
+        assert!(encoded_pages.len() > 2, "manifest plus multiple pages");
+
+        let manifest = crate::kv::retained_paging::decode_page(&encoded_pages[0])
+            .expect("decode manifest")
+            .expect("framed manifest");
+        let mut assembler =
+            crate::kv::retained_paging::RetainedPageAssembler::from_manifest(&manifest)
+                .expect("valid manifest");
+        let mut reassembled = None;
+        for encoded in encoded_pages.iter().skip(1) {
+            let page = crate::kv::retained_paging::decode_page(encoded)
+                .expect("decode page")
+                .expect("framed page");
+            reassembled = assembler.push(page).expect("valid page");
+        }
+        assert!(
+            reassembled.as_deref() == Some(image.as_slice()),
+            "reassembled retained image must match source bytes"
+        );
+    }
+
+    #[test]
+    fn treekem_retained_pages_are_isolated_by_epoch() {
+        let roster_policy = [7; 32];
+        assert_ne!(
+            treekem_page_authorization(roster_policy, 3),
+            treekem_page_authorization(roster_policy, 4),
+            "identical roster policy at a later TreeKEM epoch must not share an assembler"
+        );
     }
 
     #[tokio::test]
@@ -3233,6 +3990,175 @@ mod tests {
         sync
     }
 
+    #[tokio::test]
+    async fn encrypted_controls_separate_reader_requests_from_writer_evidence() {
+        let owner_keypair = AgentKeypair::generate().expect("owner keypair");
+        let reader_keypair = AgentKeypair::generate().expect("reader keypair");
+        let owner = owner_keypair.agent_id();
+        let reader = reader_keypair.agent_id();
+        let (mut info, contexts, _) = encrypted_group(&[owner, reader]);
+        info.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        for context in &contexts {
+            context.update_from_group(&info);
+        }
+        let context = contexts[1].clone() as SharedKvSecureContext;
+        let signing = Arc::new(AuthorSigning::from_keypair(&reader_keypair).expect("signing"));
+        let id = store_id(12);
+        let request = KvSyncMessage::StateRequest { requester: peer(2) };
+        let request_bytes =
+            KvStoreSync::seal_control_message(&context, None, &signing, &id, peer(2), &request)
+                .await
+                .expect("active nonwriter may request encrypted state");
+        assert!(
+            KvStoreSync::open_control_message(&context, None, &id, &request_bytes)
+                .await
+                .is_some()
+        );
+
+        let evidence = KvSyncMessage::StateServedV2 {
+            responder: peer(2),
+            digest: [0; 32],
+            entry_count: 0,
+        };
+        assert!(
+            KvStoreSync::seal_control_message(&context, None, &signing, &id, peer(2), &evidence,)
+                .await
+                .is_none(),
+            "nonwriter cannot endorse retained state"
+        );
+        let owner_announce = KvSyncMessage::OwnerAnnounce {
+            owner,
+            policy: AccessPolicy::Signed,
+            policy_version: u64::MAX,
+        };
+        assert!(
+            KvStoreSync::seal_control_message(
+                &context,
+                None,
+                &signing,
+                &id,
+                peer(2),
+                &owner_announce,
+            )
+            .await
+            .is_none(),
+            "group stores never publish legacy owner authority"
+        );
+
+        // A current member can bypass the local semantic helper and produce
+        // a cryptographically valid Control record. Receive admission still
+        // rejects writer evidence and legacy authority by decoded kind.
+        for message in [evidence, owner_announce] {
+            let payload = bincode::serialize(&message).expect("control payload");
+            let record = context
+                .seal_authorized(&signing, KvMutationKind::Control, &id, &payload)
+                .expect("valid member control envelope");
+            let bytes = encode_delta(peer(2), &record).expect("control wire");
+            assert!(
+                KvStoreSync::open_control_message(&context, None, &id, &bytes)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_responder_serves_tombstone_only_retained_history() {
+        let node = make_node().await;
+        let keypair = AgentKeypair::generate().expect("keypair");
+        let owner = keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let (_, contexts, group_id) = encrypted_group(&[owner]);
+        let context = contexts[0].clone();
+        let id = store_id(13);
+        let mut store = KvStore::new_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group_id,
+            context.clone() as SharedKvSecureContext,
+        )
+        .expect("encrypted store");
+        store
+            .put(
+                "gone".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store.remove("gone").expect("remove");
+        assert!(store.is_empty());
+        assert!(store.has_retained_group_history());
+
+        let mut sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            "group/private/home".to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("sync");
+        sync.set_secure_context(context.clone(), None);
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("signing"));
+        sync.set_author_signing((*signing).clone());
+        let mut main_probe = pubsub.subscribe("group/private/home".to_string()).await;
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request = KvSyncMessage::StateRequest { requester: peer(9) };
+        let request_bytes = KvStoreSync::seal_control_message(
+            &(context.clone() as SharedKvSecureContext),
+            None,
+            &signing,
+            &id,
+            peer(9),
+            &request,
+        )
+        .await
+        .expect("sealed request");
+        pubsub
+            .publish(
+                "group/private/home/state-sync".to_string(),
+                bytes::Bytes::from(request_bytes),
+            )
+            .await
+            .expect("publish request");
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&context.group_id());
+        hasher.update(&context.current_epoch().to_le_bytes());
+        let authorization = *hasher.finalize().as_bytes();
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let image_bytes = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = main_probe.recv().await.expect("retained response");
+                let (_, record) = decode_delta::<EncryptedKvStoreRecordV1>(&response.payload)
+                    .expect("decode envelope");
+                let mutation =
+                    open_mutation(context.as_ref(), &id, &record).expect("open response");
+                assert_eq!(mutation.kind, KvMutationKind::RetainedState);
+                if let Some(image) = assemble_retained_group_image(
+                    &mutation.payload,
+                    &id,
+                    &mutation.author_id,
+                    authorization,
+                    &pages,
+                )
+                .expect("assemble retained image")
+                {
+                    break image;
+                }
+            }
+        })
+        .await
+        .expect("retained response timeout");
+        let image: KvStore = bincode::deserialize(&image_bytes).expect("retained image");
+        assert!(image.is_empty());
+        assert!(image.has_retained_group_history());
+        sync.stop().await.expect("stop");
+    }
+
     async fn wait_for_key(sync: &KvStoreSync, key: &str) -> bool {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3303,7 +4229,7 @@ mod tests {
         .await
         .expect_err("removed signer must not produce a sealed payload");
         assert!(
-            matches!(err, KvError::SecureRecord(message) if message.contains("not an active group member"))
+            matches!(err, KvError::SecureRecord(message) if message.contains("current member/write policy"))
         );
     }
 
@@ -3353,7 +4279,7 @@ mod tests {
         .await
         .expect_err("refresh-removal must block the publication");
         assert!(
-            matches!(err, KvError::SecureRecord(message) if message.contains("not an active group member"))
+            matches!(err, KvError::SecureRecord(message) if message.contains("current member/write policy"))
         );
         assert!(!shared.is_active_member(&a));
     }
@@ -3461,8 +4387,16 @@ mod tests {
         .expect("control envelope");
         let encoded = encode_delta(peer(1), &record).expect("encoded envelope");
         assert!(
-            !KvStoreSync::merge_encrypted_record(&shared, None, &store, &store_id(10), &encoded,)
-                .await
+            !KvStoreSync::merge_encrypted_record(
+                &shared,
+                None,
+                &store,
+                &store_id(10),
+                peer(1),
+                &encoded,
+                &Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
+            )
+            .await
         );
         assert!(store.read().await.get("wrong-kind").is_none());
     }
@@ -3580,6 +4514,438 @@ mod tests {
             .get("secret-key")
             .map(|e| e.value.clone());
         assert_eq!(value, Some(b"hush".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn treekem_responder_pages_large_history_and_receiver_reassembles_out_of_order() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let owner_kp = AgentKeypair::generate().expect("owner kp");
+        let writer_kp = AgentKeypair::generate().expect("writer kp");
+        let reader_kp = AgentKeypair::generate().expect("reader kp");
+        let owner = owner_kp.agent_id();
+        let writer = writer_kp.agent_id();
+        let reader = reader_kp.agent_id();
+        let (group_info, mut contexts, group_id) = encrypted_group(&[owner, writer, reader]);
+        let reader_ctx = contexts.pop().expect("reader context");
+        let writer_ctx = contexts.pop().expect("writer context");
+        let _owner_ctx = contexts.pop().expect("owner context");
+
+        let mut owner_group =
+            crate::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[1; 32])
+                .expect("owner group");
+        let writer_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(writer, &[2; 32]).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(reader, &[3; 32]).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances");
+        let reader_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        drop(owner_group); // the canonical owner is offline while the writer serves.
+
+        let readers = std::collections::HashSet::from([owner, writer, reader]);
+        let writers = std::collections::HashSet::from([owner, writer]);
+        let authorization = *blake3::hash(b"current roster and AdminOnly policy").as_bytes();
+        let writer_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(writer_group),
+            readers: readers.clone(),
+            writers: std::sync::Mutex::new(writers.clone()),
+            authorization,
+        });
+        let reader_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(reader_group),
+            readers,
+            writers: std::sync::Mutex::new(writers),
+            authorization,
+        });
+        let id = store_id(44);
+        let mut source = KvStore::new_treekem_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group_id.clone(),
+            writer_ctx,
+        )
+        .expect("writer store");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed removal");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(2),
+                )
+                .expect("large entry");
+        }
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_ctx)
+            .expect("reader context");
+        source.remove("removed").expect("retained tombstone");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("concurrent target write");
+
+        let topic = "store/treekem-paged-history";
+        let mut main_probe = pubsub.subscribe(topic.to_string()).await;
+        let mut writer_sync = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(writer),
+        )
+        .expect("writer sync");
+        writer_sync.set_treekem_context(writer_protector.clone());
+        writer_sync
+            .set_author_signing(AuthorSigning::from_keypair(&writer_kp).expect("writer signing"));
+        writer_sync.start().await.expect("start responder");
+        let retained = {
+            let store = writer_sync.read().await;
+            serialize_retained_group_image(&store).expect("retained image")
+        };
+        let max_wire =
+            crate::gossip::pubsub::max_signed_v3_payload_bytes(topic).expect("wire budget");
+        let expected_frames =
+            crate::kv::retained_paging::split_image(&retained, max_wire.saturating_sub(16 * 1024))
+                .expect("paged frames")
+                .len();
+        assert!(
+            expected_frames > 2,
+            "history must span multiple data frames"
+        );
+
+        let request = KvSyncMessage::StateRequest { requester: peer(3) };
+        let reader_signing =
+            Arc::new(AuthorSigning::from_keypair(&reader_kp).expect("reader signing"));
+        let reader_trait: SharedTreeKemKvProtector = reader_protector.clone();
+        let request_bytes = KvStoreSync::seal_treekem_control(
+            &reader_trait,
+            &reader_signing,
+            &id,
+            peer(3),
+            &request,
+        )
+        .await
+        .expect("reader state request");
+        pubsub
+            .publish(
+                format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}"),
+                bytes::Bytes::from(request_bytes),
+            )
+            .await
+            .expect("publish request");
+
+        let mut wire_frames = Vec::with_capacity(expected_frames);
+        for _ in 0..expected_frames {
+            let message = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+                .await
+                .expect("responder frame timeout")
+                .expect("responder frame");
+            assert!(message.payload.len() <= max_wire);
+            wire_frames.push(message.payload);
+        }
+        wire_frames.reverse();
+        let target = Arc::new(RwLock::new(target));
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        for payload in wire_frames {
+            let _ = KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &payload,
+                &pages,
+            )
+            .await;
+        }
+        let merged = target.read().await;
+        assert!(merged.get("removed").is_none());
+        assert_eq!(
+            merged.get("concurrent").expect("concurrent").value,
+            b"local"
+        );
+        assert_eq!(merged.last_history_endorser(), Some(&writer));
+        drop(merged);
+
+        reader_protector
+            .writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&writer);
+        let hostile = writer_protector
+            .seal_record(
+                &AuthorSigning::from_keypair(&writer_kp).expect("writer signing"),
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&KvStoreDelta::new(99)).expect("delta"),
+                false,
+            )
+            .await
+            .expect("stale writer record");
+        let hostile = encode_delta(peer(2), &hostile).expect("wire record");
+        assert!(
+            !KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &hostile,
+                &pages,
+            )
+            .await
+        );
+        let _ = group_info;
+    }
+
+    #[tokio::test]
+    async fn treekem_retained_publisher_retries_partial_frames_and_receiver_reassembles() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let owner_kp = AgentKeypair::generate().expect("owner kp");
+        let writer_kp = AgentKeypair::generate().expect("writer kp");
+        let reader_kp = AgentKeypair::generate().expect("reader kp");
+        let owner = owner_kp.agent_id();
+        let writer = writer_kp.agent_id();
+        let reader = reader_kp.agent_id();
+        let (group_info, mut contexts, group_id) = encrypted_group(&[owner, writer, reader]);
+        let reader_ctx = contexts.pop().expect("reader context");
+        let writer_ctx = contexts.pop().expect("writer context");
+        let _owner_ctx = contexts.pop().expect("owner context");
+
+        let mut owner_group =
+            crate::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[1; 32])
+                .expect("owner group");
+        let writer_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(writer, &[2; 32]).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(reader, &[3; 32]).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances");
+        let reader_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        drop(owner_group); // the canonical owner is offline while the writer serves.
+
+        let readers = std::collections::HashSet::from([owner, writer, reader]);
+        let writers = std::collections::HashSet::from([owner, writer]);
+        let authorization = *blake3::hash(b"current roster and AdminOnly policy").as_bytes();
+        let writer_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(writer_group),
+            readers: readers.clone(),
+            writers: std::sync::Mutex::new(writers.clone()),
+            authorization,
+        });
+        let reader_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(reader_group),
+            readers,
+            writers: std::sync::Mutex::new(writers),
+            authorization,
+        });
+        let id = store_id(44);
+        let mut source = KvStore::new_treekem_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group_id.clone(),
+            writer_ctx,
+        )
+        .expect("writer store");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed removal");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(2),
+                )
+                .expect("large entry");
+        }
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_ctx)
+            .expect("reader context");
+        source.remove("removed").expect("retained tombstone");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("concurrent target write");
+
+        let topic = "store/treekem-paged-history";
+        let mut main_probe = pubsub.subscribe(topic.to_string()).await;
+        let mut writer_sync = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(writer),
+        )
+        .expect("writer sync");
+        writer_sync.set_treekem_context(writer_protector.clone());
+        writer_sync
+            .set_author_signing(AuthorSigning::from_keypair(&writer_kp).expect("writer signing"));
+        writer_sync.start().await.expect("start responder");
+        let retained = {
+            let store = writer_sync.read().await;
+            serialize_retained_group_image(&store).expect("retained image")
+        };
+        let max_wire =
+            crate::gossip::pubsub::max_signed_v3_payload_bytes(topic).expect("wire budget");
+        let expected_frames =
+            crate::kv::retained_paging::split_image(&retained, max_wire.saturating_sub(16 * 1024))
+                .expect("paged frames")
+                .len();
+        assert!(
+            expected_frames > 2,
+            "history must span multiple data frames"
+        );
+
+        let reader_trait: SharedTreeKemKvProtector = reader_protector.clone();
+        writer_sync.fail_retained_publish_after_for_test(1);
+        assert!(
+            writer_sync.publish_retained_group_history().await.is_err(),
+            "injected failure must stop after one actually accepted frame"
+        );
+        assert_eq!(writer_sync.retained_publish_accepted_for_test(), 1);
+        let partial = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+            .await
+            .expect("partial frame timeout")
+            .expect("partial frame");
+        assert!(partial.payload.len() <= max_wire);
+        let target = Arc::new(RwLock::new(target));
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        assert!(
+            !KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &partial.payload,
+                &pages,
+            )
+            .await,
+            "one accepted frame cannot partially mutate the receiver"
+        );
+
+        writer_sync.clear_retained_publish_failure_for_test();
+        writer_sync
+            .publish_retained_group_history()
+            .await
+            .expect("retry complete retained publication");
+        assert_eq!(
+            writer_sync.retained_publish_accepted_for_test(),
+            expected_frames
+        );
+
+        let mut wire_frames = Vec::with_capacity(expected_frames);
+        for _ in 0..expected_frames {
+            let message = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+                .await
+                .expect("responder frame timeout")
+                .expect("responder frame");
+            assert!(message.payload.len() <= max_wire);
+            wire_frames.push(message.payload);
+        }
+        wire_frames.reverse();
+        for payload in wire_frames {
+            let _ = KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &payload,
+                &pages,
+            )
+            .await;
+        }
+        let merged = target.read().await;
+        assert!(merged.get("removed").is_none());
+        assert_eq!(
+            merged.get("concurrent").expect("concurrent").value,
+            b"local"
+        );
+        assert_eq!(merged.last_history_endorser(), Some(&writer));
+        drop(merged);
+
+        reader_protector
+            .writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&writer);
+        let hostile = writer_protector
+            .seal_record(
+                &AuthorSigning::from_keypair(&writer_kp).expect("writer signing"),
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&KvStoreDelta::new(99)).expect("delta"),
+                false,
+            )
+            .await
+            .expect("stale writer record");
+        let hostile = encode_delta(peer(2), &hostile).expect("wire record");
+        assert!(
+            !KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &hostile,
+                &pages,
+            )
+            .await
+        );
+        let _ = group_info;
     }
 
     #[tokio::test]

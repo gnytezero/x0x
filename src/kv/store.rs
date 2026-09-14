@@ -31,7 +31,7 @@
 use crate::identity::AgentId;
 use crate::kv::encrypted::KvSecureContext;
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
-use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
+use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -121,6 +121,10 @@ pub enum AccessPolicy {
     /// role authorization. Content is plaintext but every mutation is signed.
     /// This variant is appended to preserve every earlier bincode discriminant.
     GroupSigned { group_id: Vec<u8> },
+
+    /// Confidential group store whose records use the live real-TreeKEM
+    /// application ratchet. Appended to preserve all existing discriminants.
+    TreeKemEncrypted { group_id: Vec<u8> },
 }
 
 impl std::fmt::Display for AccessPolicy {
@@ -132,6 +136,7 @@ impl std::fmt::Display for AccessPolicy {
             Self::AppendOnly => write!(f, "append_only"),
             Self::SelfKeyed => write!(f, "self_keyed"),
             Self::GroupSigned { .. } => write!(f, "group_signed"),
+            Self::TreeKemEncrypted { .. } => write!(f, "treekem_encrypted"),
         }
     }
 }
@@ -586,6 +591,18 @@ fn validate_entry_integrity(outer_key: &str, entry: &KvEntry) -> Result<()> {
     Ok(())
 }
 
+fn retained_entries_equal(
+    left: &HashMap<String, KvEntry>,
+    right: &HashMap<String, KvEntry>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, left_entry)| {
+            right
+                .get(key)
+                .is_some_and(|right_entry| entry_frozen_fields_equal(left_entry, right_entry))
+        })
+}
+
 /// Inputs required to build an owner-signed checkpoint.
 pub struct OwnerCheckpointParams<'a> {
     pub topic: &'a str,
@@ -819,7 +836,9 @@ impl KvStore {
     /// [`KvSecureContext`]; a replica
     /// that carries the policy without a context fails closed.
     pub fn new(id: KvStoreId, name: String, owner: AgentId, policy: AccessPolicy) -> Result<Self> {
-        if let AccessPolicy::Encrypted { group_id } = &policy {
+        if let AccessPolicy::Encrypted { group_id } | AccessPolicy::TreeKemEncrypted { group_id } =
+            &policy
+        {
             tracing::warn!(
                 target: "x0x::kv",
                 "refused to construct store {} with reserved encrypted policy (group_id {}) — use KvStore::new_encrypted with an attached secure context",
@@ -912,6 +931,20 @@ impl KvStore {
         })
     }
 
+    /// Create a real-TreeKEM protected store with a synchronous authorization
+    /// view. Wire encryption is supplied separately to `KvStoreSync`.
+    pub fn new_treekem_encrypted(
+        id: KvStoreId,
+        name: String,
+        owner: AgentId,
+        group_id: Vec<u8>,
+        ctx: Arc<dyn KvSecureContext>,
+    ) -> Result<Self> {
+        let mut store = Self::new_encrypted(id, name, owner, group_id.clone(), ctx)?;
+        store.policy = AccessPolicy::TreeKemEncrypted { group_id };
+        Ok(store)
+    }
+
     /// Create a public group-signed store with an attached current-policy context.
     pub fn new_group_signed(
         id: KvStoreId,
@@ -945,9 +978,9 @@ impl KvStore {
     /// `Encrypted`; [`KvError::Unauthorized`] on a group binding mismatch.
     pub fn set_secure_context(&mut self, ctx: Arc<dyn KvSecureContext>) -> Result<()> {
         let group_id = match &self.policy {
-            AccessPolicy::Encrypted { group_id } | AccessPolicy::GroupSigned { group_id } => {
-                group_id
-            }
+            AccessPolicy::Encrypted { group_id }
+            | AccessPolicy::GroupSigned { group_id }
+            | AccessPolicy::TreeKemEncrypted { group_id } => group_id,
             _ => {
                 return Err(KvError::EncryptedPolicyReserved {
                     group_id: Vec::new(),
@@ -974,7 +1007,15 @@ impl KvStore {
     /// True when this store carries the group-encrypted policy.
     #[must_use]
     pub fn is_encrypted(&self) -> bool {
-        matches!(self.policy, AccessPolicy::Encrypted { .. })
+        matches!(
+            self.policy,
+            AccessPolicy::Encrypted { .. } | AccessPolicy::TreeKemEncrypted { .. }
+        )
+    }
+
+    #[must_use]
+    pub fn is_treekem_encrypted(&self) -> bool {
+        matches!(self.policy, AccessPolicy::TreeKemEncrypted { .. })
     }
 
     #[must_use]
@@ -1241,7 +1282,7 @@ impl KvStore {
                 self.owner.as_ref().is_some_and(|o| o == agent_id)
                     || self.allowed_writers.contains(agent_id)
             }
-            AccessPolicy::Encrypted { .. } => {
+            AccessPolicy::Encrypted { .. } | AccessPolicy::TreeKemEncrypted { .. } => {
                 // Group-encrypted store (#341 Phase B): the v1 write rule is
                 // ACTIVE GROUP MEMBERSHIP, evaluated by the attached secure
                 // context. Without a context (reserved policy, or a replica
@@ -1249,7 +1290,7 @@ impl KvStore {
                 // yet) this stays fail-closed (#341 Phase A).
                 self.secure
                     .as_ref()
-                    .is_some_and(|ctx| ctx.is_active_member(agent_id))
+                    .is_some_and(|ctx| ctx.is_authorized_writer(agent_id))
             }
             AccessPolicy::AppendOnly => {
                 // Owner-only writes, exactly like Signed. Immutability of
@@ -1304,7 +1345,7 @@ impl KvStore {
     /// - [`KvError::Unauthorized`] if `writer` is not authorized for `key`.
     pub fn authorize_write(&self, writer: &AgentId, key: &str) -> Result<()> {
         match &self.policy {
-            AccessPolicy::Encrypted { group_id } => {
+            AccessPolicy::Encrypted { group_id } | AccessPolicy::TreeKemEncrypted { group_id } => {
                 // #341 Phase B: the v1 write rule is active group
                 // membership, via the attached secure context. Without a
                 // context this is the reserved fail-closed state — notably
@@ -1312,9 +1353,9 @@ impl KvStore {
                 // therefore local removes through the handle layer) was
                 // unconditionally permissive on a reserved Encrypted store.
                 match self.secure.as_ref() {
-                    Some(ctx) if ctx.is_active_member(writer) => Ok(()),
+                    Some(ctx) if ctx.is_authorized_writer(writer) => Ok(()),
                     Some(_) => Err(KvError::Unauthorized(format!(
-                        "encrypted store: writer {} is not an active member of group {}",
+                        "encrypted store: writer {} is not an authorized writer in group {}",
                         hex::encode(writer.as_bytes()),
                         hex::encode(group_id)
                     ))),
@@ -1414,23 +1455,25 @@ impl KvStore {
     /// - [`KvError::Unauthorized`] if `writer` is not authorized under the
     ///   store's policy.
     pub fn authorize_local_write(&self, writer: &AgentId) -> Result<()> {
-        if let AccessPolicy::Encrypted { group_id } = &self.policy {
+        if let AccessPolicy::Encrypted { group_id } | AccessPolicy::TreeKemEncrypted { group_id } =
+            &self.policy
+        {
             // #341 Phase B: with an attached secure context the v1 write
             // rule is active group membership. Without one this is the
             // reserved fail-closed state — loudly, and never `OwnerUnknown`
             // (this is not an ownership issue).
             return match self.secure.as_ref() {
-                Some(ctx) if ctx.is_active_member(writer) => Ok(()),
+                Some(ctx) if ctx.is_authorized_writer(writer) => Ok(()),
                 Some(_) => {
                     tracing::warn!(
                         target: "x0x::kv",
-                        "refused local write by {} on encrypted store {} (group_id {}) — writer is not an active group member",
+                        "refused local write by {} on encrypted store {} (group_id {}) — writer is not authorized by the current group policy",
                         hex::encode(writer.as_bytes()),
                         self.id,
                         hex::encode(group_id)
                     );
                     Err(KvError::Unauthorized(format!(
-                        "encrypted store: writer {} is not an active member of group {}",
+                        "encrypted store: writer {} is not an authorized writer in group {}",
                         hex::encode(writer.as_bytes()),
                         hex::encode(group_id)
                     )))
@@ -1586,6 +1629,22 @@ impl KvStore {
                 _ => {
                     return Err(KvError::OwnerTokenInvalid(
                         "encrypted policy is terminal; confidentiality downgrade rejected"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if let AccessPolicy::TreeKemEncrypted {
+            group_id: anchored_group,
+        } = &self.policy
+        {
+            match &policy {
+                AccessPolicy::TreeKemEncrypted {
+                    group_id: announce_group,
+                } if announce_group == anchored_group => {}
+                _ => {
+                    return Err(KvError::OwnerTokenInvalid(
+                        "TreeKEM encrypted policy is terminal; confidentiality downgrade rejected"
                             .to_string(),
                     ));
                 }
@@ -2298,7 +2357,9 @@ impl KvStore {
         //    signature, store binding, sequence, integrity, root) apply —
         //    the checkpoint author's membership was already enforced by the
         //    sync layer before merge.
-        if let AccessPolicy::Encrypted { group_id } = &self.policy {
+        if let AccessPolicy::Encrypted { group_id } | AccessPolicy::TreeKemEncrypted { group_id } =
+            &self.policy
+        {
             if self.secure.is_none() {
                 tracing::warn!(
                     target: "x0x::kv",
@@ -2427,6 +2488,15 @@ impl KvStore {
                     self.id,
                     cp.policy
                 );
+                return false;
+            }
+        }
+        if let AccessPolicy::TreeKemEncrypted {
+            group_id: anchored_group,
+        } = &self.policy
+        {
+            let keeps_binding = matches!(&cp.policy, AccessPolicy::TreeKemEncrypted { group_id } if group_id == anchored_group);
+            if !keeps_binding {
                 return false;
             }
         }
@@ -2604,9 +2674,13 @@ impl KvStore {
         if self.id != other.id {
             return Err(KvError::StoreIdMismatch);
         }
-        if self.is_group_signed() || other.is_group_signed() {
+        if self.is_group_signed()
+            || other.is_group_signed()
+            || self.is_encrypted()
+            || other.is_encrypted()
+        {
             return Err(KvError::Merge(
-                "group-signed stores require an authenticated retained-image merge".to_string(),
+                "group stores require an authenticated retained-image merge".to_string(),
             ));
         }
 
@@ -2659,9 +2733,9 @@ impl KvStore {
         Ok(())
     }
 
-    /// Merge a fully retained public-group CRDT image after its current
-    /// endorser has been authenticated by the sync layer.
-    pub(crate) fn merge_group_signed_image(
+    /// Merge a fully retained group CRDT image after its current endorser has
+    /// been authenticated by the sync layer.
+    pub fn merge_group_retained_image(
         &mut self,
         other: &KvStore,
         endorser: AgentId,
@@ -2670,13 +2744,21 @@ impl KvStore {
         let same_binding = self.id == other.id
             && self.owner == other.owner
             && self.name.get() == other.name.get()
-            && matches!(
-                (&self.policy, &other.policy),
+            && match (&self.policy, &other.policy) {
                 (
                     AccessPolicy::GroupSigned { group_id: ours },
-                    AccessPolicy::GroupSigned { group_id: theirs }
-                ) if ours == theirs
-            );
+                    AccessPolicy::GroupSigned { group_id: theirs },
+                )
+                | (
+                    AccessPolicy::Encrypted { group_id: ours },
+                    AccessPolicy::Encrypted { group_id: theirs },
+                )
+                | (
+                    AccessPolicy::TreeKemEncrypted { group_id: ours },
+                    AccessPolicy::TreeKemEncrypted { group_id: theirs },
+                ) => ours == theirs,
+                _ => false,
+            };
         if !same_binding {
             return Err(KvError::Unauthorized(
                 "retained group image has a foreign store/group/owner binding".to_string(),
@@ -2727,6 +2809,115 @@ impl KvStore {
         }
         *self = trial;
         Ok(())
+    }
+
+    /// Import retained content from one locally preserved legacy page store.
+    ///
+    /// The caller authenticates the current group writer and validates the
+    /// exact legacy manifest/snapshot binding. This method deliberately moves
+    /// only CRDT content: destination identity, group policy, checkpoints,
+    /// allowlists, and persistence authority remain local.
+    pub fn merge_legacy_signed_history(
+        &mut self,
+        source: &KvStore,
+        expected_source_owner: AgentId,
+        endorser: AgentId,
+        local_peer: PeerId,
+    ) -> Result<()> {
+        Self::validate_legacy_signed_source(source, expected_source_owner)?;
+        if !matches!(
+            self.policy,
+            AccessPolicy::GroupSigned { .. }
+                | AccessPolicy::Encrypted { .. }
+                | AccessPolicy::TreeKemEncrypted { .. }
+        ) {
+            return Err(KvError::Unauthorized(
+                "legacy import requires a group destination".to_string(),
+            ));
+        }
+
+        let retained_sequence_floor = self
+            .keys
+            .max_retained_sequence_for_peer(&local_peer)
+            .into_iter()
+            .chain(source.keys.max_retained_sequence_for_peer(&local_peer))
+            .max();
+        if retained_sequence_floor.is_some_and(|floor| floor > u64::MAX - 2) {
+            return Err(KvError::Merge(
+                "legacy history leaves insufficient local sequence allocator capacity".to_string(),
+            ));
+        }
+        let mut trial = self.clone();
+        trial
+            .keys
+            .merge_state(&source.keys)
+            .map_err(|e| KvError::Merge(format!("legacy OR-Set image merge failed: {e}")))?;
+        for (key, entry) in &source.entries {
+            if let Some(local) = trial.entries.get_mut(key) {
+                local.merge(entry);
+            } else {
+                trial.entries.insert(key.clone(), entry.clone());
+            }
+        }
+        // `merge_state` records a new OR-Set version only when it retains a
+        // previously unseen add or tombstone. Compare entries by their logical
+        // fields because their metadata maps have no canonical byte order.
+        let changed = trial.keys.version() != self.keys.version()
+            || !retained_entries_equal(&trial.entries, &self.entries)
+            || trial.last_history_endorser.as_ref() != Some(&endorser);
+        trial.last_history_endorser = Some(endorser);
+        if changed {
+            trial.version = self.version.saturating_add(1);
+        }
+        if let Some(floor) = retained_sequence_floor {
+            trial.restore_seq_counter(floor);
+        }
+        *self = trial;
+        Ok(())
+    }
+
+    /// Validate every retained entry and the exact owner/policy binding
+    /// before opening or creating an import destination.
+    pub fn validate_legacy_signed_source(
+        source: &KvStore,
+        expected_source_owner: AgentId,
+    ) -> Result<()> {
+        if source.policy != AccessPolicy::Signed || source.owner != Some(expected_source_owner) {
+            return Err(KvError::Unauthorized(
+                "legacy import requires an owner-bound Signed source".to_string(),
+            ));
+        }
+        for (key, entry) in &source.entries {
+            validate_entry_integrity(key, entry)?;
+            if entry.value.len() > crate::kv::entry::MAX_INLINE_SIZE {
+                return Err(KvError::ValueTooLarge {
+                    size: entry.value.len(),
+                    max: crate::kv::entry::MAX_INLINE_SIZE,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Active keys for which source and destination currently carry
+    /// different retained values. The CRDT merge still decides the winner;
+    /// this list makes that decision visible to the explicit importer.
+    #[must_use]
+    pub fn legacy_import_conflicts(&self, source: &KvStore) -> Vec<String> {
+        let mut conflicts = source
+            .active_keys()
+            .into_iter()
+            .filter(|key| {
+                self.get(key)
+                    .zip(source.get(key))
+                    .is_some_and(|(ours, theirs)| {
+                        ours.value != theirs.value || ours.content_type != theirs.content_type
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        conflicts.sort();
+        conflicts
     }
 
     /// Current writer who authenticated the most recently imported retained
@@ -3961,7 +4152,7 @@ mod tests {
 
         let endorser = agent(7);
         target
-            .merge_group_signed_image(&source, endorser, peer(2))
+            .merge_group_retained_image(&source, endorser, peer(2))
             .expect("authenticated retained image");
 
         assert!(target.get("removed").is_none(), "OR-Set tombstone survives");
@@ -4003,7 +4194,7 @@ mod tests {
         let mut target = KvStore::new_group_signed(id, "Wiki".to_string(), owner, group, ctx)
             .expect("independent target");
         target
-            .merge_group_signed_image(&source, owner, local_peer)
+            .merge_group_retained_image(&source, owner, local_peer)
             .expect("authenticated retained merge");
         assert_eq!(
             target.seq_counter_value(),
@@ -4064,7 +4255,7 @@ mod tests {
             KvStore::new_group_signed(id, "Wiki".to_string(), owner, group, ctx).expect("target");
         let before = bincode::serialize(&target).expect("before");
         assert!(matches!(
-            target.merge_group_signed_image(&source, owner, local_peer),
+            target.merge_group_retained_image(&source, owner, local_peer),
             Err(KvError::Merge(message)) if message.contains("allocator capacity")
         ));
         assert_eq!(bincode::serialize(&target).expect("after"), before);
@@ -4094,6 +4285,235 @@ mod tests {
         assert!(matches!(store.full_delta(), Err(KvError::Merge(_))));
         assert_eq!(bincode::serialize(&store).expect("after"), before);
         assert_eq!(store.seq_counter_value(), u64::MAX);
+    }
+
+    #[test]
+    fn encrypted_retained_image_preserves_removal_and_concurrent_write() {
+        let owner = agent(1);
+        let writer = agent(2);
+        let ctx = TestCtx::new(7, &[owner, writer]);
+        let id = store_id(10);
+        let group = vec![7u8; 16];
+        let mut source =
+            KvStore::new_encrypted(id, "Home".to_string(), owner, group.clone(), ctx.clone())
+                .expect("source");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        let mut target = source.clone();
+        source.remove("removed").expect("remove");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("concurrent");
+
+        target
+            .merge_group_retained_image(&source, writer, peer(2))
+            .expect("authenticated retained image");
+        assert!(target.get("removed").is_none());
+        assert_eq!(
+            target.get("concurrent").expect("concurrent survives").value,
+            b"local"
+        );
+        assert_eq!(target.last_history_endorser(), Some(&writer));
+        assert!(matches!(
+            target.policy(),
+            AccessPolicy::Encrypted { group_id } if group_id == &group
+        ));
+
+        let mut unauthenticated = source.clone();
+        unauthenticated.allowed_writers.insert(agent(9));
+        let before = target.clone();
+        assert!(target.merge(&unauthenticated).is_err());
+        assert_eq!(target.name(), before.name());
+        assert_eq!(target.len(), before.len());
+        assert_eq!(target.allowed_writers(), before.allowed_writers());
+        assert!(target.get("concurrent").is_some());
+
+        let mut treekem = KvStore::new_treekem_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group,
+            TestCtx::new(7, &[owner, writer]),
+        )
+        .expect("TreeKEM target");
+        treekem
+            .put(
+                "private".to_string(),
+                b"keep".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("TreeKEM local write");
+        assert!(treekem
+            .merge_group_retained_image(&source, writer, peer(3))
+            .is_err());
+        assert_eq!(
+            treekem.get("private").expect("local remains").value,
+            b"keep",
+            "a legacy GSS image cannot cross into the TreeKEM plane"
+        );
+        assert!(treekem.get("removed").is_none());
+    }
+
+    #[test]
+    fn legacy_signed_import_is_content_only_and_retry_idempotent() {
+        let source_owner = agent(1);
+        let writer = agent(2);
+        let mut source = KvStore::new(
+            store_id(21),
+            "Legacy Wiki".to_string(),
+            source_owner,
+            AccessPolicy::Signed,
+        )
+        .expect("legacy source");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed removed key");
+        source.remove("removed").expect("source tombstone");
+        source
+            .put(
+                "imported".to_string(),
+                b"history".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed imported key");
+        source
+            .put(
+                "shared".to_string(),
+                b"legacy".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed conflicting key");
+        source
+            .entries
+            .get_mut("imported")
+            .expect("imported metadata target")
+            .metadata
+            .extend([
+                ("z-last".to_string(), "second".to_string()),
+                ("a-first".to_string(), "first".to_string()),
+            ]);
+        let encoded = bincode::serialize(&source).expect("legacy snapshot");
+        let source: KvStore = bincode::deserialize(&encoded).expect("restart decode");
+        assert_eq!(source.seq_counter_value(), 0, "allocator is not serialized");
+
+        let group = vec![9u8; 16];
+        let mut destination = KvStore::new_group_signed(
+            store_id(22),
+            "Wiki".to_string(),
+            writer,
+            group.clone(),
+            TestCtx::new(9, &[writer]),
+        )
+        .expect("destination");
+        destination
+            .put(
+                "concurrent".to_string(),
+                b"keep".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("local value");
+        destination
+            .put(
+                "shared".to_string(),
+                b"current".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("current conflicting key");
+
+        assert_eq!(
+            destination.legacy_import_conflicts(&source),
+            vec!["shared".to_string()]
+        );
+
+        let mut forged = source.clone();
+        let wrong_entry = forged.get("imported").expect("entry").clone();
+        forged
+            .entries
+            .insert("wrong-map-key".to_string(), wrong_entry);
+        let before_forged = bincode::serialize(&destination).expect("before forged import");
+        assert!(destination
+            .merge_legacy_signed_history(&forged, source_owner, writer, peer(2))
+            .is_err());
+        assert_eq!(
+            bincode::serialize(&destination).expect("after forged import"),
+            before_forged,
+            "invalid source rejection is transactionally unchanged"
+        );
+
+        destination
+            .merge_legacy_signed_history(&source, source_owner, writer, peer(2))
+            .expect("first import");
+        let first_counter = destination.seq_counter_value();
+        let first_version = destination.current_version();
+        assert!(destination.get("removed").is_none());
+        assert_eq!(
+            destination.get("imported").expect("imported").value,
+            b"history"
+        );
+        assert_eq!(destination.get("concurrent").expect("local").value, b"keep");
+        assert_eq!(destination.owner(), Some(&writer));
+        assert_eq!(destination.last_history_endorser(), Some(&writer));
+        assert!(matches!(
+            destination.policy(),
+            AccessPolicy::GroupSigned { group_id } if group_id == &group
+        ));
+        let encoded_retry = bincode::serialize(&source).expect("retry snapshot");
+        let mut reordered_source: KvStore =
+            bincode::deserialize(&encoded_retry).expect("retry restart decode");
+        let mut reordered_entries = HashMap::new();
+        let mut entry_keys = reordered_source.entries.keys().cloned().collect::<Vec<_>>();
+        entry_keys.sort_by(|left, right| right.cmp(left));
+        for key in entry_keys {
+            let mut entry = reordered_source.entries.remove(&key).expect("retry entry");
+            let mut metadata = entry.metadata.drain().collect::<Vec<_>>();
+            metadata.sort_by(|left, right| right.0.cmp(&left.0));
+            entry.metadata.extend(metadata);
+            reordered_entries.insert(key, entry);
+        }
+        reordered_source.entries = reordered_entries;
+        destination
+            .merge_legacy_signed_history(&reordered_source, source_owner, writer, peer(2))
+            .expect("restart/reordered receipt-failure retry");
+        assert_eq!(destination.seq_counter_value(), first_counter);
+        assert_eq!(
+            destination.current_version(),
+            first_version,
+            "logically identical retry does not advance the destination"
+        );
+
+        destination
+            .put(
+                "removed".to_string(),
+                b"re-added".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("re-add after imported same-peer tombstone");
+        assert_eq!(
+            destination.get("removed").expect("re-add visible").value,
+            b"re-added"
+        );
     }
 
     #[test]
@@ -4176,7 +4596,7 @@ mod tests {
             .content_hash = [0; 32];
 
         assert!(target
-            .merge_group_signed_image(&hostile, owner, peer(1))
+            .merge_group_retained_image(&hostile, owner, peer(1))
             .is_err());
         assert_eq!(
             bincode::serialize(&target).expect("unchanged target"),
@@ -4187,7 +4607,7 @@ mod tests {
         bad.content_hash = *blake3::hash(&bad.value).as_bytes();
         bad.key = "wrong-map-key".to_string();
         assert!(target
-            .merge_group_signed_image(&hostile, owner, peer(1))
+            .merge_group_retained_image(&hostile, owner, peer(1))
             .is_err());
         assert_eq!(
             bincode::serialize(&target).expect("unchanged target"),
@@ -4199,7 +4619,7 @@ mod tests {
         bad.value = vec![0; crate::kv::entry::MAX_INLINE_SIZE + 1];
         bad.content_hash = *blake3::hash(&bad.value).as_bytes();
         assert!(matches!(
-            target.merge_group_signed_image(&hostile, owner, peer(1)),
+            target.merge_group_retained_image(&hostile, owner, peer(1)),
             Err(KvError::ValueTooLarge { .. })
         ));
         assert_eq!(
@@ -6295,8 +6715,8 @@ mod tests {
         // WHY: AccessPolicy is bincode-encoded positionally in persisted
         // stores, checkpoints (wire + signing bytes), and deltas. If anyone
         // reorders or inserts a variant mid-enum, every existing store
-        // corrupts. This test pins the exact on-wire indices 0..=5.
-        let cases: [(AccessPolicy, u32); 6] = [
+        // corrupts. This test pins the exact on-wire indices 0..=6.
+        let cases: [(AccessPolicy, u32); 7] = [
             (AccessPolicy::Signed, 0),
             (AccessPolicy::Allowlisted, 1),
             (
@@ -6312,6 +6732,12 @@ mod tests {
                     group_id: Vec::new(),
                 },
                 5,
+            ),
+            (
+                AccessPolicy::TreeKemEncrypted {
+                    group_id: Vec::new(),
+                },
+                6,
             ),
         ];
         for (policy, index) in cases {

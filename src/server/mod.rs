@@ -16,6 +16,7 @@ pub mod config;
 mod crdt_subscriptions;
 mod delegations;
 mod instance_lock;
+mod legacy_store_migration;
 mod rider_auth;
 mod routes;
 mod sse;
@@ -1979,6 +1980,15 @@ pub async fn serve_with_options(
         .route("/groups/:id", delete(leave_group))
         // Group-scoped encrypted KvStore (#341 Phase B)
         .route("/groups/:id/stores", post(create_group_kv_store))
+        .route(
+            "/groups/:id/stores/:app/legacy-imports",
+            get(routes::stores::list_legacy_page_imports),
+        )
+        .route(
+            "/groups/:id/stores/:app/legacy-imports/:source_id",
+            get(routes::stores::download_legacy_page_import)
+                .post(routes::stores::import_legacy_page_store),
+        )
         // KvStore endpoints
         .route("/stores", get(list_kv_stores))
         .route("/stores", post(create_kv_store))
@@ -2683,7 +2693,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
         // Only the authority (group creator) stores the relay
         // obligation. A non-authority witness just applies.
         if !is_local_authority || !is_requester_offer {
-            let apply_result = apply_named_group_metadata_event_inner_serialized(
+            let apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
                 relay_state,
                 event.clone(),
                 sender,
@@ -2694,7 +2704,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 &mut replay_group_id,
                 true,
                 false,
-            )
+            ))
             .await;
             replay_after = replay_group_id;
             let _ = apply_result;
@@ -3095,7 +3105,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
 
         // Now apply the request (only for New; Repair skips apply).
         let group_snapshot = if is_new_request {
-            let mut apply_result = apply_named_group_metadata_event_inner_serialized(
+            let mut apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
                 relay_state,
                 event.clone(),
                 sender,
@@ -3106,7 +3116,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 &mut replay_group_id,
                 true, // lock_already_held
                 false,
-            )
+            ))
             .await;
             replay_after = replay_group_id;
             if !apply_result.accepted {
