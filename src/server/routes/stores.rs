@@ -2804,6 +2804,22 @@ mod tests {
             .expect("digest")
             .to_string();
 
+        let (code, download) = download_legacy_page_import(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{download:?}");
+        assert_eq!(download.0["source_store_id"], source_id);
+        assert_eq!(download.0["source_digest"], digest);
+        assert!(
+            download.0["snapshot_b64"]
+                .as_str()
+                .is_some_and(|snapshot| !snapshot.is_empty()),
+            "download returns the reviewed immutable source snapshot: {download:?}"
+        );
+
         let rider = crate::server::rider_auth::ActorContext::Rider {
             sub_agent_id: "rider".to_string(),
             token_id: 1,

@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 179,
+  "endpoint_count": 182,
   "endpoints": [
     {
       "category": "status",
@@ -17,6 +17,16 @@
       "description": "Runtime status with uptime",
       "method": "GET",
       "path": "/status",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store legacy download",
+      "description": "Download the exact reviewed legacy Wiki/Web snapshot without changing it",
+      "method": "GET",
+      "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
       "request": {
         "kind": "none"
       }
@@ -2823,6 +2833,40 @@
             "cli": "NAME",
             "in": "body",
             "name": "name",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store legacy imports",
+      "description": "List exact local legacy Wiki/Web snapshots available for explicit import",
+      "method": "GET",
+      "path": "/groups/:id/stores/:app/legacy-imports",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store legacy import",
+      "description": "Import a reviewed local legacy Wiki/Web snapshot into its canonical shared group store",
+      "method": "POST",
+      "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "source_digest",
+            "required": true
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "idempotency_key",
             "required": true
           }
         ],
