@@ -3155,13 +3155,15 @@ async function loadLegacyPageImport(sid,app){
   const candidates=r.candidates||[];
   if(!candidates.length){el.innerHTML='';return}
   el.innerHTML=candidates.map(c=>{
+    if(c.import_idempotency_key)legacyImportKeys[sid+'|'+app+'|'+c.source_store_id+'|'+c.source_digest]=c.import_idempotency_key;
     const keys=(c.keys||[]).map(esc).join(', ')||'No active pages';
     const conflicts=(c.conflicts||[]).map(esc).join(', ');
     const ambiguity=c.ambiguous_group_prefix?' This historical alias is shared by more than one local space. Import will use target '+esc(c.target_group_id)+' and source '+esc(c.source_store_id)+'.':'';
     const conflictText=conflicts?' Conflicting current pages: '+conflicts+'.':'';
-    const imported=c.imported?' This exact snapshot was already imported.':'';
+    const imported=c.publish_pending?' Imported on this device; sharing has not been accepted for sync yet.':(c.publish_accepted?' Imported locally and offered for space sync.':(c.imported?' This exact snapshot was already imported.':''));
     const refusal=c.import_refusal_reason?' Import unavailable: '+esc(c.import_refusal_reason)+'.':'';
-    return `<div class="card" style="font-size:12px"><strong>Legacy ${esc(app)} pages found</strong><div class="mt" style="color:var(--tx3)">${keys}.${conflictText}${ambiguity}${esc(imported)}${refusal}</div><div class="mt" style="font-family:var(--mono);font-size:10px;color:var(--tx3)">Target ${esc(c.target_group_id)} · Source ${esc(c.source_store_id)}</div><div class="row mt"><button data-legacy-download="${esc(c.source_store_id)}" onclick="downloadLegacyPages('${sid}','${app}',this.dataset.legacyDownload)">Download snapshot</button><button class="pri" data-legacy-import="${esc(c.source_store_id)}" data-legacy-digest="${esc(c.source_digest)}" onclick="importLegacyPages('${sid}','${app}',this.dataset.legacyImport,this.dataset.legacyDigest)" ${c.imported||!c.can_import?'disabled':''}>Import this snapshot into this shared space</button></div></div>`;
+    const action=c.publish_pending?'Retry sharing this imported snapshot':'Import this snapshot into this shared space';
+    return `<div class="card" style="font-size:12px"><strong>Legacy ${esc(app)} pages found</strong><div class="mt" style="color:var(--tx3)">${keys}.${conflictText}${ambiguity}${esc(imported)}${refusal}</div><div class="mt" style="font-family:var(--mono);font-size:10px;color:var(--tx3)">Target ${esc(c.target_group_id)} · Source ${esc(c.source_store_id)}</div><div class="row mt"><button data-legacy-download="${esc(c.source_store_id)}" onclick="downloadLegacyPages('${sid}','${app}',this.dataset.legacyDownload)">Download snapshot</button><button class="pri" data-legacy-import="${esc(c.source_store_id)}" data-legacy-digest="${esc(c.source_digest)}" onclick="importLegacyPages('${sid}','${app}',this.dataset.legacyImport,this.dataset.legacyDigest)" ${c.publish_accepted||!c.can_import?'disabled':''}>${action}</button></div></div>`;
   }).join('');
 }
 
@@ -3180,13 +3182,18 @@ async function importLegacyPages(sid,app,sourceId,digest){
   const key=legacyImportAttemptKey(sid,app,sourceId,digest);
   const r=await api('/groups/'+encSeg(sid)+'/stores/'+encSeg(app)+'/legacy-imports/'+encSeg(sourceId),{method:'POST',body:JSON.stringify({source_digest:digest,idempotency_key:key})});
   if(!r||!r._http_ok||!r.ok){
-    toast('The import was not confirmed. Some content may already have been applied; the same request will be used if you retry. '+apiError(r),'error');
+    const message=r&&r.imported_locally?'Pages were imported locally; sharing is pending and the same request will retry it. ':'The import was not confirmed. Some content may already have been applied; the same request will be used if you retry. ';
+    toast(message+apiError(r),'error');
     if(app==='wiki')loadWikiPages(sid);else loadWebPages(sid);
     loadLegacyPageImport(sid,app);
     return;
   }
-  delete legacyImportKeys[sid+'|'+app+'|'+sourceId+'|'+digest];
-  toast('Legacy pages imported into this space','success');
+  if(r.publish_accepted){
+    delete legacyImportKeys[sid+'|'+app+'|'+sourceId+'|'+digest];
+    toast('Legacy pages imported locally and offered for space sync','success');
+  }else{
+    toast('Legacy pages were imported locally, but sync publication is still pending','error');
+  }
   resetSpacePageStore(sid,app);
   if(app==='wiki')loadWikiPages(sid);else loadWebPages(sid);
   loadLegacyPageImport(sid,app);

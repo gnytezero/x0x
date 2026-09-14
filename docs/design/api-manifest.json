@@ -2842,7 +2842,7 @@
     {
       "category": "stores",
       "cli_name": "group store legacy imports",
-      "description": "List exact local legacy Wiki/Web snapshots available for explicit import",
+      "description": "List local legacy Wiki/Web snapshots with durable import and local sync-publication status",
       "method": "GET",
       "path": "/groups/:id/stores/:app/legacy-imports",
       "request": {
@@ -2852,7 +2852,7 @@
     {
       "category": "stores",
       "cli_name": "group store legacy import",
-      "description": "Import a reviewed local legacy Wiki/Web snapshot into its canonical shared group store",
+      "description": "Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync",
       "method": "POST",
       "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
       "request": {

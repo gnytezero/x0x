@@ -16977,6 +16977,31 @@ impl KvStoreHandle {
         self.sync.read().await.legacy_import_conflicts(source)
     }
 
+    pub(crate) async fn publish_retained_group_history(&self) -> error::Result<()> {
+        self.sync
+            .publish_retained_group_history()
+            .await
+            .map_err(|error| {
+                error::IdentityError::Storage(std::io::Error::other(error.to_string()))
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_retained_publish_after_for_test(&self, accepted_frames: usize) {
+        self.sync
+            .fail_retained_publish_after_for_test(accepted_frames);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_publish_accepted_for_test(&self) -> usize {
+        self.sync.retained_publish_accepted_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_retained_publish_failure_for_test(&self) {
+        self.sync.clear_retained_publish_failure_for_test();
+    }
+
     /// Merge one validated local legacy Signed-store image into this group
     /// store, persist the result, and retain current-writer endorsement.
     pub(crate) async fn import_legacy_signed_history(

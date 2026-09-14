@@ -56,6 +56,14 @@ struct GroupHistorySeal<'a> {
     local_peer_id: PeerId,
 }
 
+struct RetainedHistoryPublish<'a> {
+    seal: GroupHistorySeal<'a>,
+    pubsub: &'a PubSubManager,
+    topic: &'a str,
+    #[cfg(test)]
+    test_state: Option<&'a std::sync::Mutex<RetainedPublishTestState>>,
+}
+
 /// Delays between state-request retries for a first-time joiner whose
 /// store is still empty. Spread out so a slow mesh (peer discovery,
 /// subscription propagation) still converges without flooding.
@@ -390,6 +398,15 @@ pub struct KvStoreSync {
     /// sign-then-encrypt flow).
     author_signing: Option<std::sync::Arc<AuthorSigning>>,
     retained_pages: Arc<std::sync::Mutex<RetainedPagePool>>,
+    #[cfg(test)]
+    retained_publish_test: Arc<std::sync::Mutex<RetainedPublishTestState>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RetainedPublishTestState {
+    fail_after: Option<usize>,
+    accepted: usize,
 }
 
 /// Structural teardown (parallel-review finding): the background loops hold
@@ -455,6 +472,10 @@ impl KvStoreSync {
             secure_refresh: None,
             author_signing: None,
             retained_pages: Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
+            #[cfg(test)]
+            retained_publish_test: Arc::new(std::sync::Mutex::new(
+                RetainedPublishTestState::default(),
+            )),
         })
     }
 
@@ -737,6 +758,64 @@ impl KvStoreSync {
             )
             .await
         }
+    }
+
+    async fn publish_retained_history_frames(
+        publish: RetainedHistoryPublish<'_>,
+        retained: &[u8],
+    ) -> Result<()> {
+        let max_wire = crate::gossip::pubsub::max_signed_v3_payload_bytes(publish.topic)
+            .ok_or_else(|| {
+                KvError::Gossip("group history topic is too large for signed V3".to_string())
+            })?;
+        let frames =
+            crate::kv::retained_paging::split_image(retained, max_wire.saturating_sub(16 * 1024))?;
+        for frame in frames {
+            #[cfg(test)]
+            if let Some(state) = publish.test_state {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.fail_after == Some(state.accepted) {
+                    return Err(KvError::Gossip(
+                        "injected retained image publication failure".to_string(),
+                    ));
+                }
+            }
+            let serialized = Self::seal_group_history_payload(
+                GroupHistorySeal {
+                    store: publish.seal.store,
+                    treekem: publish.seal.treekem,
+                    secure: publish.seal.secure,
+                    refresh: publish.seal.refresh,
+                    signing: publish.seal.signing,
+                    encrypted: publish.seal.encrypted,
+                    local_peer_id: publish.seal.local_peer_id,
+                },
+                frame,
+            )
+            .await?;
+            if serialized.len() > max_wire {
+                return Err(KvError::Gossip(
+                    "sealed retained image frame exceeds signed V3 wire limit".to_string(),
+                ));
+            }
+            publish
+                .pubsub
+                .publish(publish.topic.to_string(), bytes::Bytes::from(serialized))
+                .await
+                .map_err(|error| {
+                    KvError::Gossip(format!("retained image publish failed: {error}"))
+                })?;
+            #[cfg(test)]
+            if let Some(state) = publish.test_state {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .accepted += 1;
+            }
+        }
+        Ok(())
     }
 
     async fn merge_group_signed_record(
@@ -1765,30 +1844,12 @@ impl KvStoreSync {
                         };
                         let mut markers: Vec<KvSyncMessage> = Vec::new();
                         if let Some(retained) = retained {
-                            let Some(max_wire) = crate::gossip::pubsub::max_signed_v3_payload_bytes(
-                                &responder_topic,
-                            ) else {
-                                tracing::warn!("group history topic is too large for signed V3");
-                                continue;
-                            };
-                            let page_budget = max_wire.saturating_sub(16 * 1024);
-                            let frames = match crate::kv::retained_paging::split_image(
-                                &retained,
-                                page_budget,
-                            ) {
-                                Ok(frames) => frames,
-                                Err(error) => {
-                                    tracing::warn!(%error, "cannot page complete group history");
-                                    continue;
-                                }
-                            };
                             let Some(signing) = responder_signing.as_ref() else {
                                 continue;
                             };
-                            let mut published_all = true;
-                            for frame in frames {
-                                let serialized = Self::seal_group_history_payload(
-                                    GroupHistorySeal {
+                            let published = Self::publish_retained_history_frames(
+                                RetainedHistoryPublish {
+                                    seal: GroupHistorySeal {
                                         store: &responder_store,
                                         treekem: responder_treekem.as_ref(),
                                         secure: responder_secure.as_ref(),
@@ -1797,33 +1858,23 @@ impl KvStoreSync {
                                         encrypted: responder_is_encrypted,
                                         local_peer_id,
                                     },
-                                    frame,
-                                )
-                                .await;
-                                let Ok(serialized) = serialized else {
-                                    published_all = false;
-                                    break;
-                                };
-                                if serialized.len() > max_wire
-                                    || responder_pubsub
-                                        .publish(
-                                            responder_topic.clone(),
-                                            bytes::Bytes::from(serialized),
-                                        )
-                                        .await
-                                        .is_err()
-                                {
-                                    published_all = false;
-                                    break;
-                                }
-                            }
-                            if published_all {
+                                    pubsub: responder_pubsub.as_ref(),
+                                    topic: &responder_topic,
+                                    #[cfg(test)]
+                                    test_state: None,
+                                },
+                                &retained,
+                            )
+                            .await;
+                            if published.is_ok() {
                                 last_full_response = Some(tokio::time::Instant::now());
                                 markers.push(KvSyncMessage::StateServedV2 {
                                     responder: local_peer_id,
                                     digest: served.0,
                                     entry_count: served.1,
                                 });
+                            } else if let Err(error) = published {
+                                tracing::warn!(%error, "cannot publish complete group history");
                             }
                         } else if let Some(full) = full {
                             // #341 Phase B: the full-state serve on the main
@@ -2375,6 +2426,76 @@ impl KvStoreSync {
             .map_err(|e| KvError::Gossip(format!("publish delta failed: {e}")))?;
 
         Ok(())
+    }
+
+    /// Publish the current complete retained group history through the same
+    /// authenticated, bounded frame path used by reactive state responses.
+    pub(crate) async fn publish_retained_group_history(&self) -> Result<()> {
+        let (retained, encrypted, group_policy) = {
+            let store = self.store.read().await;
+            (
+                serialize_retained_group_image(&store)?,
+                store.is_encrypted(),
+                store.is_encrypted() || store.is_group_signed(),
+            )
+        };
+        if !group_policy {
+            return Err(KvError::SecureRecord(
+                "retained group history publication requires a group store".to_string(),
+            ));
+        }
+        let signing = self.author_signing.as_ref().ok_or_else(|| {
+            KvError::SecureRecord(
+                "retained group history publication requires author signing material".to_string(),
+            )
+        })?;
+        Self::publish_retained_history_frames(
+            RetainedHistoryPublish {
+                seal: GroupHistorySeal {
+                    store: &self.store,
+                    treekem: self.treekem_secure.as_ref(),
+                    secure: self.secure.as_ref(),
+                    refresh: self.secure_refresh.as_ref(),
+                    signing,
+                    encrypted,
+                    local_peer_id: self.local_peer_id,
+                },
+                pubsub: &self.pubsub,
+                topic: &self.topic,
+                #[cfg(test)]
+                test_state: Some(&self.retained_publish_test),
+            },
+            &retained,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_retained_publish_after_for_test(&self, accepted_frames: usize) {
+        let mut state = self
+            .retained_publish_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.fail_after = Some(accepted_frames);
+        state.accepted = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_publish_accepted_for_test(&self) -> usize {
+        self.retained_publish_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_retained_publish_failure_for_test(&self) {
+        let mut state = self
+            .retained_publish_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.fail_after = None;
+        state.accepted = 0;
     }
 
     /// Get a read-only reference to the store.
@@ -4527,6 +4648,229 @@ mod tests {
         wire_frames.reverse();
         let target = Arc::new(RwLock::new(target));
         let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        for payload in wire_frames {
+            let _ = KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &payload,
+                &pages,
+            )
+            .await;
+        }
+        let merged = target.read().await;
+        assert!(merged.get("removed").is_none());
+        assert_eq!(
+            merged.get("concurrent").expect("concurrent").value,
+            b"local"
+        );
+        assert_eq!(merged.last_history_endorser(), Some(&writer));
+        drop(merged);
+
+        reader_protector
+            .writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&writer);
+        let hostile = writer_protector
+            .seal_record(
+                &AuthorSigning::from_keypair(&writer_kp).expect("writer signing"),
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&KvStoreDelta::new(99)).expect("delta"),
+                false,
+            )
+            .await
+            .expect("stale writer record");
+        let hostile = encode_delta(peer(2), &hostile).expect("wire record");
+        assert!(
+            !KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &hostile,
+                &pages,
+            )
+            .await
+        );
+        let _ = group_info;
+    }
+
+    #[tokio::test]
+    async fn treekem_retained_publisher_retries_partial_frames_and_receiver_reassembles() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let owner_kp = AgentKeypair::generate().expect("owner kp");
+        let writer_kp = AgentKeypair::generate().expect("writer kp");
+        let reader_kp = AgentKeypair::generate().expect("reader kp");
+        let owner = owner_kp.agent_id();
+        let writer = writer_kp.agent_id();
+        let reader = reader_kp.agent_id();
+        let (group_info, mut contexts, group_id) = encrypted_group(&[owner, writer, reader]);
+        let reader_ctx = contexts.pop().expect("reader context");
+        let writer_ctx = contexts.pop().expect("writer context");
+        let _owner_ctx = contexts.pop().expect("owner context");
+
+        let mut owner_group =
+            crate::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[1; 32])
+                .expect("owner group");
+        let writer_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(writer, &[2; 32]).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(reader, &[3; 32]).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances");
+        let reader_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        drop(owner_group); // the canonical owner is offline while the writer serves.
+
+        let readers = std::collections::HashSet::from([owner, writer, reader]);
+        let writers = std::collections::HashSet::from([owner, writer]);
+        let authorization = *blake3::hash(b"current roster and AdminOnly policy").as_bytes();
+        let writer_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(writer_group),
+            readers: readers.clone(),
+            writers: std::sync::Mutex::new(writers.clone()),
+            authorization,
+        });
+        let reader_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(reader_group),
+            readers,
+            writers: std::sync::Mutex::new(writers),
+            authorization,
+        });
+        let id = store_id(44);
+        let mut source = KvStore::new_treekem_encrypted(
+            id,
+            "Home".to_string(),
+            owner,
+            group_id.clone(),
+            writer_ctx,
+        )
+        .expect("writer store");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed removal");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(2),
+                )
+                .expect("large entry");
+        }
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_ctx)
+            .expect("reader context");
+        source.remove("removed").expect("retained tombstone");
+        target
+            .put(
+                "concurrent".to_string(),
+                b"local".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("concurrent target write");
+
+        let topic = "store/treekem-paged-history";
+        let mut main_probe = pubsub.subscribe(topic.to_string()).await;
+        let mut writer_sync = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(writer),
+        )
+        .expect("writer sync");
+        writer_sync.set_treekem_context(writer_protector.clone());
+        writer_sync
+            .set_author_signing(AuthorSigning::from_keypair(&writer_kp).expect("writer signing"));
+        writer_sync.start().await.expect("start responder");
+        let retained = {
+            let store = writer_sync.read().await;
+            serialize_retained_group_image(&store).expect("retained image")
+        };
+        let max_wire =
+            crate::gossip::pubsub::max_signed_v3_payload_bytes(topic).expect("wire budget");
+        let expected_frames =
+            crate::kv::retained_paging::split_image(&retained, max_wire.saturating_sub(16 * 1024))
+                .expect("paged frames")
+                .len();
+        assert!(
+            expected_frames > 2,
+            "history must span multiple data frames"
+        );
+
+        let reader_trait: SharedTreeKemKvProtector = reader_protector.clone();
+        writer_sync.fail_retained_publish_after_for_test(1);
+        assert!(
+            writer_sync.publish_retained_group_history().await.is_err(),
+            "injected failure must stop after one actually accepted frame"
+        );
+        assert_eq!(writer_sync.retained_publish_accepted_for_test(), 1);
+        let partial = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+            .await
+            .expect("partial frame timeout")
+            .expect("partial frame");
+        assert!(partial.payload.len() <= max_wire);
+        let target = Arc::new(RwLock::new(target));
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        assert!(
+            !KvStoreSync::merge_treekem_record(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &partial.payload,
+                &pages,
+            )
+            .await,
+            "one accepted frame cannot partially mutate the receiver"
+        );
+
+        writer_sync.clear_retained_publish_failure_for_test();
+        writer_sync
+            .publish_retained_group_history()
+            .await
+            .expect("retry complete retained publication");
+        assert_eq!(
+            writer_sync.retained_publish_accepted_for_test(),
+            expected_frames
+        );
+
+        let mut wire_frames = Vec::with_capacity(expected_frames);
+        for _ in 0..expected_frames {
+            let message = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+                .await
+                .expect("responder frame timeout")
+                .expect("responder frame");
+            assert!(message.payload.len() <= max_wire);
+            wire_frames.push(message.payload);
+        }
+        wire_frames.reverse();
         for payload in wire_frames {
             let _ = KvStoreSync::merge_treekem_record(
                 &reader_trait,

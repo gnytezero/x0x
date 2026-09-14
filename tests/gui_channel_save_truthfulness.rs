@@ -185,7 +185,7 @@ fn gui_legacy_discovery_shows_conflicts_and_explicit_import() {
         r#"
 {DRIVER_PREAMBLE}
 ROUTES['GET /groups/sid1/stores/wiki/legacy-imports'] = {{ _http_ok: true, ok: true, candidates: [{{ target_group_id: 'sid1', source_store_id: 'source1', source_digest: 'digest1', keys: ['old-page'], conflicts: ['shared'], ambiguous_group_prefix: true, imported: false, can_import: true, import_refusal_reason: null }}] }};
-ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: true, ok: true, receipt: {{}} }};
+ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: true, ok: true, imported_locally: true, publish_accepted: true, receipt: {{}} }};
 globalThis.__done = loadLegacyPageImport('sid1','wiki').then(async () => {{
     const panel = document.getElementById('wiki-legacy').innerHTML;
     await importLegacyPages('sid1','wiki','source1','digest1');
@@ -224,9 +224,47 @@ globalThis.__done = loadLegacyPageImport('sid1','wiki').then(async () => {{
         "explicit selected source imported: {out}"
     );
     assert!(
-        out.contains("Legacy pages imported into this space"),
+        out.contains("Legacy pages imported locally and offered for space sync"),
         "truthful success: {out}"
     );
+}
+
+#[test]
+fn gui_legacy_pending_reload_uses_server_key_for_retry() {
+    let driver = format!(
+        r#"
+{DRIVER_PREAMBLE}
+ROUTES['GET /groups/sid1/stores/wiki/legacy-imports'] = {{ _http_ok: true, ok: true, candidates: [{{ target_group_id: 'sid1', source_store_id: 'source1', source_digest: 'digest1', keys: ['old-page'], conflicts: [], ambiguous_group_prefix: false, imported: true, publish_pending: true, publish_accepted: false, import_idempotency_key: 'durable-retry-key', can_import: true, import_refusal_reason: null }}] }};
+ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: true, ok: true, imported_locally: true, publish_accepted: true, receipt: {{}} }};
+globalThis.__done = loadLegacyPageImport('sid1','wiki').then(async () => {{
+    const panel = document.getElementById('wiki-legacy').innerHTML;
+    await importLegacyPages('sid1','wiki','source1','digest1');
+    console.log(JSON.stringify({{ panel, calls: CALLS, bodies: CALL_BODIES, toasts: TOASTS }}));
+}});
+"#
+    );
+    let (ok, out) = run_driver(&driver, "legacy_pending_retry");
+    assert!(ok, "driver failed: {out}");
+    let value: serde_json::Value =
+        serde_json::from_str(out.lines().last().expect("driver JSON")).expect("driver JSON");
+    let panel = value["panel"].as_str().expect("panel");
+    assert!(panel.contains("sharing has not been accepted"), "{out}");
+    assert!(
+        panel.contains("Retry sharing this imported snapshot"),
+        "{out}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(
+        value["bodies"]
+            .as_array()
+            .expect("request bodies")
+            .iter()
+            .find_map(serde_json::Value::as_str)
+            .expect("POST body"),
+    )
+    .expect("POST JSON");
+    assert_eq!(posted["idempotency_key"], "durable-retry-key");
+    assert_eq!(posted["source_digest"], "digest1");
+    assert!(out.contains("offered for space sync"), "{out}");
 }
 
 #[test]
@@ -256,6 +294,31 @@ globalThis.__done = (async () => {{
         value["first"], value["second"],
         "retry key must remain stable"
     );
+}
+
+#[test]
+fn gui_legacy_publication_failure_reports_known_local_import() {
+    let driver = format!(
+        r#"
+{DRIVER_PREAMBLE}
+ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: false, _http_status: 503, ok: false, imported_locally: true, publish_accepted: false, idempotency_key: 'durable-key', error: 'sync publication pending' }};
+globalThis.__done = (async () => {{
+    const first=legacyImportAttemptKey('sid1','wiki','source1','digest1');
+    await importLegacyPages('sid1','wiki','source1','digest1');
+    const second=legacyImportAttemptKey('sid1','wiki','source1','digest1');
+    console.log(JSON.stringify({{ first, second, toasts: TOASTS }}));
+}})();
+"#
+    );
+    let (ok, out) = run_driver(&driver, "legacy_publish_pending");
+    assert!(ok, "driver failed: {out}");
+    assert!(
+        out.contains("imported locally; sharing is pending"),
+        "{out}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(out.lines().last().expect("driver JSON")).expect("driver JSON");
+    assert_eq!(value["first"], value["second"], "retry key remains stable");
 }
 
 #[test]
@@ -289,12 +352,14 @@ globalThis.__done = loadLegacyPageImport('sid1','web').then(() => console.log(do
 /// modal inputs, and provide a small routing table.
 const DRIVER_PREAMBLE: &str = r#"
 const CALLS = [];
+const CALL_BODIES = [];
 const TOASTS = [];
 toast = (msg, type) => { TOASTS.push({ msg: String(msg), type: type || 'info' }); };
 let ROUTES = {};
 api = async (path, opt) => {
     const method = (opt && opt.method) || 'GET';
     CALLS.push(method + ' ' + path);
+    if (opt && opt.body) CALL_BODIES.push(opt.body);
     const key = method + ' ' + path;
     const r = (ROUTES[key] !== undefined) ? ROUTES[key] : { _http_ok: true, ok: true };
     return Object.assign({}, r);

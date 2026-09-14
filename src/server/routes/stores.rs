@@ -44,6 +44,9 @@ struct LegacyStoreCandidate {
     ambiguous_group_prefix: bool,
     conflicts: Vec<String>,
     imported: bool,
+    publish_pending: bool,
+    publish_accepted: bool,
+    import_idempotency_key: Option<String>,
     can_import: bool,
     import_refusal_reason: Option<String>,
 }
@@ -2178,34 +2181,42 @@ pub(in crate::server) async fn list_legacy_page_imports(
         }
         None => Vec::new(),
     };
-    let candidates = source.into_iter().map(|source| LegacyStoreCandidate {
-        target_group_id: stable_group_id.clone(),
-        imported: receipts.iter().any(|receipt| {
+    let candidates = source.into_iter().map(|source| {
+        let receipt = receipts.iter().find(|receipt| {
             receipt.group_id == stable_group_id
                 && receipt.app == app
                 && receipt.source_store_id == source.store_id_hex
                 && receipt.source_digest == source.digest
-        }),
-        source_store_id: source.store_id_hex,
-        topic: source.topic,
-        owner: hex::encode(source.owner.as_bytes()),
-        source_digest: source.digest,
-        active_keys: source.store.active_keys().len(),
-        keys: {
-            let mut keys = source
-                .store
-                .active_keys()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            keys.sort();
-            keys
-        },
-        ambiguous_group_prefix: ambiguous,
-        conflicts: conflicts.clone(),
-        can_import,
-        import_refusal_reason: (!can_import)
-            .then(|| "your current group role cannot endorse legacy history".to_string()),
+        });
+        LegacyStoreCandidate {
+            target_group_id: stable_group_id.clone(),
+            imported: receipt.is_some(),
+            publish_pending: receipt
+                .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_none()),
+            publish_accepted: receipt
+                .is_some_and(|receipt| receipt.publish_accepted_at_ms.is_some()),
+            import_idempotency_key: receipt.map(|receipt| receipt.idempotency_key.clone()),
+            source_store_id: source.store_id_hex,
+            topic: source.topic,
+            owner: hex::encode(source.owner.as_bytes()),
+            source_digest: source.digest,
+            active_keys: source.store.active_keys().len(),
+            keys: {
+                let mut keys = source
+                    .store
+                    .active_keys()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys
+            },
+            ambiguous_group_prefix: ambiguous,
+            conflicts: conflicts.clone(),
+            can_import,
+            import_refusal_reason: (!can_import)
+                .then(|| "your current group role cannot endorse legacy history".to_string()),
+        }
     });
     (
         StatusCode::OK,
@@ -2276,7 +2287,7 @@ pub(in crate::server) async fn import_legacy_page_store(
     .await;
     let _reservation_guard = reservation.lock().await;
     let membership = super::named_groups::group_membership_lock(&state, &id).await;
-    let _membership_guard = membership.lock().await;
+    let membership_guard = membership.lock().await;
     let (binding, authority_binding, public, treekem) = {
         let groups = state.named_groups.read().await;
         let (_, info) = match find_store_group(&groups, &id) {
@@ -2325,45 +2336,61 @@ pub(in crate::server) async fn import_legacy_page_store(
             )
         }
     };
-    if let Some(existing) = receipts
+    let existing_receipt = receipts
         .iter()
         .find(|receipt| receipt.idempotency_key == request.idempotency_key)
-    {
+        .cloned();
+    if let Some(existing) = existing_receipt.as_ref() {
         let same = existing.group_id == binding.stable_group_id
             && existing.app == app
             && existing.source_store_id == source_id
             && existing.source_digest == request.source_digest;
-        return if same {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "receipt": existing})),
-            )
-        } else {
-            api_error(
+        if !same {
+            return api_error(
                 StatusCode::CONFLICT,
                 "idempotency key already binds different import arguments",
-            )
-        };
+            );
+        }
+        if existing.publish_accepted_at_ms.is_some() {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true, "receipt": existing,
+                    "imported_locally": true, "publish_accepted": true
+                })),
+            );
+        }
     }
-    let source =
+    let source = if existing_receipt.is_none() {
         match load_legacy_page_store(&state, &binding.stable_group_id, app, Some(&source_id)).await
         {
-            Ok(Some(source)) => source,
+            Ok(Some(source)) => Some(source),
             Ok(None) => return not_found("legacy source is not registered on this device"),
             Err(response) => return response,
-        };
-    if source.digest != request.source_digest {
+        }
+    } else {
+        // Pending retries publish the already-persisted canonical image and
+        // never remerge or create a duplicate receipt.
+        None
+    };
+    if source
+        .as_ref()
+        .is_some_and(|source| source.digest != request.source_digest)
+    {
         return api_error(
             StatusCode::CONFLICT,
             "legacy source changed after it was reviewed",
         );
     }
-    if let Err(error) = x0x::kv::KvStore::validate_legacy_signed_source(&source.store, source.owner)
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            format!("legacy source content is invalid: {error}"),
-        );
+    if let Some(source) = source.as_ref() {
+        if let Err(error) =
+            x0x::kv::KvStore::validate_legacy_signed_source(&source.store, source.owner)
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("legacy source content is invalid: {error}"),
+            );
+        }
     }
     let (handle, created) = if public {
         match open_bound_public_store(&state, &binding).await {
@@ -2388,42 +2415,92 @@ pub(in crate::server) async fn import_legacy_page_store(
             .await
             .insert(binding.topic.clone(), handle.clone());
     }
-    let conflicts = handle.legacy_import_conflicts(&source.store).await;
-    let before = handle.retained_content_digest_hex().await;
-    if let Err(error) = handle
-        .import_legacy_signed_history(&source.store, source.owner)
-        .await
-    {
-        return match error {
-            x0x::error::IdentityError::Unauthorized(message) => forbidden(message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    let (receipt, conflicts) = if let Some(existing) = existing_receipt {
+        (existing, Vec::new())
+    } else {
+        let Some(source) = source else {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "legacy source unavailable",
+            );
         };
-    }
-    let after = handle.retained_content_digest_hex().await;
-    let receipt = super::super::legacy_store_migration::new_receipt(
-        super::super::legacy_store_migration::LegacyImportReceiptInput {
-            idempotency_key: request.idempotency_key,
-            group_id: binding.stable_group_id,
-            app: app.to_string(),
-            source_store_id: source.store_id_hex,
-            source_digest: source.digest,
-            endorser: hex::encode(state.agent.agent_id().as_bytes()),
-            authority_binding,
-            destination_digest_before: before,
-            destination_digest_after: after,
-        },
-    );
-    if let Err(error) =
-        super::super::legacy_store_migration::append_receipt(&receipt_path, receipt.clone()).await
-    {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("destination persisted but import receipt did not: {error}"),
+        let conflicts = handle.legacy_import_conflicts(&source.store).await;
+        let before = handle.retained_content_digest_hex().await;
+        if let Err(error) = handle
+            .import_legacy_signed_history(&source.store, source.owner)
+            .await
+        {
+            return match error {
+                x0x::error::IdentityError::Unauthorized(message) => forbidden(message),
+                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            };
+        }
+        let after = handle.retained_content_digest_hex().await;
+        let receipt = super::super::legacy_store_migration::new_receipt(
+            super::super::legacy_store_migration::LegacyImportReceiptInput {
+                idempotency_key: request.idempotency_key,
+                group_id: binding.stable_group_id,
+                app: app.to_string(),
+                source_store_id: source.store_id_hex,
+                source_digest: source.digest,
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding,
+                destination_digest_before: before,
+                destination_digest_after: after,
+            },
+        );
+        if let Err(error) =
+            super::super::legacy_store_migration::append_receipt(&receipt_path, receipt.clone())
+                .await
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("destination persisted but import receipt did not: {error}"),
+            );
+        }
+        (receipt, conflicts)
+    };
+    drop(membership_guard);
+    if let Err(error) = handle.publish_retained_group_history().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("import persisted locally but sync publication is pending: {error}"),
+                "receipt": receipt,
+                "idempotency_key": receipt.idempotency_key,
+                "imported_locally": true,
+                "publish_accepted": false,
+            })),
         );
     }
+    let accepted = match super::super::legacy_store_migration::mark_publish_accepted(
+        &receipt_path,
+        &receipt.idempotency_key,
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("import persisted and publication was accepted, but receipt status remains pending: {error}"),
+                    "receipt": receipt,
+                    "idempotency_key": receipt.idempotency_key,
+                    "imported_locally": true,
+                    "publish_accepted": false,
+                })),
+            )
+        }
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "receipt": receipt, "conflicts": conflicts})),
+        Json(serde_json::json!({
+            "ok": true, "receipt": accepted, "conflicts": conflicts,
+            "imported_locally": true, "publish_accepted": true
+        })),
     )
 }
 
@@ -2920,6 +2997,206 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_partial_publication_is_pending_and_exact_retry_marks_accepted() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "92".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .expect("group")
+            .policy
+            .write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        for index in 0..17 {
+            source_handle
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                )
+                .await
+                .expect("large retained source entry");
+        }
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic");
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(topic)
+            .cloned()
+            .expect("destination handle");
+        handle.fail_retained_publish_after_for_test(1);
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let request = || ImportLegacyStoreRequest {
+            source_digest: digest.clone(),
+            idempotency_key: "partial-publish".to_string(),
+        };
+        let (code, failed) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{failed:?}");
+        assert_eq!(failed.0["imported_locally"], true);
+        assert_eq!(failed.0["publish_accepted"], false);
+        assert_eq!(handle.retained_publish_accepted_for_test(), 1);
+        assert!(
+            handle
+                .get("legacy-only")
+                .await
+                .expect("imported read")
+                .is_some(),
+            "partial publication never rolls back the persisted import"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        let pending = crate::server::legacy_store_migration::read_receipts(&receipt_path)
+            .await
+            .expect("pending receipt");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].publish_accepted_at_ms, None);
+        let (_, pending_listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let pending_candidate = &pending_listing.0["candidates"][0];
+        assert_eq!(pending_candidate["imported"], true);
+        assert_eq!(pending_candidate["publish_pending"], true);
+        assert_eq!(pending_candidate["publish_accepted"], false);
+        assert_eq!(
+            pending_candidate["import_idempotency_key"],
+            "partial-publish"
+        );
+        source_handle
+            .put(
+                "after-reviewed-snapshot".to_string(),
+                b"must not merge on retry".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("mutate source after reviewed import");
+
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group")
+                .members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Member;
+        }
+        let (code, _) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::FORBIDDEN,
+            "pending retry must reauthorize"
+        );
+        assert_eq!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("still pending")[0]
+                .publish_accepted_at_ms,
+            None
+        );
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group")
+                .members_v2
+                .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+                .expect("local member")
+                .role = crate::groups::GroupRole::Admin;
+        }
+        handle.clear_retained_publish_failure_for_test();
+        let (code, retried) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{retried:?}");
+        assert_eq!(retried.0["publish_accepted"], true);
+        let accepted = crate::server::legacy_store_migration::read_receipts(&receipt_path)
+            .await
+            .expect("accepted receipt");
+        assert_eq!(accepted.len(), 1, "retry must not duplicate receipt");
+        assert!(accepted[0].publish_accepted_at_ms.is_some());
+        assert!(
+            handle
+                .get("after-reviewed-snapshot")
+                .await
+                .expect("read canonical after retry")
+                .is_none(),
+            "pending retry republishes the persisted canonical image without remerging source"
+        );
+        let accepted_frames = handle.retained_publish_accepted_for_test();
+        let (code, accepted_repeat) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id.clone())),
+            Extension(owner_actor()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{accepted_repeat:?}");
+        assert_eq!(accepted_repeat.0["publish_accepted"], true);
+        assert_eq!(
+            handle.retained_publish_accepted_for_test(),
+            accepted_frames,
+            "accepted retry does not publish again"
+        );
+
+        let (code, _) = import_legacy_page_store(
+            State(state),
+            Path((group_id, "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: "changed".to_string(),
+                idempotency_key: "partial-publish".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
     }
 
     #[cfg(unix)]
