@@ -1689,6 +1689,9 @@ enum GroupStoreLegacySub {
         /// Exact source store ID returned by `legacy imports`.
         #[arg(value_name = "SOURCE_ID")]
         source_id: String,
+        /// Stable key returned for a pending import snapshot.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Import one reviewed snapshot under the current writer's endorsement.
     Import {
@@ -2446,7 +2449,9 @@ async fn run(
                     commands::exec::cancel(&client, &request_id, agent_id.as_deref()).await
                 } else {
                     let Some(agent_id) = agent_id else {
-                        anyhow::bail!("usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>");
+                        anyhow::bail!(
+                            "usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>"
+                        );
                     };
                     commands::exec::run(
                         &client,
@@ -2743,10 +2748,18 @@ async fn run(
                                 group_id,
                                 app,
                                 source_id,
+                                idempotency_key,
                             },
                     },
             }) => {
-                commands::group::legacy_store_download(&client, &group_id, &app, &source_id).await
+                commands::group::legacy_store_download(
+                    &client,
+                    &group_id,
+                    &app,
+                    &source_id,
+                    idempotency_key.as_deref(),
+                )
+                .await
             }
             Some(GroupSub::Store {
                 sub:
@@ -3442,6 +3455,40 @@ mod tests {
                 Ok(())
             }
             _ => anyhow::bail!("expected group update with --new-name"),
+        }
+    }
+
+    #[test]
+    fn legacy_download_pending_key_requires_and_retains_value() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "x0x",
+            "group",
+            "store",
+            "legacy",
+            "download",
+            "group",
+            "wiki",
+            "source",
+            "--idempotency-key",
+            "retry-key",
+        ])?;
+        match cli.command {
+            Commands::Group {
+                sub:
+                    Some(GroupSub::Store {
+                        sub:
+                            GroupStoreSub::Legacy {
+                                sub:
+                                    GroupStoreLegacySub::Download {
+                                        idempotency_key, ..
+                                    },
+                            },
+                    }),
+            } => {
+                assert_eq!(idempotency_key.as_deref(), Some("retry-key"));
+                Ok(())
+            }
+            _ => anyhow::bail!("expected legacy download with a valued retry key"),
         }
     }
 }

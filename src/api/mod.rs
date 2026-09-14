@@ -252,7 +252,10 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group store legacy download",
         description: "Download the exact reviewed legacy Wiki/Web snapshot without changing it",
         category: "stores",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query(
+            "idempotency_key",
+            false,
+        )]),
     },
     EndpointDef {
         method: Method::Post,
