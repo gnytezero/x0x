@@ -2630,21 +2630,35 @@ impl KvStore {
                 "retained group image has a foreign store/group/owner binding".to_string(),
             ));
         }
-        self.keys
+        // Validate the complete incoming image before touching local state.
+        for (key, entry) in &other.entries {
+            validate_entry_integrity(key, entry)?;
+            if entry.value.len() > crate::kv::entry::MAX_INLINE_SIZE {
+                return Err(KvError::ValueTooLarge {
+                    size: entry.value.len(),
+                    max: crate::kv::entry::MAX_INLINE_SIZE,
+                });
+            }
+        }
+
+        let mut trial = self.clone();
+        trial
+            .keys
             .merge_state(&other.keys)
             .map_err(|e| KvError::Merge(format!("OR-Set image merge failed: {e}")))?;
         for (key, entry) in &other.entries {
-            if let Some(local) = self.entries.get_mut(key) {
+            if let Some(local) = trial.entries.get_mut(key) {
                 local.merge(entry);
             } else {
-                self.entries.insert(key.clone(), entry.clone());
+                trial.entries.insert(key.clone(), entry.clone());
             }
         }
         // Remote images contribute retained content only. Identity, policy,
         // checkpoint authority, allowlists, and local sequence state remain
         // locally anchored.
-        self.last_history_endorser = Some(endorser);
-        self.version = self.version.saturating_add(1);
+        trial.last_history_endorser = Some(endorser);
+        trial.version = self.version.saturating_add(1);
+        *self = trial;
         Ok(())
     }
 
@@ -3913,6 +3927,78 @@ mod tests {
         assert!(target.get("remote").is_none());
         assert_eq!(target.name(), "Wiki");
         assert!(!target.allowed_writers.contains(&agent(9)));
+    }
+
+    #[test]
+    fn group_signed_retained_image_rejects_invalid_entries_atomically() {
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let id = store_id(10);
+        let group = vec![7u8; 16];
+        let mut target =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group.clone(), ctx.clone())
+                .expect("target");
+        target
+            .put(
+                "local".to_string(),
+                b"keep".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("local");
+        let before = bincode::serialize(&target).expect("snapshot target");
+
+        let mut hostile =
+            KvStore::new_group_signed(id, "Wiki".to_string(), owner, group, ctx).expect("hostile");
+        hostile
+            .put(
+                "valid".to_string(),
+                b"new".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("valid");
+        hostile
+            .put(
+                "bad".to_string(),
+                b"bad".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("bad");
+        hostile
+            .entries
+            .get_mut("bad")
+            .expect("bad entry")
+            .content_hash = [0; 32];
+
+        assert!(target.merge_group_signed_image(&hostile, owner).is_err());
+        assert_eq!(
+            bincode::serialize(&target).expect("unchanged target"),
+            before
+        );
+
+        let bad = hostile.entries.get_mut("bad").expect("bad entry");
+        bad.content_hash = *blake3::hash(&bad.value).as_bytes();
+        bad.key = "wrong-map-key".to_string();
+        assert!(target.merge_group_signed_image(&hostile, owner).is_err());
+        assert_eq!(
+            bincode::serialize(&target).expect("unchanged target"),
+            before
+        );
+
+        let bad = hostile.entries.get_mut("bad").expect("bad entry");
+        bad.key = "bad".to_string();
+        bad.value = vec![0; crate::kv::entry::MAX_INLINE_SIZE + 1];
+        bad.content_hash = *blake3::hash(&bad.value).as_bytes();
+        assert!(matches!(
+            target.merge_group_signed_image(&hostile, owner),
+            Err(KvError::ValueTooLarge { .. })
+        ));
+        assert_eq!(
+            bincode::serialize(&target).expect("unchanged target"),
+            before
+        );
     }
 
     #[test]

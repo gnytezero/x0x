@@ -100,6 +100,7 @@ impl PublicState {
             write_access: info.policy.write_access,
             writers,
             valid: !info.withdrawn
+                && !info.is_fork_quarantined()
                 && info.policy.confidentiality == GroupConfidentiality::SignedPublic,
         }
     }
@@ -220,11 +221,11 @@ impl KvSecureContext for PublicGroupKvContext {
     }
 
     fn is_active_member(&self, agent: &AgentId) -> bool {
-        self.state
+        let state = self
+            .state
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .writers
-            .contains_key(agent)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.valid && state.writers.contains_key(agent)
     }
 
     fn is_authorized_writer(&self, agent: &AgentId) -> bool {
@@ -272,6 +273,38 @@ impl KvSecureContext for PublicGroupKvContext {
             state.state_revision,
             signing,
             kind,
+            store_id,
+            &payload,
+        )
+    }
+
+    fn sign_control_authorized(
+        &self,
+        signing: &AuthorSigning,
+        store_id: &KvStoreId,
+        payload: &[u8],
+        reader_only: bool,
+    ) -> Result<crate::kv::encrypted::SignedKvMutation> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let authorized = if reader_only {
+            state.authorizes_reader(&signing.agent_id)
+        } else {
+            state.authorizes(&signing.agent_id)
+        };
+        if !authorized {
+            return Err(KvError::Unauthorized(
+                "public group control message refused by current policy".to_string(),
+            ));
+        }
+        let payload = bind_public_payload(state.authorization_binding(), payload);
+        crate::kv::encrypted::sign_mutation_with_snapshot(
+            state.stable_group_id.as_bytes().to_vec(),
+            state.state_revision,
+            signing,
+            KvMutationKind::Control,
             store_id,
             &payload,
         )
@@ -846,5 +879,24 @@ mod tests {
         info.policy.write_access = GroupWriteAccess::ModeratedPublic;
         ctx.update_from_group(&info);
         assert!(!ctx.is_authorized_writer(&owner));
+
+        let terminal = info.terminal_commit_header();
+        info.fork_quarantine = Some(crate::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+            committed_by: hex::encode(owner.as_bytes()),
+            observed_at_ms: 1,
+            snapshot: crate::groups::ForkSnapshot {
+                terminal_commit: terminal.clone(),
+                conflicting_commit: terminal,
+                classification: Some("signer_only".to_string()),
+            },
+            no_anchor: false,
+        });
+        info.policy.write_access = GroupWriteAccess::MembersOnly;
+        ctx.update_from_group(&info);
+        assert!(!ctx.is_active_member(&owner));
+        assert!(!ctx.is_authorized_writer(&owner));
+        assert!(!ctx.is_authorized_reader(&owner));
     }
 }

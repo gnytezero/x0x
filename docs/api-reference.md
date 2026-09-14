@@ -1099,7 +1099,7 @@ helper API.
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
-| POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a deterministic GSS encrypted KV store for an active group member |
+| POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
 | GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set display name in group. Body `{"name":"<display name>"}` |
@@ -1135,18 +1135,22 @@ helper API.
 | POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Attempt to open a `SecureShareDelivered` envelope with this daemon's KEM key (adversarial test) |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. A sole-member leave deletes the group (`{"ok":true,"deleted":...}`); otherwise the last admin is blocked — promote another admin first or use `x0x group delete` |
 
-### `POST /groups/:id/stores` — group encrypted store
+### `POST /groups/:id/stores` — group store
 
 This bearer-authenticated owner route accepts either the durable API token or a
 session token. Rider tokens cannot reach it: the deny-by-default middleware
-returns `403` before the handler, regardless of a rider's group grants. The
-daemon's own agent must also be an active member of the requested group.
+returns `403` before the handler, regardless of a rider's group grants. For
+`MlsEncrypted` groups the daemon's own agent must be an active member. For
+`SignedPublic` groups, public-read policy permits nonmembers to open and read;
+members-only read policy requires an active member. Writes always follow the
+current group role and write policy.
 
 The body is `{"name":"<store name>"}`. The name is trimmed and must remain
 non-empty. Store identity and topic are deterministic from the group's stable
-id plus that name, and ownership is anchored to the group creator. The group
-must be active, `MlsEncrypted`, and on the GSS secure plane; TreeKEM-plane
-groups are not supported by this endpoint.
+id plus that name, and ownership is anchored to the group creator. An active
+`SignedPublic` group gets plaintext records signed by current writers under its
+current roster and policy. An active `MlsEncrypted` group gets encrypted GSS
+records. TreeKEM-plane encrypted groups are not supported by this endpoint.
 
 A new local store returns `201`; an already-open store returns `200` with the
 same identity. Both responses contain:

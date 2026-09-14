@@ -2814,7 +2814,7 @@
     {
       "category": "stores",
       "cli_name": "group store create",
-      "description": "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+      "description": "Open a creator-anchored group store: signed plaintext for SignedPublic, encrypted for MlsEncrypted GSS; current group policy gates writes",
       "method": "POST",
       "path": "/groups/:id/stores",
       "request": {
