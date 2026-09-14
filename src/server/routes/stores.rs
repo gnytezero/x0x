@@ -531,9 +531,12 @@ pub(in crate::server) async fn list_kv_keys(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let Some(handle) = stores.get(&id) else {
-        return not_found("store not found");
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        let Some(handle) = stores.get(&id) else {
+            return not_found("store not found");
+        };
+        handle.clone()
     };
 
     match handle.keys().await {
@@ -554,6 +557,9 @@ pub(in crate::server) async fn list_kv_keys(
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "keys": keys })),
             )
+        }
+        Err(e) if matches!(e, x0x::error::IdentityError::Unauthorized(_)) => {
+            api_error(StatusCode::FORBIDDEN, format!("{e}"))
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -590,7 +596,7 @@ pub(in crate::server) async fn put_kv_value(
             // #341 Phase B: encrypted stores replicate ONLY via the sealed
             // gossip path — never ship the plaintext local delta over the
             // DM direct-delivery side channel.
-            if !handle.is_encrypted().await {
+            if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
@@ -624,9 +630,12 @@ pub(in crate::server) async fn get_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let Some(handle) = stores.get(&id) else {
-        return not_found("store not found");
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        let Some(handle) = stores.get(&id) else {
+            return not_found("store not found");
+        };
+        handle.clone()
     };
 
     match handle.get(&key).await {
@@ -648,6 +657,9 @@ pub(in crate::server) async fn get_kv_value(
             )
         }
         Ok(None) => not_found("key not found"),
+        Err(e) if matches!(e, x0x::error::IdentityError::Unauthorized(_)) => {
+            api_error(StatusCode::FORBIDDEN, format!("{e}"))
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
@@ -669,7 +681,7 @@ pub(in crate::server) async fn delete_kv_value(
         Ok(delta) => {
             // #341 Phase B: see put_kv_value — no plaintext DM fallback for
             // encrypted stores.
-            if !handle.is_encrypted().await {
+            if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
@@ -786,7 +798,7 @@ fn resolve_public_group_store(
     groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
     id: &str,
     name: &str,
-    _caller: &AgentId,
+    caller: &AgentId,
 ) -> Result<GssGroupStoreBinding, GroupStoreResponse> {
     let name = name.trim();
     if name.is_empty() {
@@ -802,6 +814,13 @@ fn resolve_public_group_store(
     if info.policy.write_access == x0x::groups::GroupWriteAccess::ModeratedPublic {
         return Err(bad_request(
             "ModeratedPublic group stores are unsupported without a moderation protocol",
+        ));
+    }
+    if info.policy.read_access == x0x::groups::GroupReadAccess::MembersOnly
+        && !info.has_active_member(&hex::encode(caller.as_bytes()))
+    {
+        return Err(forbidden(
+            "public group store is restricted to current members",
         ));
     }
     let stable_group_id = info.stable_group_id().to_string();
@@ -820,6 +839,7 @@ fn refresh_public_store_binding(
     ctx: &x0x::groups::PublicGroupKvContext,
     info: Option<&x0x::groups::GroupInfo>,
     creator: AgentId,
+    caller: &AgentId,
 ) -> bool {
     if let Some(info) = info {
         if info.creator == creator
@@ -827,6 +847,8 @@ fn refresh_public_store_binding(
             && !info.withdrawn
             && info.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
             && info.policy.write_access != x0x::groups::GroupWriteAccess::ModeratedPublic
+            && (info.policy.read_access == x0x::groups::GroupReadAccess::Public
+                || info.has_active_member(&hex::encode(caller.as_bytes())))
         {
             ctx.update_from_group(info);
             return true;
@@ -852,7 +874,12 @@ fn public_kv_refresh(
         Box::pin(async move {
             let valid = {
                 let groups = state.named_groups.read().await;
-                refresh_public_store_binding(&ctx, groups.get(&group_key), creator)
+                refresh_public_store_binding(
+                    &ctx,
+                    groups.get(&group_key),
+                    creator,
+                    &state.agent.agent_id(),
+                )
             };
             if !valid {
                 tracing::warn!(target: "x0x::kv", "retiring public group store {topic}: group binding is no longer eligible");
@@ -1063,7 +1090,14 @@ async fn open_bound_public_store(
                 .ok_or_else(|| bad_request("group is not SignedPublic"))?,
         )
     };
-    if let Some(handle) = state.kv_stores.read().await.get(&expected.topic).cloned() {
+    // Drop the map read guard before any mismatch cleanup takes the write
+    // guard. In edition 2021 an `if let` scrutinee temporary otherwise lives
+    // through the whole arm and self-deadlocks on `write().await` below.
+    let cached = {
+        let stores = state.kv_stores.read().await;
+        stores.get(&expected.topic).cloned()
+    };
+    if let Some(handle) = cached {
         if handle
             .validate_group_binding(
                 &expected.name,
@@ -1409,6 +1443,35 @@ mod tests {
     }
 
     #[test]
+    fn signed_public_store_resolver_enforces_current_read_axis() {
+        let group_id = "13".repeat(16);
+        let creator = AgentId([1; 32]);
+        let outsider = AgentId([2; 32]);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            creator,
+            group_id.clone(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let mut groups = std::collections::HashMap::from([(group_id.clone(), info)]);
+        assert!(resolve_public_group_store(&groups, &group_id, "Wiki", &outsider).is_ok());
+
+        let info = groups.get_mut(&group_id).expect("group");
+        info.policy.read_access = crate::groups::GroupReadAccess::MembersOnly;
+        assert!(resolve_public_group_store(&groups, &group_id, "Wiki", &outsider).is_err());
+        groups.get_mut(&group_id).expect("group").add_member(
+            hex::encode(outsider.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(creator.as_bytes())),
+            None,
+        );
+        assert!(resolve_public_group_store(&groups, &group_id, "Wiki", &outsider).is_ok());
+    }
+
+    #[test]
     fn issue565_resolver_and_refresh_reject_ineligible_binding_and_fence_clones() {
         let gid = "ab".repeat(16);
         let base = binding_fixture(&gid);
@@ -1554,8 +1617,11 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         let agent = Arc::new(
             x0x::Agent::builder()
+                .with_identity_dir(&data_dir)
                 .with_machine_key(data_dir.join("machine.key"))
                 .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))
                 .with_network_config(test_network_config())
                 .build()
@@ -1874,5 +1940,169 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST, "{resp:?}");
         let _ = GssKvSecureContext::from_group; // keep backend import referenced
         let _ = GroupPolicy::default();
+    }
+
+    #[tokio::test]
+    async fn public_store_cached_binding_mismatch_returns_without_deadlock() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "34".repeat(16);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &state.agent.agent_id())
+                .expect("binding")
+        };
+        let wrong = state
+            .agent
+            .create_kv_store("wrong", "wrong/topic")
+            .await
+            .expect("wrong cached handle");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), wrong);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            open_bound_public_store(&state, &binding),
+        )
+        .await
+        .expect("mismatch cleanup must not deadlock");
+        assert!(result.is_err(), "mismatched cached handle must fail closed");
+        assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
+    }
+
+    #[tokio::test]
+    async fn cached_public_store_read_refresh_rejects_removed_member() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "56".repeat(16);
+        let local = state.agent.agent_id();
+        let creator = AgentId([8; 32]);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            creator,
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::MembersOnly;
+        info.add_member(
+            hex::encode(local.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(creator.as_bytes())),
+            None,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &local).expect("binding")
+        };
+        let (handle, _, _) = open_bound_public_store(&state, &binding)
+            .await
+            .expect("open member store");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+        handle
+            .put(
+                "visible".to_string(),
+                b"value".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("member write");
+        assert!(handle.get("visible").await.expect("member read").is_some());
+        let version_before = handle.ownership_info().await.version;
+
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_key)
+            .expect("group")
+            .remove_member(&hex::encode(local.as_bytes()), None);
+        assert!(handle
+            .put(
+                "late".to_string(),
+                b"denied".to_vec(),
+                "text/plain".to_string()
+            )
+            .await
+            .is_err());
+        assert_eq!(handle.ownership_info().await.version, version_before);
+        let mut direct = x0x::kv::KvStoreDelta::new(version_before + 1);
+        direct.added.insert(
+            "direct".to_string(),
+            (
+                x0x::kv::KvEntry::new(
+                    "direct".to_string(),
+                    b"denied".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (saorsa_gossip_types::PeerId::new([9; 32]), 1),
+            ),
+        );
+        assert!(handle
+            .apply_remote_delta(
+                saorsa_gossip_types::PeerId::new([9; 32]),
+                &direct,
+                Some(local)
+            )
+            .await
+            .is_err());
+        assert_eq!(handle.ownership_info().await.version, version_before);
+
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+        let get_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_kv_value(
+                State(Arc::clone(&state)),
+                Path((binding.topic.clone(), "visible".to_string())),
+            ),
+        )
+        .await
+        .expect("GET must not deadlock")
+        .into_response();
+        assert_eq!(get_response.status(), StatusCode::FORBIDDEN);
+
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle);
+        let keys_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            list_kv_keys(State(Arc::clone(&state)), Path(binding.topic.clone())),
+        )
+        .await
+        .expect("keys listing must not deadlock")
+        .into_response();
+        assert_eq!(keys_response.status(), StatusCode::FORBIDDEN);
+        assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
     }
 }

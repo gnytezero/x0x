@@ -289,6 +289,12 @@ pub trait KvSecureContext: Send + Sync {
         self.is_active_member(agent)
     }
 
+    /// Whether `agent` may read or request current state under the group's
+    /// read policy. Confidential contexts default to active membership.
+    fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+        self.is_active_member(agent)
+    }
+
     /// Current public roster/policy commitment. Encrypted contexts have no
     /// plaintext authorization binding and return `None`.
     fn authorization_binding(&self) -> Option<[u8; 32]> {
@@ -322,7 +328,7 @@ pub trait KvSecureContext: Send + Sync {
     fn invalidate(&self);
 }
 
-/// Bind a public mutation payload to the exact current roster and write
+/// Bind a public mutation payload to the exact current roster and read/write
 /// policy. The resulting bytes remain inside the existing signed v1 payload,
 /// preserving the encrypted mutation envelope format.
 #[must_use]

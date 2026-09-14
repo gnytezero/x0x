@@ -28,7 +28,7 @@
 //! effect on the next record, and a removed member fails the membership
 //! check on its next write attempt.
 
-use super::{GroupConfidentiality, GroupInfo, GroupRole, GroupWriteAccess};
+use super::{GroupConfidentiality, GroupInfo, GroupReadAccess, GroupRole, GroupWriteAccess};
 use crate::identity::AgentId;
 use crate::kv::encrypted::{
     bind_public_payload, encrypted_record_aad, seal_mutation_with_snapshot, store_record_key,
@@ -80,6 +80,7 @@ struct PublicState {
     stable_group_id: String,
     state_revision: u64,
     roster_root: String,
+    read_access: GroupReadAccess,
     write_access: GroupWriteAccess,
     writers: std::collections::HashMap<AgentId, GroupRole>,
     valid: bool,
@@ -95,6 +96,7 @@ impl PublicState {
             stable_group_id: info.stable_group_id().to_string(),
             state_revision: info.state_revision,
             roster_root: super::compute_roster_root(&info.members_v2),
+            read_access: info.policy.read_access,
             write_access: info.policy.write_access,
             writers,
             valid: !info.withdrawn
@@ -116,6 +118,14 @@ impl PublicState {
         }
     }
 
+    fn authorizes_reader(&self, agent: &AgentId) -> bool {
+        self.valid
+            && match self.read_access {
+                GroupReadAccess::Public => true,
+                GroupReadAccess::MembersOnly => self.writers.contains_key(agent),
+            }
+    }
+
     fn authorization_binding(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"x0x.kv.public-roster-policy.v1");
@@ -123,6 +133,10 @@ impl PublicState {
         hasher.update(self.stable_group_id.as_bytes());
         hasher.update(&self.state_revision.to_le_bytes());
         hasher.update(self.roster_root.as_bytes());
+        hasher.update(&[match self.read_access {
+            GroupReadAccess::Public => 0,
+            GroupReadAccess::MembersOnly => 1,
+        }]);
         hasher.update(&[match self.write_access {
             GroupWriteAccess::MembersOnly => 0,
             GroupWriteAccess::ModeratedPublic => 1,
@@ -218,6 +232,13 @@ impl KvSecureContext for PublicGroupKvContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .authorizes(agent)
+    }
+
+    fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authorizes_reader(agent)
     }
 
     fn authorization_binding(&self) -> Option<[u8; 32]> {
