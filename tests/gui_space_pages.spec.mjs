@@ -595,6 +595,7 @@ test('a save held under public cannot complete generically after the policy read
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [] } },
     'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: 'held-unavailable' } },
   };
   const seen = await mountGui(page, routes, { gate });
   await page.evaluate(() => {
@@ -846,6 +847,7 @@ test('a FAILED policy PATCH is still treated as uncertain, not as no-op', async 
     'GET /stores': { status: 200, body: { ok: true, stores: [] } },
     'POST /stores': { status: 200, body: { ok: true } },
     [`PATCH /groups/${SID}/policy`]: { status: 500, body: { ok: false, error: 'patch failed' } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: 'held-failed-patch' } },
   };
   const seen = await mountGui(page, routes, { gate });
   await page.evaluate(() => {
@@ -1000,12 +1002,14 @@ for (const [app, saver, contentId, editorId, errId] of [
 ]) {
   test(`${app}: a save whose PUT already succeeded is reported truthfully, not as unwritten`, async ({ page }) => {
     const generic = `x0x-${app}-${SID.slice(0, 16)}`;
-    const PUTKEY = `PUT /stores/${generic}/`;
+    const bound = `group-${app}-write-outcome`;
+    const PUTKEY = `PUT /stores/${bound}/`;
     const gate = makeGate([PUTKEY]);
     const routes = {
       [`GET /groups/${SID}`]: publicGroup(),
       'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
       'POST /stores': { status: 200, body: { ok: true } },
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: bound } },
       [PUTKEY]: { status: 200, body: { ok: true } },      // the write SUCCEEDS
       [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
     };
@@ -1050,12 +1054,14 @@ for (const [app, saver, contentId, editorId, errId] of [
 
 test('a read interrupted after its request cannot claim nothing was read', async ({ page }) => {
   const generic = `x0x-wiki-${SID.slice(0, 16)}`;
-  const KEYS = `GET /stores/${generic}/keys`;
+  const bound = 'group-wiki-read-outcome';
+  const KEYS = `GET /stores/${bound}/keys`;
   const gate = makeGate([KEYS]);
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
     'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: bound } },
     [KEYS]: { status: 200, body: { ok: true, keys: ['page-a'] } },
     [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
   };
