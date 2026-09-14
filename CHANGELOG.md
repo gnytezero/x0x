@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The #501 legacy-bus meter now reads the measured arms' ingress, and cuts
+  after it has drained (#613).** Two defects in how the meter *reads* D5/O5;
+  neither changes what the oracle requires. (1) `raw_sample` began at
+  saorsa-gossip's decode, so frames x0x's own receive pump discarded
+  (`recv_pump.pubsub.dropped_full`) or shed near overload (`shed_priority`,
+  ADR 0013) were invisible — "never arrived" and "arrived and was dropped
+  here" produced an identical failure line and had to be hand-classified on
+  every occurrence. The sample now carries `recv_pump` (per stream and per
+  peer) and the D5 failure reasons carry an `ingress[...]` summary keyed on
+  the generator's machine ID. (2) The t1 cut was taken at the return of the
+  200th publish — i.e. when the last *send* succeeded, not when the receiver
+  had processed it — so it measured how much the arm had processed by the
+  time the fixture looked. Measured on a quiet host: D5's bus eager egress
+  read 189 at that instant and 200 three seconds later. `measure` now waits
+  for both measured arms to stop advancing — ingress **and** the bus egress
+  the oracle actually reads, which lags it — before cutting (four unchanged
+  250 ms polls, 20 s bound, typically ~2 s), and records `load.quiescence`.
+  `load.elapsed_ns` stays the generator's load phase and excludes the
+  barrier, so `load_achieved_per_second` is unaffected. See
+  `docs/legacy-compat.md` for the measurements and for what this does **not**
+  establish about the CI occurrences of #613.
+
 ### Tests
 
 - **The #684 settle-barrier workaround is retired (closes #692).** Both

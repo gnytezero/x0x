@@ -151,3 +151,111 @@ cooling via one bounded probe per cooldown expiry, which covers every x0x
 announce/discovery/caps/release lane). The #501 meter premise therefore moves
 from 0.5.79 to **0.5.80**, checksum `2f019ae3c17a73197ff7c48b5078caa2d03b669b7c0b724e30d2037e44e868b6`.
 
+
+## 2026-09-14 — #613: the measured arms' ingress joins the record, and the t1 cut waits for it
+
+Two defects in how the #501 meter *reads* the measured arms, both found by
+running the fixture rather than from the issue narrative. Neither changes
+what the oracle requires.
+
+**1. The record began at saorsa-gossip's decode.** `raw_sample` captured the
+arm's egress, participation and `stage_stats()`. Every one of those starts
+after x0x's own receive pump has handed the frame to the gossip dispatcher.
+That pump drops PubSub frames when its bounded forward channel is full
+(`recv_pump.pubsub.dropped_full`) and proactively sheds recoverable control
+frames near overload (`shed_priority`, ADR 0013) — both silent to every
+counter the record carried. So "the generator's frames never reached this
+host" and "they reached it and x0x discarded them" produced an identical
+failure line, and each occurrence had to be hand-classified. The sample now
+carries `recv_pump` (per stream and per peer), and the D5 failure reasons
+carry a one-line `ingress[...]` summary keyed on the generator's machine ID,
+so the panic message alone separates the two.
+
+Measured on this fixture on a quiet 18-core host: the pump is nowhere near
+its limit — `max_depth` 2-3 against `capacity` 10,000, `dropped_full` 0,
+`shed_priority` 0, and D5's decoded EAGER count exactly equal to
+`produced_total`. Local shedding is therefore excluded *for these runs*; it
+was never excluded for the CI occurrences because it was never sampled.
+
+**2. The t1 cut was taken with nothing drained.** The oracle compares a
+generator count accumulated across the whole load against the arms' counters
+read at one instant, and that instant was the return of the 200th publish. A
+publish returns when the *send* succeeded, not when the receiver has
+processed the frame, so the old cut measured "how much had this arm processed
+by the time I looked". Measured: D5's bus eager egress was 189 at the old cut
+instant and 200 three seconds later — 5.5% of the load still in flight on an
+idle host. Under runner starvation that fraction has no bound and `delta == 0`
+is its limit. `measure` now waits for both measured arms to stop advancing —
+ingress **and** the bus egress the oracle actually reads — before cutting,
+and records `load.quiescence` including whether quiescence was actually
+reached. This is a premise repair, not a tolerance: the oracle's requirement
+is unchanged, the instant it reads is now a valid one.
+
+The egress term is load-bearing, and its absence was the blocking finding on
+the first version of this barrier. The oracle reads `sample_rows` over
+`egress.outbound_by_topic_named`, and that lags ingress: in the table above,
+D5 had already produced and decoded 201 at the old cut instant — ingress
+essentially complete — while its bus eager egress read 189. A barrier
+stabilising on ingress alone would have reported quiescent while the very
+quantity the oracle measures was still draining, i.e. it would have repaired
+the wrong half. Including egress cannot mask anything on the O5 arm either:
+the value that arm's oracle requires is 0, stable on the first poll, so the
+term tightens O5 rather than loosening it.
+
+`load.elapsed_ns` deliberately excludes the barrier. It is the generator's
+load phase and feeds `load_achieved_per_second` in the CI derivation;
+billing the drain to it would understate the achieved rate by roughly the
+barrier's duration and report a load the fixture did sustain as one it did
+not. The barrier's own cost lives in `load.quiescence.waited_ms`.
+
+**The cut moved — read this before distrusting the meter.** If you are
+debugging a #613-class failure on a record that has `load.quiescence`, the
+t1 sample is no longer taken at the last publish. What the barrier can and
+cannot do:
+
+- It is **bounded**: four consecutive unchanged 250 ms polls — 1 s of
+  stillness, because 500 ms is thin on exactly the starved runners this
+  targets, where one scheduling gap of that length would read as a drained
+  pipeline — over `(recv_pump.pubsub.produced_total,
+  recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, plus that
+  arm's bus outbound msgs)` on *both* measured arms, capped at 20 s and
+  wrapped in a 30 s labelled deadline so a wedged arm is still caught and
+  still attributed to this label. Measured cost on a passing run: ~1.5-1.8 s.
+- The bus kinds it watches are **per arm, and are the arm's own oracle
+  kinds**: D5 `eager + ihave` (#674 active dissemination), O5 `eager +
+  ihave + iwant + anti_entropy` (no bus egress of any kind). Both arms read
+  them from `D5_BUS_ORACLE_KINDS` / `O5_BUS_ORACLE_KINDS`, the same consts
+  `validate_measurement` sums, so the reset condition covers exactly the
+  verdict it protects by construction rather than by two lists agreeing —
+  and `load.quiescence.bus_kinds_watched` records which kinds were in force
+  for the run. A barrier watching a narrower quantity than the oracle
+  judges on is what produced the 189-vs-200 gap; these consts are what stop
+  it recurring if either oracle's kinds change.
+- On **timeout** it does not fail, retry or widen anything — it stops
+  waiting, records `"quiescent": false` with the elapsed `waited_ms`, and
+  the t1 cut is taken exactly as before. A `false` there means the arms
+  were still moving after 20 s, which is itself evidence and is why the
+  flag is recorded rather than asserted.
+- It **cannot manufacture counts**. A barrier only gives already-sent work
+  time to be processed. If frames were genuinely dropped, refused or never
+  forwarded, waiting produces no additional counts, the oracle still reads
+  zero dissemination, and the test still fails — now with the
+  `ingress[...]` attribution above. That is the property that separates
+  this from a loosened threshold: a tolerance says "a gap of N is
+  acceptable", whereas this says "measure after the system has finished,
+  not mid-flight", which is what the meter always claimed to measure.
+
+Not established by this change: whether the CI occurrences of #613 are that
+drain artefact. They did not reproduce locally (3/3 PASS on x0x v0.44.0 /
+saorsa-gossip-pubsub 0.5.80, D5 receiving 197-212 of 200 bus publications),
+and this repo has no way to run the Coverage Gate's contention locally. The
+next CI occurrence will say which of the three ingress situations it was.
+
+Also refuted while checking: the `DeliverOnly`-empties-`eager_peers`
+mechanism proposed on #613 cannot apply to the bus topic. x0x registers base
+content validators only on the identity, machine, revocation and
+`x0x.discovery.groups` topics (`src/storm_control.rs`), and with no base
+validator `RelayFanout::verdict` (`src/gossip/relay_fanout.rs`) can only
+return `ForwardAndDeliver` or `LazyForward` — and `LazyForward` queues the
+IHAVE that the #674 oracle already counts (observed live: 18 IHAVE msgs on
+D5's bus row in one local run).

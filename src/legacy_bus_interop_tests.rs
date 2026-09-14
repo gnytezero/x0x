@@ -1417,8 +1417,171 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
         .gossip_participation()
         .expect("actual participation getter");
     let stages = pubsub(agent).stage_stats();
+    // #613: the ingress side of this arm. `stages` starts at sg's decode, so
+    // a frame x0x's own receive pump discarded (bounded forward channel full,
+    // or ADR 0013 near-overload shed) is invisible to every counter this
+    // record previously carried — leaving "arrived and was dropped here" and
+    // "never arrived" indistinguishable. `recv_pump.pubsub.produced_total`
+    // counts frames read off the wire BEFORE that queue, so the pair
+    // (produced, dropped_full + shed_priority) separates them.
+    let recv_pump = agent
+        .recv_pump_diagnostics()
+        .expect("actual recv pump getter");
     serde_json::json!({"begin_ns":begin,"end_ns":diamond_now(clock),
-        "egress":egress,"participation":participation,"stages":stages})
+        "egress":egress,"participation":participation,"stages":stages,
+        "recv_pump":recv_pump})
+}
+
+/// The bus wire kinds each arm's oracle judges on. Shared by
+/// `validate_measurement` and by the drain barrier so the barrier's reset
+/// condition covers **exactly** the verdict it protects — no more and no
+/// less — by construction rather than by two lists agreeing. A barrier
+/// watching a narrower quantity than the oracle judges on is what produced
+/// the 189-vs-200 gap; these consts are what stop that recurring if either
+/// oracle's kinds change.
+///
+/// D5 is judged on active dissemination (#674: eager re-publish, or the
+/// IHAVE announce a `LazyForward` verdict withholds it for). O5 is judged on
+/// the strictly stronger claim of no bus egress of ANY kind.
+const D5_BUS_ORACLE_KINDS: [&str; 2] = ["eager", "ihave"];
+const O5_BUS_ORACLE_KINDS: [&str; 4] = ["eager", "ihave", "iwant", "anti_entropy"];
+
+/// #613: the cumulative quantities the t1 cut depends on. The bus-egress
+/// terms are load-bearing and were missing from the first version of this
+/// barrier: the oracle reads **bus egress** (`sample_rows` over
+/// `egress.outbound_by_topic_named`), and that lags ingress. In the drain
+/// probe that motivated the barrier, D5 had already produced and decoded 201
+/// at the old cut instant — ingress essentially complete — while its bus
+/// eager egress read 189. Stabilising on ingress alone would therefore
+/// report quiescent while the measured quantity was still draining.
+///
+/// `kinds` is that arm's entry from the consts above, read from the same
+/// `stage_stats().outbound_by_topic` row under the same topic key the oracle
+/// projects, so there is no parallel counter that could drift. Including
+/// egress cannot mask anything on the O5 arm: the value that arm's oracle
+/// requires is 0, stable on the first poll, so the terms tighten it.
+fn drain_counts(agent: &Agent, bus: &str, kinds: &[&str]) -> (u64, u64, u64, Vec<u64>) {
+    let pump = agent
+        .recv_pump_diagnostics()
+        .expect("actual recv pump getter");
+    let stages = pubsub(agent).stage_stats();
+    let bus_row = stages.outbound_by_topic.get(bus);
+    let bus_msgs = kinds
+        .iter()
+        .map(|kind| {
+            bus_row.map_or(0, |row| match *kind {
+                "eager" => row.eager.msgs,
+                "ihave" => row.ihave.msgs,
+                "iwant" => row.iwant.msgs,
+                "anti_entropy" => row.anti_entropy.msgs,
+                // Fail loud: silently reading 0 for a mistyped kind would
+                // leave the barrier blind to exactly what it must watch.
+                other => panic!("unknown bus wire kind {other}"),
+            })
+        })
+        .collect();
+    (
+        pump.pubsub.produced_total,
+        pump.pubsub.dequeued_total,
+        stages.message_kinds.eager,
+        bus_msgs,
+    )
+}
+
+/// #613 premise repair: the oracle compares a generator count accumulated
+/// across the whole load against the measured arms' counters read at one
+/// instant. That comparison is only valid once the pipeline the generator
+/// filled has drained: the publish returns when the SEND succeeded, not when
+/// the receiver has processed the frame, so a cut taken at the last publish
+/// measures "how much had the arm processed by the time I looked". Measured
+/// on this fixture (2026-09-14, quiet 18-core host, load 20.4 s): D5's bus
+/// eager egress was 189 at the old cut instant and 200 three seconds later —
+/// 5.5% of the load was still in flight. Under runner starvation that
+/// fraction has no bound, and "delta == 0" is its limit.
+///
+/// So wait for BOTH measured arms to stop moving — ingress AND the bus
+/// egress the oracle actually reads — before cutting. This is a quiescence
+/// barrier, not a tolerance: it does not weaken what the oracle requires, it
+/// makes the instant the oracle reads a valid one. A bounded barrier cannot
+/// manufacture counts: frames that were genuinely dropped, refused or never
+/// forwarded produce nothing extra no matter how long it waits, so a real
+/// forwarding failure still fails — now with attribution. It is bounded, it
+/// stops early in the normal case, and whether it actually reached
+/// quiescence is recorded in the evidence rather than assumed.
+async fn await_drain_quiescence(d5: &Agent, o5: &Agent) -> serde_json::Value {
+    const POLL: Duration = Duration::from_millis(250);
+    const BUDGET: Duration = Duration::from_secs(20);
+    // Four consecutive unchanged observations (1 s of stillness). Two was
+    // 500 ms, which is thin on exactly the starved runners this targets: one
+    // scheduling gap of that length would read as a drained pipeline.
+    // Measured cost at 4 is ~2 s against a 20 s cap.
+    const STABLE_POLLS: u32 = 4;
+    let bus = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    let sample = || {
+        (
+            drain_counts(d5, &bus, &D5_BUS_ORACLE_KINDS),
+            drain_counts(o5, &bus, &O5_BUS_ORACLE_KINDS),
+        )
+    };
+    let started = tokio::time::Instant::now();
+    let mut previous = sample();
+    let mut stable = 0u32;
+    let mut polls = 0u64;
+    while stable < STABLE_POLLS && started.elapsed() < BUDGET {
+        tokio::time::sleep(POLL).await;
+        polls += 1;
+        let current = sample();
+        stable = if current == previous { stable + 1 } else { 0 };
+        previous = current;
+    }
+    serde_json::json!({
+        "quiescent": stable >= STABLE_POLLS,
+        "waited_ms": started.elapsed().as_millis() as u64,
+        "polls": polls,
+        "poll_ms": POLL.as_millis() as u64,
+        "budget_ms": BUDGET.as_millis() as u64,
+        "stable_polls_required": STABLE_POLLS,
+        "counts": "per measured arm: (recv_pump.pubsub.produced_total, recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, bus outbound msgs for that arm's oracle kinds)",
+        "bus_kinds_watched": {"D5": D5_BUS_ORACLE_KINDS, "O5": O5_BUS_ORACLE_KINDS},
+        "timeout_behaviour": "records quiescent=false and cuts as before; never retries, fails or widens the oracle",
+    })
+}
+
+/// #613: what the record can say about one arm's ingress, for a failure
+/// reason. `stages` begins at saorsa-gossip's decode, so a frame x0x's own
+/// receive pump discarded was invisible to every counter this record
+/// previously carried, leaving "arrived and was dropped here" and "never
+/// arrived" indistinguishable. These are the fields that separate them.
+fn ingress_facts(sample: &serde_json::Value, generator_machine_hex: &str) -> String {
+    let pump = &sample["recv_pump"]["pubsub"];
+    let field = |value: &serde_json::Value, key: &str| -> String {
+        value[key]
+            .as_u64()
+            .map_or_else(|| "?".to_owned(), |v| v.to_string())
+    };
+    format!(
+        "ingress[produced={} enqueued={} dequeued={} dropped_full={} shed_priority={} \
+         depth={}/{} max_depth={} from_generator={} dropped_from_generator={} \
+         decoded_eager={} refused_unsubscribed={}]",
+        field(pump, "produced_total"),
+        field(pump, "enqueued_total"),
+        field(pump, "dequeued_total"),
+        field(pump, "dropped_full"),
+        field(pump, "shed_priority"),
+        field(pump, "latest_depth"),
+        field(pump, "capacity"),
+        field(pump, "max_depth"),
+        field(
+            &sample["recv_pump"]["per_peer"][generator_machine_hex],
+            "pubsub_produced"
+        ),
+        field(
+            &sample["recv_pump"]["per_peer"][generator_machine_hex],
+            "pubsub_dropped_full"
+        ),
+        field(&sample["stages"]["message_kinds"], "eager"),
+        field(&sample["participation"], "unsubscribed_refused_frames"),
+    )
 }
 
 fn sample_rows(
@@ -1465,6 +1628,10 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
     if !projected.contains(bus.as_str()) {
         return Err("bus missing from universe".into());
     }
+    // #613: the generator's machine ID keys the per-peer receive-pump rows.
+    let generator_machine_hex = raw["identities"][0]["machine"]
+        .as_str()
+        .ok_or("missing generator machine identity")?;
     for arm in ["D5", "O5"] {
         let before = &raw["samples"][arm]["t0"];
         let after = &raw["samples"][arm]["t1"];
@@ -1546,16 +1713,39 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                 .checked_sub(bus_bytes(a, kinds)?)
                 .ok_or("bus counter decreased".into())
         };
+        // #613: neither verdict on this arm is self-explaining. A D5 zero is
+        // identical for "never received the load", "x0x's own receive pump
+        // discarded it" and "received it and refused to forward"; and an O5
+        // result — including a PASS — is only trustworthy if the barrier
+        // actually settled, since nothing having drained also produces zero
+        // bus egress. Carry the facts that separate those, so an occurrence
+        // is triaged from the failure line rather than by hand.
+        let facts = || {
+            format!(
+                " [{} quiescence={}]",
+                ingress_facts(after, generator_machine_hex),
+                raw["load"]["quiescence"]["quiescent"]
+            )
+        };
         if arm == "D5" {
             if !b.contains_key(&bus) {
-                return Err("D5 positive bus row/attempt not observed".into());
+                return Err(format!(
+                    "D5 positive bus row/attempt not observed{}",
+                    facts()
+                ));
             }
             // Cached endpoint peer_scores are diagnostic only.
-            if delta(&a, &b, &["eager", "ihave"])? == 0 {
-                return Err("FAIL: D5 recorded no bus dissemination (eager or IHAVE)".into());
+            if delta(&a, &b, &D5_BUS_ORACLE_KINDS)? == 0 {
+                return Err(format!(
+                    "FAIL: D5 recorded no bus dissemination (eager or IHAVE){}",
+                    facts()
+                ));
             }
-        } else if delta(&a, &b, &["eager", "ihave", "iwant", "anti_entropy"])? != 0 {
-            return Err("FAIL: O5 recorded bus egress of any kind".into());
+        } else if delta(&a, &b, &O5_BUS_ORACLE_KINDS)? != 0 {
+            return Err(format!(
+                "FAIL: O5 recorded bus egress of any kind{}",
+                facts()
+            ));
         }
     }
     Ok(())
@@ -1695,9 +1885,34 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
             }
         }
     }).await;
+    // The generator's own phase ends HERE. `elapsed_ns` is the measured load
+    // phase and feeds `load_achieved_per_second` in the CI derivation, so the
+    // drain barrier below must not be billed to it — that would understate the
+    // achieved rate and report a load the fixture did sustain as one it did
+    // not. The barrier's own cost is recorded inside `load.quiescence`.
+    let load_elapsed = started.elapsed();
+    // #613: cut only once the quantity the oracle reads has stopped moving on
+    // both measured arms; see `await_drain_quiescence`.
+    let quiescence = bounded(
+        "post-load drain quiescence",
+        Duration::from_secs(30),
+        await_drain_quiescence(&agents[1], &agents[2]),
+    )
+    .await;
     raw["samples"]["D5"]["t1"] = raw_sample(&agents[1], clock);
     raw["samples"]["O5"]["t1"] = raw_sample(&agents[2], clock);
-    raw["load"] = json!({"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":started.elapsed().as_nanos() as u64,"fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
+    // #613: retain the ingress attribution for BOTH arms whatever the verdict.
+    // The O5 arm passes by observing zero bus egress, and "nothing drained"
+    // produces that too — so an O5 PASS is exactly the result whose
+    // trustworthiness rests on the barrier having settled, and it never
+    // reaches a failure reason where the facts could otherwise be attached.
+    let generator_machine_hex = hex::encode(agents[0].machine_id().0);
+    raw["ingress_attribution"] = json!({
+        "D5": ingress_facts(&raw["samples"]["D5"]["t1"], &generator_machine_hex),
+        "O5": ingress_facts(&raw["samples"]["O5"]["t1"], &generator_machine_hex),
+        "quiescent": quiescence["quiescent"].clone(),
+    });
+    raw["load"] = json!({"quiescence":quiescence,"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":load_elapsed.as_nanos() as u64,"elapsed_excludes":"post-load drain barrier (see load.quiescence.waited_ms)","fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
     raw["generator_diagnostics"]["cuts"]["t1"] = generator_cut(&agents[0], clock);
     attach_generator_load(&mut raw, &load_returns);
     raw["topology"]["observations"]["t1"] = bounded(
@@ -2418,4 +2633,52 @@ fn generator_ancillary_attachment_is_bounded_and_ignores_cut_totals() {
     let prior = raw["generator_diagnostics"]["load_interpretation"].clone();
     attach_generator_load(&mut raw, &calls);
     assert_eq!(raw["generator_diagnostics"]["load_interpretation"], prior);
+}
+
+/// #613: a zero-dissemination failure must name WHERE the load stopped.
+/// Three physically different situations produce the identical oracle
+/// verdict — the generator's frames never reached this host, they reached
+/// it and x0x's own bounded receive queue discarded them, or they were
+/// decoded and simply not forwarded. Before this record carried the
+/// receive pump, every occurrence had to be hand-classified. The facts
+/// line must therefore distinguish those three, which means it must read
+/// the pump (not only `stages`, which starts at saorsa-gossip's decode).
+#[test]
+fn ingress_facts_separate_non_arrival_from_local_shedding() {
+    let sample = |produced: u64, from_generator: u64, dropped: u64, decoded: u64| {
+        serde_json::json!({
+            "recv_pump": {
+                "pubsub": {"produced_total": produced, "enqueued_total": produced - dropped,
+                    "dequeued_total": produced - dropped, "dropped_full": dropped,
+                    "shed_priority": 0, "latest_depth": 0, "capacity": 10_000, "max_depth": 4},
+                "per_peer": {"aa": {"pubsub_produced": from_generator, "pubsub_dropped_full": dropped}},
+            },
+            "stages": {"message_kinds": {"eager": decoded}},
+            "participation": {"unsubscribed_refused_frames": 0},
+        })
+    };
+    let never_arrived = ingress_facts(&sample(4, 0, 0, 4), "aa");
+    let shed_locally = ingress_facts(&sample(204, 200, 196, 8), "aa");
+    let arrived_not_forwarded = ingress_facts(&sample(204, 200, 0, 204), "aa");
+    assert!(
+        never_arrived.contains("from_generator=0"),
+        "{never_arrived}"
+    );
+    assert!(
+        shed_locally.contains("from_generator=200") && shed_locally.contains("dropped_full=196"),
+        "{shed_locally}"
+    );
+    assert!(
+        arrived_not_forwarded.contains("from_generator=200")
+            && arrived_not_forwarded.contains("dropped_full=0")
+            && arrived_not_forwarded.contains("decoded_eager=204"),
+        "{arrived_not_forwarded}"
+    );
+    // All three are distinct lines: a triager reading only the panic message
+    // can tell them apart without opening the raw record.
+    assert_ne!(never_arrived, shed_locally);
+    assert_ne!(shed_locally, arrived_not_forwarded);
+    // An absent per-peer row must degrade to "?" rather than reading as zero
+    // frames from the generator, which would invert the conclusion.
+    assert!(ingress_facts(&sample(4, 0, 0, 4), "bb").contains("from_generator=?"));
 }
