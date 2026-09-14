@@ -506,7 +506,8 @@ class FleetHarness:
                 self.log.debug(
                     "cmd DM to %s attempt %d/5: %s", target, attempt, exc,
                 )
-            time.sleep(min(8, 2 * attempt))
+            if attempt < 5:
+                time.sleep(min(8, 2 * attempt))
         raise RuntimeError(
             f"cmd DM to {target} failed after 5 attempts: {last}"
         )

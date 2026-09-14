@@ -38,6 +38,17 @@ def load_mesh():
     return module
 
 
+def load_groups():
+    script = Path(__file__).with_name("e2e_vps_groups.py")
+    spec = importlib.util.spec_from_file_location("e2e_vps_groups", script)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.next_id = 1
@@ -75,6 +86,7 @@ class X0xTestRunnerTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.runner_mod = load_runner()
         cls.mesh = load_mesh()
+        cls.groups = load_groups()
 
     def test_resubscribe_replaces_stale_control_topic_subscriptions(self) -> None:
         client = FakeClient()
@@ -126,6 +138,7 @@ class X0xTestRunnerTests(unittest.TestCase):
                 None,
                 False,
                 time.monotonic(),
+                None,
             )
         )
 
@@ -200,6 +213,458 @@ class X0xTestRunnerTests(unittest.TestCase):
         self.assertTrue(first[2])
         self.assertFalse(second[2])
 
+    def _direct_command(self, runner, sender, command):
+        wire = b"x0xtest|cmd|" + base64.b64encode(json.dumps(command).encode())
+        runner._handle_direct_event(
+            "direct_message",
+            json.dumps({
+                "sender": sender,
+                "payload": base64.b64encode(wire).decode(),
+            }),
+        )
+
+    @staticmethod
+    def _command(request_id, action="group_join", **params):
+        return {
+            "command_id": request_id,
+            "target_node": "nyc",
+            "action": action,
+            "result_chunks_v2": True,
+            "params": {"request_id": request_id, **params},
+        }
+
+    @staticmethod
+    def _complete_queued_delivery(runner):
+        body, target, chunks, _, replay_key = runner._send_q.get_nowait()
+        key = runner._result_delivery_key(body, target, chunks, replay_key)
+        if key is not None:
+            with runner._queued_result_lock:
+                runner._queued_result_keys.discard(key)
+            runner._mark_replay_delivery_finished(replay_key)
+        return body
+
+    def test_duplicate_discovery_is_coalesced_in_result_queue(self) -> None:
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        command = self._command("discover-1", action="discover")
+        sender = "a" * 64
+
+        for _ in range(6):
+            self._direct_command(runner, sender, command)
+
+        self.assertEqual(1, runner._send_q.qsize())
+
+    def test_untrusted_discovery_cannot_poison_direct_replay_namespace(self) -> None:
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        sender = "a" * 64
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(params["invite"])
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        from unittest.mock import patch
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            runner._dispatch_command(
+                self._command("scope-id", invite="legacy"),
+                source_aid=sender,
+                source_authenticated=False,
+            )
+            self._direct_command(
+                runner, sender, self._command("scope-id", invite="direct"),
+            )
+
+        self.assertEqual(["legacy", "direct"], calls)
+        self.assertEqual(2, runner._send_q.qsize())
+        self.assertEqual(2, len(runner._replay))
+
+    def test_command_sender_omits_terminal_retry_sleep(self) -> None:
+        from unittest.mock import Mock, patch
+
+        client = Mock()
+        client.direct_send.side_effect = TimeoutError("no ack")
+        harness = self.groups.FleetHarness(
+            client=client,
+            router=Mock(),
+            anchor_aid="a" * 64,
+            anchor_name="nyc",
+            runners={"sfo": self.groups.Runner("sfo", "b" * 64)},
+            log=Mock(),
+        )
+        with patch.object(self.groups.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "failed after 5 attempts"):
+                harness._send_command("sfo", b"command")
+
+        self.assertEqual(5, client.direct_send.call_count)
+        self.assertEqual([2, 4, 6, 8], [call.args[0] for call in sleep.call_args_list])
+        self.assertEqual(
+            96.0,
+            self.groups.COMMAND_DISPATCH_BUDGET_SECS,
+        )
+
+    def test_duplicate_group_join_runs_once_and_reuses_completed_result(self) -> None:
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        command = self._command("join-1", invite="invite")
+        sender = "a" * 64
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        from unittest.mock import patch
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, sender, command)
+            self._direct_command(runner, sender, command)
+
+        self.assertEqual(["join-1"], calls)
+        self.assertEqual(1, runner._send_q.qsize())
+        self._complete_queued_delivery(runner)
+        self._direct_command(runner, sender, command)
+        self.assertEqual(["join-1"], calls)
+        self.assertEqual(1, runner._send_q.qsize())
+
+    def test_same_request_from_two_authenticated_senders_runs_twice(self) -> None:
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        command = self._command("shared-id", invite="invite")
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(anchor)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        from unittest.mock import patch
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, "a" * 64, command)
+            self._direct_command(runner, "b" * 64, command)
+
+        self.assertEqual(["a" * 64, "b" * 64], calls)
+
+    def test_same_sender_request_payload_conflict_is_refused(self) -> None:
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        sender = "a" * 64
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(params["invite"])
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        from unittest.mock import patch
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, sender, self._command("join-2", invite="one"))
+            self._direct_command(runner, sender, self._command("join-2", invite="two"))
+
+        self.assertEqual(["one"], calls)
+        queued = [runner._send_q.get_nowait()[0] for _ in range(2)]
+        self.assertEqual("group_join_result", queued[0]["kind"])
+        self.assertEqual("error", queued[1]["kind"])
+        self.assertIn("different command", queued[1]["outcome"]["error"])
+
+    def test_inflight_duplicate_and_capacity_pressure_never_rerun(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        first = self._command("join-live", invite="one")
+        with patch.object(self.runner_mod, "COMMAND_REPLAY_MAX_ENTRIES", 1), \
+                patch.object(runner, "_do_simple_action", side_effect=action):
+            worker = threading.Thread(
+                target=self._direct_command,
+                args=(runner, "a" * 64, first),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(timeout=2))
+            self._direct_command(runner, "a" * 64, first)
+            self._direct_command(
+                runner, "a" * 64,
+                self._command("join-pressure", invite="two"),
+            )
+            release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(["join-live"], calls)
+        queued = [runner._send_q.get_nowait()[0] for _ in range(2)]
+        self.assertEqual(["error", "group_join_result"], [x["kind"] for x in queued])
+
+    def test_replay_cache_ttl_and_byte_bound_allow_fresh_execution(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok",
+                 "details": "x" * 100},
+                anchor, chunks,
+            )
+
+        command = self._command("join-expire", invite="one")
+        clock = [0.0]
+        with patch.object(self.runner_mod, "COMMAND_REPLAY_TTL_SECS", 1), \
+                patch.object(self.runner_mod, "COMMAND_REPLAY_MAX_BYTES", 4096), \
+                patch.object(runner, "_do_simple_action", side_effect=action), \
+                patch.object(self.runner_mod.time, "monotonic",
+                             side_effect=lambda: clock[0]):
+            self._direct_command(runner, "a" * 64, command)
+            self._complete_queued_delivery(runner)
+            clock[0] = 2.0
+            self._direct_command(runner, "a" * 64, command)
+
+        self.assertEqual(["join-expire", "join-expire"], calls)
+
+        bounded = self.runner_mod.TestRunner("nyc", FakeClient())
+        bounded_calls = []
+        def bounded_action(_action, command_id, params, anchor, chunks):
+            bounded_calls.append(command_id)
+            bounded._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok",
+                 "details": "x" * 100},
+                anchor, chunks,
+            )
+        with patch.object(self.runner_mod, "COMMAND_REPLAY_MAX_BYTES", 32), \
+                patch.object(bounded, "_do_simple_action", side_effect=bounded_action):
+            self._direct_command(bounded, "b" * 64, command)
+            self.assertLessEqual(
+                bounded._replay_bytes,
+                self.runner_mod.COMMAND_REPLAY_MAX_BYTES,
+            )
+            self._complete_queued_delivery(bounded)
+            self._direct_command(bounded, "b" * 64, command)
+        self.assertEqual(0, bounded._replay_bytes)
+        self.assertEqual(1, len(bounded._replay))
+        self.assertEqual(["join-expire"], bounded_calls)
+        self.assertEqual("error", bounded._send_q.get_nowait()[0]["kind"])
+
+    def test_completed_replay_cache_refuses_pressure_without_rerun(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        with patch.object(self.runner_mod, "COMMAND_REPLAY_MAX_ENTRIES", 1), \
+                patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(
+                runner, "a" * 64, self._command("first", invite="one"),
+            )
+            self._complete_queued_delivery(runner)
+            self._direct_command(
+                runner, "a" * 64, self._command("second", invite="two"),
+            )
+            self._direct_command(
+                runner, "a" * 64, self._command("first", invite="one"),
+            )
+
+        self.assertEqual(["first"], calls)
+        self.assertEqual(1, len(runner._replay))
+        queued = [runner._send_q.get_nowait()[0] for _ in range(2)]
+        self.assertEqual(["error", "group_join_result"], [x["kind"] for x in queued])
+
+    def test_pending_large_results_never_exceed_replay_byte_bound(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok",
+                 "details": "x" * 400},
+                anchor, chunks,
+            )
+
+        with patch.object(self.runner_mod, "COMMAND_REPLAY_MAX_BYTES", 512), \
+                patch.object(runner, "_do_simple_action", side_effect=action):
+            for index in range(5):
+                self._direct_command(
+                    runner,
+                    "a" * 64,
+                    self._command(f"large-{index}", invite="one"),
+                )
+                self.assertLessEqual(runner._replay_bytes, 512)
+            self._direct_command(
+                runner, "a" * 64,
+                self._command("large-4", invite="one"),
+            )
+
+        self.assertEqual([f"large-{index}" for index in range(5)], calls)
+        self.assertLessEqual(runner._replay_bytes, 512)
+        self.assertEqual(6, runner._send_q.qsize())
+        self.assertEqual("error", list(runner._send_q.queue)[-1][0]["kind"])
+
+    def test_reinsert_full_releases_delivery_pin_for_retry_and_expiry(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        command = self._command("reinsert-full", invite="one")
+        calls = []
+
+        def action(_action, command_id, params, anchor, chunks):
+            calls.append(command_id)
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        class FullDuringReinsert:
+            def __init__(self, item):
+                self.item = item
+                self.returned = False
+
+            def get_nowait(self):
+                if self.returned:
+                    raise queue.Empty
+                self.returned = True
+                return self.item
+
+            def put_nowait(self, _item):
+                raise queue.Full
+
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, "a" * 64, command)
+            queued = runner._send_q.get_nowait()
+            runner._send_q = FullDuringReinsert(queued)
+            runner._prune_stale_results(self.runner_mod.now_ms())
+
+            replay_key = ("direct:" + ("a" * 64), "reinsert-full")
+            self.assertFalse(runner._replay[replay_key]["delivery_pending"])
+
+            runner._send_q = queue.Queue()
+            self._direct_command(runner, "a" * 64, command)
+            self.assertEqual(["reinsert-full"], calls)
+            self.assertEqual(1, runner._send_q.qsize())
+            self._complete_queued_delivery(runner)
+
+            runner._replay[replay_key]["completed_at"] -= (
+                self.runner_mod.COMMAND_REPLAY_TTL_SECS + 1
+            )
+            with runner._replay_lock:
+                runner._prune_replay_locked(time.monotonic())
+            self.assertNotIn(replay_key, runner._replay)
+
+    def test_completed_command_without_result_never_reexecutes(self) -> None:
+        from unittest.mock import patch
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        command = self._command("missing-result", invite="one")
+        calls = []
+
+        def action(*_args):
+            calls.append("called")
+
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, "a" * 64, command)
+            self._direct_command(runner, "a" * 64, command)
+
+        self.assertEqual(["called"], calls)
+        self.assertEqual("error", runner._send_q.get_nowait()[0]["kind"])
+
+    def test_legacy_publication_releases_tracked_result_without_target(self) -> None:
+        from unittest.mock import patch
+
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        command = self._command("legacy-result", invite="one")
+
+        def action(_action, command_id, params, _anchor, chunks):
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                None, chunks,
+            )
+
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, "a" * 64, command)
+
+        replay_key = ("direct:" + ("a" * 64), "legacy-result")
+        publisher = threading.Thread(target=runner._publisher_loop)
+        publisher.start()
+        deadline = time.monotonic() + 2
+        while not client.published and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        runner._stop.set()
+        publisher.join(timeout=2)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertTrue(client.published)
+        self.assertFalse(runner._replay[replay_key]["delivery_pending"])
+        runner._replay[replay_key]["completed_at"] -= (
+            self.runner_mod.COMMAND_REPLAY_TTL_SECS + 1
+        )
+        with runner._replay_lock:
+            runner._prune_replay_locked(time.monotonic())
+        self.assertNotIn(replay_key, runner._replay)
+
+    def test_final_queue_rejection_releases_tracked_result_without_target(self) -> None:
+        from unittest.mock import patch
+
+        class AlwaysFull:
+            def put_nowait(self, _item):
+                raise queue.Full
+
+            def get_nowait(self):
+                raise queue.Empty
+
+        runner = self.runner_mod.TestRunner("nyc", FakeClient())
+        runner._send_q = AlwaysFull()
+        command = self._command("legacy-drop", invite="one")
+
+        def action(_action, command_id, params, _anchor, chunks):
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                None, chunks,
+            )
+
+        with patch.object(runner, "_do_simple_action", side_effect=action):
+            self._direct_command(runner, "a" * 64, command)
+
+        replay_key = ("direct:" + ("a" * 64), "legacy-drop")
+        self.assertFalse(runner._replay[replay_key]["delivery_pending"])
+
     def test_result_stage_logs_queue_wait_and_owned_publish_completion(self) -> None:
         from unittest.mock import patch
 
@@ -223,7 +688,7 @@ class X0xTestRunnerTests(unittest.TestCase):
         with patch.object(
             self.runner_mod.time,
             "monotonic",
-            side_effect=[10.0, 12.0, 13.0, 15.0, 16.0],
+            side_effect=[10.0, 12.0, 13.0, 15.0, 16.0, 17.0],
         ), self.assertLogs("runner[sin]", level="INFO") as captured:
             runner._enqueue_result(envelope, target_aid="a" * 64)
             publisher = threading.Thread(target=runner._publisher_loop)

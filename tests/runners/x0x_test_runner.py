@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import hashlib
 import json
 import logging
 import os
@@ -97,6 +99,9 @@ RESULT_RAW_QUIC_ACK_MS: Optional[int] = _optional_int_env(
 )
 RESULT_QUEUE_MAX = 1024
 RESULT_QUEUE_MAX_AGE_SECS = 300
+COMMAND_REPLAY_MAX_ENTRIES = 256
+COMMAND_REPLAY_MAX_BYTES = 4 * 1024 * 1024
+COMMAND_REPLAY_TTL_SECS = 300
 
 
 def now_ms() -> int:
@@ -352,7 +357,7 @@ class TestRunner:
         # target_aid=None means publish on the legacy results topic
         # (last-resort fallback for orchestrators that don't include
         # an anchor address).
-        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool, float]]" = (
+        self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str], bool, float, Optional[Tuple[str, str]]]]" = (
             queue.Queue(maxsize=RESULT_QUEUE_MAX)
         )
         self._agent_id: Optional[str] = None
@@ -363,6 +368,17 @@ class TestRunner:
         # fresh discover.
         self._last_known_anchor_aid: Optional[str] = None
         self._subscription_ids: Dict[str, str] = {}
+        # Both control listeners can dispatch concurrently. Entries remain in
+        # this table while their action is running, so pressure never evicts an
+        # in-flight mutation and permits a duplicate to run it again.
+        self._replay_lock = threading.Lock()
+        self._replay: "collections.OrderedDict[Tuple[str, str], Dict[str, Any]]" = (
+            collections.OrderedDict()
+        )
+        self._replay_bytes = 0
+        self._dispatch_context = threading.local()
+        self._queued_result_keys: set = set()
+        self._queued_result_lock = threading.Lock()
 
     # ─── lifecycle ─────────────────────────────────────────────────────
     def run(self) -> int:
@@ -456,9 +472,13 @@ class TestRunner:
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                envelope, target_aid, result_chunks_v2, enqueued_at = self._send_q.get(
-                    timeout=0.5
-                )
+                (
+                    envelope,
+                    target_aid,
+                    result_chunks_v2,
+                    enqueued_at,
+                    replay_key,
+                ) = self._send_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             publish_started = time.monotonic()
@@ -469,37 +489,49 @@ class TestRunner:
                 envelope.get("command_id"),
                 max(0.0, (publish_started - enqueued_at) * 1000), publish_started,
             )
+            delivery_key = self._result_delivery_key(
+                envelope, target_aid, result_chunks_v2, replay_key,
+            )
             payload = json.dumps(envelope).encode("utf-8")
-            if target_aid:
-                v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
-                mode = "chunks_v2" if result_chunks_v2 and v1_bytes > DM_MAX_BYTES else "v1"
-                self.log.info(
-                    "result delivery kind=%s request_id=%s command_id=%s "
-                    "mode=%s json_bytes=%d dm_bytes=%d",
-                    envelope.get("kind"), envelope.get("request_id"),
-                    envelope.get("command_id"), mode, len(payload), v1_bytes,
-                )
-                if self._send_result_dm(
-                    target_aid, payload, envelope, result_chunks_v2,
-                ):
-                    self.log.info(
-                        "result stage=publish_complete kind=%s request_id=%s "
-                        "command_id=%s mode=%s duration_ms=%.1f",
-                        envelope.get("kind"), envelope.get("request_id"),
-                        envelope.get("command_id"), mode,
-                        (time.monotonic() - publish_started) * 1000,
+            try:
+                if target_aid:
+                    v1_bytes = len(b"x0xtest|res|" + base64.b64encode(payload))
+                    mode = (
+                        "chunks_v2"
+                        if result_chunks_v2 and v1_bytes > DM_MAX_BYTES
+                        else "v1"
                     )
-                    continue
-                # DM failed irretrievably — fall through to pubsub so the
-                # orchestrator at least sees the result on the legacy
-                # topic if it's still listening there.
-                self.log.warning(
-                    "result fallback kind=%s request_id=%s command_id=%s "
-                    "from_mode=%s json_bytes=%d",
-                    envelope.get("kind"), envelope.get("request_id"),
-                    envelope.get("command_id"), mode, len(payload),
-                )
-            self._publish_result_legacy(payload, envelope)
+                    self.log.info(
+                        "result delivery kind=%s request_id=%s command_id=%s "
+                        "mode=%s json_bytes=%d dm_bytes=%d",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"), mode, len(payload), v1_bytes,
+                    )
+                    if self._send_result_dm(
+                        target_aid, payload, envelope, result_chunks_v2,
+                    ):
+                        self.log.info(
+                            "result stage=publish_complete kind=%s request_id=%s "
+                            "command_id=%s mode=%s duration_ms=%.1f",
+                            envelope.get("kind"), envelope.get("request_id"),
+                            envelope.get("command_id"), mode,
+                            (time.monotonic() - publish_started) * 1000,
+                        )
+                        continue
+                    # DM failed irretrievably — fall through to pubsub so the
+                    # orchestrator can still receive it on the legacy topic.
+                    self.log.warning(
+                        "result fallback kind=%s request_id=%s command_id=%s "
+                        "from_mode=%s json_bytes=%d",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"), mode, len(payload),
+                    )
+                self._publish_result_legacy(payload, envelope)
+            finally:
+                if delivery_key is not None:
+                    with self._queued_result_lock:
+                        self._queued_result_keys.discard(delivery_key)
+                self._mark_replay_delivery_finished(replay_key)
 
     def _send_result_dm(
         self,
@@ -647,7 +679,9 @@ class TestRunner:
         body: Dict[str, Any],
         target_aid: Optional[str] = None,
         result_chunks_v2: bool = False,
-    ) -> None:
+        coalesce: bool = True,
+        replay_key: Optional[Tuple[str, str]] = None,
+    ) -> bool:
         body.setdefault("node", self.node_name)
         body.setdefault("agent_id", self._agent_id)
         body.setdefault("machine_id", self._machine_id)
@@ -656,9 +690,28 @@ class TestRunner:
         if not isinstance(current_ms, int):
             current_ms = now_ms()
             body["ts_ms"] = current_ms
+        context_key = replay_key or getattr(self._dispatch_context, "replay_key", None)
+        if replay_key is not None:
+            self._pin_replay_delivery(replay_key)
+        elif context_key is not None:
+            self._remember_replay_result(
+                context_key, body, target_aid, result_chunks_v2,
+            )
+        delivery_key = self._result_delivery_key(
+            body, target_aid, result_chunks_v2, context_key,
+        )
+        if delivery_key is not None and coalesce:
+            with self._queued_result_lock:
+                if delivery_key in self._queued_result_keys:
+                    self.log.info(
+                        "coalescing queued result kind=%s request_id=%s",
+                        body.get("kind"), body.get("request_id"),
+                    )
+                    return False
+                self._queued_result_keys.add(delivery_key)
         self._prune_stale_results(current_ms)
         enqueued_at = time.monotonic()
-        item = (body, target_aid, result_chunks_v2, enqueued_at)
+        item = (body, target_aid, result_chunks_v2, enqueued_at, context_key)
         try:
             self._send_q.put_nowait(item)
             self.log.info(
@@ -667,11 +720,16 @@ class TestRunner:
                 body.get("kind"), body.get("request_id"), body.get("command_id"),
                 enqueued_at, self._send_q.qsize(),
             )
-            return
+            return True
         except queue.Full:
             pass
         try:
-            dropped, _, _, _ = self._send_q.get_nowait()
+            dropped, dropped_target, dropped_chunks, _, dropped_replay = (
+                self._send_q.get_nowait()
+            )
+            self._release_dropped_result(
+                (dropped, dropped_target, dropped_chunks, 0.0, dropped_replay),
+            )
             self.log.warning(
                 "dropping oldest queued result after result buffer filled: "
                 "kind=%s request_id=%s",
@@ -688,6 +746,7 @@ class TestRunner:
                 body.get("kind"), body.get("request_id"), body.get("command_id"),
                 enqueued_at, self._send_q.qsize(),
             )
+            return True
         except queue.Full:
             self.log.error(
                 "dropping current result because result buffer remained full: "
@@ -695,6 +754,157 @@ class TestRunner:
                 body.get("kind"),
                 body.get("request_id"),
             )
+            if delivery_key is not None and coalesce:
+                with self._queued_result_lock:
+                    self._queued_result_keys.discard(delivery_key)
+            self._mark_replay_delivery_finished(context_key)
+            return False
+
+    @staticmethod
+    def _result_delivery_key(
+        body: Dict[str, Any],
+        target_aid: Optional[str],
+        result_chunks_v2: bool,
+        replay_key: Optional[Tuple[str, str]],
+    ) -> Optional[Tuple[str, str, str]]:
+        request_id = body.get("request_id")
+        if not target_aid or not isinstance(request_id, str) or not request_id:
+            return None
+        identity = (
+            repr(replay_key)
+            if replay_key is not None
+            else hashlib.sha256(
+                json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+        negotiation = "chunks" if result_chunks_v2 else "legacy"
+        return identity, target_aid, negotiation
+
+    def _remember_replay_result(
+        self,
+        key: Tuple[str, str],
+        body: Dict[str, Any],
+        target_aid: Optional[str],
+        result_chunks_v2: bool,
+    ) -> None:
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        with self._replay_lock:
+            entry = self._replay.get(key)
+            if entry is None or entry["state"] != "in_flight":
+                return
+            prior_bytes = entry["result_bytes"]
+            available = COMMAND_REPLAY_MAX_BYTES - (self._replay_bytes - prior_bytes)
+            if len(encoded) <= available:
+                entry["result"] = (dict(body), target_aid, result_chunks_v2)
+                entry["result_bytes"] = len(encoded)
+                self._replay_bytes += len(encoded) - prior_bytes
+            else:
+                entry["result"] = None
+                entry["result_bytes"] = 0
+                entry["result_unavailable"] = True
+                self._replay_bytes -= prior_bytes
+            entry["delivery_pending"] = True
+
+    def _pin_replay_delivery(self, key: Tuple[str, str]) -> None:
+        with self._replay_lock:
+            entry = self._replay.get(key)
+            if entry is not None and entry["state"] == "complete":
+                entry["delivery_pending"] = True
+
+    def _mark_replay_delivery_finished(
+        self, replay_key: Optional[Tuple[str, str]],
+    ) -> None:
+        if replay_key is None:
+            return
+        with self._replay_lock:
+            entry = self._replay.get(replay_key)
+            if entry is not None:
+                entry["delivery_pending"] = False
+            self._prune_replay_locked(time.monotonic())
+
+    def _release_dropped_result(
+        self,
+        item: Tuple[
+            Dict[str, Any], Optional[str], bool, float, Optional[Tuple[str, str]]
+        ],
+    ) -> None:
+        body, target, chunks, _, replay_key = item
+        delivery_key = self._result_delivery_key(
+            body, target, chunks, replay_key,
+        )
+        if delivery_key is not None:
+            with self._queued_result_lock:
+                self._queued_result_keys.discard(delivery_key)
+        self._mark_replay_delivery_finished(replay_key)
+
+    def _prune_replay_locked(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._replay.items()
+            if entry["state"] == "complete"
+            and not entry["delivery_pending"]
+            and now - entry["completed_at"] >= COMMAND_REPLAY_TTL_SECS
+        ]
+        for key in expired:
+            entry = self._replay.pop(key)
+            self._replay_bytes -= entry["result_bytes"]
+
+    @staticmethod
+    def _command_fingerprint(cmd: Dict[str, Any]) -> str:
+        encoded = json.dumps(cmd, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _begin_replay(
+        self,
+        cmd: Dict[str, Any],
+        source_aid: Optional[str],
+        source_authenticated: bool,
+    ) -> Tuple[str, Optional[Tuple[str, str]], Optional[Tuple[Dict[str, Any], Optional[str], bool]]]:
+        request_id = (cmd.get("params") or {}).get("request_id")
+        command_id = cmd.get("command_id")
+        if not isinstance(source_aid, str) or len(source_aid) != 64:
+            return "execute", None, None
+        if not isinstance(request_id, str) or not request_id or command_id != request_id:
+            return "execute", None, None
+        namespace = "direct" if source_authenticated else "legacy-pubsub"
+        key = f"{namespace}:{source_aid}", request_id
+        fingerprint = self._command_fingerprint(cmd)
+        now = time.monotonic()
+        with self._replay_lock:
+            self._prune_replay_locked(now)
+            existing = self._replay.get(key)
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    return "conflict", key, None
+                self._replay.move_to_end(key)
+                if existing["state"] == "complete":
+                    if existing.get("result_unavailable"):
+                        return "unavailable", key, None
+                    return "replay", key, existing.get("result")
+                return "coalesce", key, None
+            if len(self._replay) >= COMMAND_REPLAY_MAX_ENTRIES:
+                return "busy", key, None
+            self._replay[key] = {
+                "fingerprint": fingerprint,
+                "state": "in_flight",
+                "result": None,
+                "result_bytes": 0,
+                "result_unavailable": False,
+                "delivery_pending": False,
+            }
+        return "execute", key, None
+
+    def _finish_replay(self, key: Optional[Tuple[str, str]]) -> None:
+        if key is None:
+            return
+        with self._replay_lock:
+            entry = self._replay.get(key)
+            if entry is None:
+                return
+            if entry.get("result") is None:
+                entry["result_unavailable"] = True
+            entry["state"] = "complete"
+            entry["completed_at"] = time.monotonic()
+            self._prune_replay_locked(entry["completed_at"])
 
     def _prune_stale_results(self, now_ms_value: int) -> None:
         cutoff_ms = now_ms_value - (RESULT_QUEUE_MAX_AGE_SECS * 1000)
@@ -705,9 +915,10 @@ class TestRunner:
                 item = self._send_q.get_nowait()
             except queue.Empty:
                 break
-            envelope, _, _, _ = item
+            envelope, target, chunks, _, replay_key = item
             ts_ms = envelope.get("ts_ms")
             if isinstance(ts_ms, int) and ts_ms < cutoff_ms:
+                self._release_dropped_result(item)
                 dropped += 1
             else:
                 kept.append(item)
@@ -715,6 +926,7 @@ class TestRunner:
             try:
                 self._send_q.put_nowait(item)
             except queue.Full:
+                self._release_dropped_result(item)
                 dropped += 1
         if dropped:
             self.log.warning(
@@ -820,7 +1032,11 @@ class TestRunner:
         ).get("anchor_aid")
         if isinstance(anchor, str) and len(anchor) == 64:
             self._last_known_anchor_aid = anchor
-        self._dispatch_command(cmd, source_aid=anchor)
+        # PubSub authenticates neither the embedded anchor nor its command ID.
+        # It gets a separate compatibility namespace from direct-message peers.
+        self._dispatch_command(
+            cmd, source_aid=anchor, source_authenticated=False,
+        )
 
     def _handle_direct_event(self, event_type: str, data: str) -> None:
         if event_type != "direct_message":
@@ -951,6 +1167,53 @@ class TestRunner:
 
     # ─── command dispatch ──────────────────────────────────────────────
     def _dispatch_command(
+        self,
+        cmd: Dict[str, Any],
+        source_aid: Optional[str] = None,
+        source_authenticated: bool = True,
+    ) -> None:
+        target = cmd.get("target_node", "*")
+        if target not in (self.node_name, "*"):
+            return
+        disposition, replay_key, cached = self._begin_replay(
+            cmd, source_aid, source_authenticated,
+        )
+        request_id = (cmd.get("params") or {}).get("request_id")
+        if disposition == "coalesce":
+            self.log.info("coalescing in-flight command request_id=%s", request_id)
+            return
+        if disposition == "replay" and cached is not None:
+            body, target_aid, chunks = cached
+            self._enqueue_result(
+                dict(body), target_aid, chunks, replay_key=replay_key,
+            )
+            return
+        if disposition in ("conflict", "busy", "unavailable"):
+            errors = {
+                "conflict": "request_id reused with different command",
+                "busy": "runner replay cache is full with protected commands",
+                "unavailable": "completed command result exceeds replay cache bound",
+            }
+            self._enqueue_result(
+                {
+                    "kind": "error",
+                    "command_id": cmd.get("command_id"),
+                    "request_id": request_id,
+                    "outcome": {"error": errors[disposition]},
+                },
+                target_aid=source_aid,
+                result_chunks_v2=cmd.get("result_chunks_v2") is True,
+                coalesce=False,
+            )
+            return
+        self._dispatch_context.replay_key = replay_key
+        try:
+            self._execute_command(cmd, source_aid)
+        finally:
+            self._dispatch_context.replay_key = None
+            self._finish_replay(replay_key)
+
+    def _execute_command(
         self,
         cmd: Dict[str, Any],
         source_aid: Optional[str] = None,
