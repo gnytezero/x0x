@@ -238,8 +238,9 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run line coverage gate
-        # Filter timing-flaky binaries that flake only under llvm-cov's ~3x
-        # instrumentation slowdown — a flake here must not abort the whole
+        # Filter timing-flaky binaries from the coverage run only — they
+        # keep running in the Test Suite + integration tiers. See the
+        # per-binary reasons below (#607); a flake here must not abort the
         # coverage computation:
         #   * x0x_0041_synthetic_kill_restart — documented, matches Test Suite.
         #   * x0x_0041_prefer_newest_test — sibling binary; the
@@ -268,9 +269,27 @@ jobs:
           cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
           source "$RUNNER_TEMP/coverage-env.sh"
           cargo llvm-cov clean --workspace
-          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)'
-          cargo llvm-cov report --workspace --lcov --output-path lcov.info --fail-under-lines 65.7
-          python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
+          # #607: --no-fail-fast + exit capture. A red test must not abort
+          # the step before the report/ratchet below (bash -e would), and the
+          # remaining tests' profile data must still be produced. The job
+          # still fails on it — see the status merge at the end.
+          coverage_test_status=0
+          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
+          # #607: report and ratchet are still ATTEMPTED after a red test
+          # pass; their own failures are captured the same way.
+          coverage_report_status=0
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info --fail-under-lines 65.7 || coverage_report_status=$?
+          coverage_ratchet_status=0
+          python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global || coverage_ratchet_status=$?
+          # Any phase failure fails the job; the first nonzero phase exit
+          # becomes the job's exit code (test → report → ratchet).
+          status="$coverage_test_status"
+          if [ "$status" -eq 0 ]; then status="$coverage_report_status"; fi
+          if [ "$status" -eq 0 ]; then status="$coverage_ratchet_status"; fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::coverage gate failed (test=$coverage_test_status report=$coverage_report_status ratchet=$coverage_ratchet_status)" >&2
+          fi
+          exit "$status"
 
       - name: Upload LCOV report
         if: always()
