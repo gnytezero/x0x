@@ -28,7 +28,15 @@
       "method": "GET",
       "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
       "request": {
-        "kind": "none"
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "idempotency_key",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
