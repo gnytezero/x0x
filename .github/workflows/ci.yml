@@ -219,6 +219,21 @@ jobs:
           printf 'ACCEPTANCE_EXIT=%s\n' "${acceptance_status}" >"${artifact}/workflow-exit.txt"
           exit "${acceptance_status}"
 
+      - name: Exercise literal systemd paths and arguments
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance/literals"
+          python3 -B scripts/ci/test_systemd_literals.py --self-test
+          set +e
+          sudo python3 -B scripts/ci/test_systemd_literals.py \
+            --probe "${GITHUB_WORKSPACE}/target/debug/examples/linux690_systemd_probe" \
+            --artifact-root "${artifact}"
+          literal_status=$?
+          set -e
+          sudo chown -R "$(id -u):$(id -g)" "${artifact}"
+          printf 'LITERAL_ACCEPTANCE_EXIT=%s\n' "${literal_status}" >"${artifact}/workflow-exit.txt"
+          exit "${literal_status}"
+
       - name: Upload Linux systemd acceptance custody
         if: always()
         uses: actions/upload-artifact@v5

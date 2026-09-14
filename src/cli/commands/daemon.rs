@@ -281,16 +281,53 @@ fn escape_systemd_exec_arg(arg: &str) -> String {
     out
 }
 
+/// Render the ExecStart EXECUTABLE path: like [`escape_systemd_exec_arg`]
+/// except a literal `$` stays RAW — systemd never environment-expands the
+/// executable path (the execve target is the stored path verbatim), so
+/// `$$`-doubling there would address a different file. `%%` still doubles
+/// because the path does go through load-time `%`-specifier expansion.
+#[cfg(any(test, target_os = "linux"))]
+fn escape_systemd_exec_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        match c {
+            '%' => out.push_str("%%"),
+            // Raw on purpose — see the doc comment above.
+            '$' => out.push('$'),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(any(test, target_os = "linux"))]
 fn render_systemd_unit(executable: &str, args: &[String]) -> Result<String> {
     validate_autostart_value(executable)?;
     for arg in args {
         validate_autostart_value(arg)?;
     }
-    let exec_start = std::iter::once(escape_systemd_exec_arg(executable))
-        .chain(args.iter().map(|arg| escape_systemd_exec_arg(arg)))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // `$`-bearing executables use systemd's `@` argv[0] override: the raw
+    // path stays the execve target, while the `$$`-escaped copy becomes
+    // argv[0] and spawn-collapses back to the literal path (without the
+    // override, the implicit argv[0] copy of the path diverges for
+    // `${FOO}`/`$$` paths and the readback cannot bind it). `$`-free
+    // executables keep the plain form (byte-identical legacy output).
+    let exec_start = if executable.contains('$') {
+        std::iter::once(format!("@{}", escape_systemd_exec_path(executable)))
+            .chain(std::iter::once(escape_systemd_exec_arg(executable)))
+            .chain(args.iter().map(|arg| escape_systemd_exec_arg(arg)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        std::iter::once(escape_systemd_exec_path(executable))
+            .chain(args.iter().map(|arg| escape_systemd_exec_arg(arg)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     Ok(format!(
         "[Unit]\nDescription=x0x Agent Daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exec_start}\nEnvironment={env_key}={template_version}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         env_key = crate::upgrade::restart::SYSTEMD_TEMPLATE_ENV_KEY,
@@ -1034,6 +1071,47 @@ mod tests {
         }));
         assert!(unit.lines().any(|line| line == "Type=simple"));
         assert!(unit.lines().any(|line| line == "Restart=always"));
+    }
+
+    /// `$`-bearing executables render the proven `@` argv[0]-override form:
+    /// raw path, `$$`-escaped argv[0] copy, then arguments. `$`-free
+    /// executables keep the plain legacy form.
+    #[test]
+    fn systemd_template_renders_escaped_argv0_for_dollar_paths() {
+        let unit = render_systemd_unit(
+            "/opt/x0x$prod/x0xd",
+            &["--name".to_string(), "$x".to_string()],
+        )
+        .expect("`$` executable path renders");
+        let exec = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .expect("actual ExecStart line");
+        // Experiment-exact shape: `@` + raw path, `$$`-escaped argv[0]
+        // copy, then normally-escaped arguments.
+        assert_eq!(
+            exec,
+            "@\"/opt/x0x$prod/x0xd\" \"/opt/x0x$$prod/x0xd\" \"--name\" \"$$x\""
+        );
+        // `${FOO}` and `$$` shapes take the same form (braced/double-dollar
+        // receipt cases).
+        let braced =
+            render_systemd_unit("/opt/p${FOO}/x0xd", &[]).expect("braced executable path renders");
+        assert!(braced
+            .lines()
+            .any(|l| l == "ExecStart=@\"/opt/p${FOO}/x0xd\" \"/opt/p$${FOO}/x0xd\""));
+        let doubled = render_systemd_unit("/opt/p$$literal/x0xd", &[])
+            .expect("double-dollar executable path renders");
+        assert!(doubled
+            .lines()
+            .any(|l| l == "ExecStart=@\"/opt/p$$literal/x0xd\" \"/opt/p$$$$literal/x0xd\""));
+        // `%`-only executables keep the plain form: `%%` for the load-time
+        // expander, no `@`, no duplicate (`percent-path` receipt).
+        let pct =
+            render_systemd_unit("/opt/x0x%prod/x0xd", &[]).expect("`%` executable path renders");
+        assert!(pct
+            .lines()
+            .any(|l| l == "ExecStart=\"/opt/x0x%%prod/x0xd\""));
     }
 
     #[test]
