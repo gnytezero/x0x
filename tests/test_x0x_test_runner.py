@@ -58,7 +58,7 @@ class FakeClient:
         self.direct: list[tuple[str, bytes]] = []
         self.direct_error_code: int | None = None
 
-    def publish(self, topic: str, payload: bytes) -> None:
+    def publish(self, topic: str, payload: bytes, **_kwargs) -> None:
         self.published.append((topic, payload))
 
     def subscribe(self, topic: str) -> dict[str, str]:
@@ -665,6 +665,124 @@ class X0xTestRunnerTests(unittest.TestCase):
         replay_key = ("direct:" + ("a" * 64), "legacy-drop")
         self.assertFalse(runner._replay[replay_key]["delivery_pending"])
 
+    def test_chunk_failures_fall_back_within_enqueue_budget(self) -> None:
+        from unittest.mock import patch
+
+        clock = [0.0]
+        fallback_started = []
+        timeouts = []
+
+        class BudgetClient(FakeClient):
+            def direct_send(self, _target, _payload, **kwargs):
+                timeout = kwargs["timeout"]
+                timeouts.append(timeout)
+                clock[0] += timeout
+                raise TimeoutError("controlled raw timeout")
+
+            def publish(self, topic, payload, **kwargs):
+                fallback_started.append(clock[0])
+                clock[0] += min(1.0, kwargs["timeout"])
+                return super().publish(topic, payload)
+
+        client = BudgetClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        result = {
+            "kind": "group_messages_result",
+            "command_id": "large-budget",
+            "request_id": "large-budget",
+            "outcome": "ok",
+            "details": {"body": "x" * 60_000},
+        }
+
+        def fake_sleep(seconds):
+            clock[0] += seconds
+
+        with patch.object(
+            self.runner_mod.time, "monotonic", side_effect=lambda: clock[0],
+        ), patch.object(
+            self.runner_mod.time, "sleep", side_effect=fake_sleep,
+        ):
+            runner._enqueue_result(
+                result, target_aid="a" * 64, result_chunks_v2=True,
+            )
+            publisher = threading.Thread(target=runner._publisher_loop)
+            publisher.start()
+            deadline = time.monotonic() + 2
+            while not client.published and time.monotonic() < deadline:
+                threading.Event().wait(0.01)
+            runner._stop.set()
+            publisher.join(timeout=2)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertGreater(len(self.runner_mod.frame_result(
+            json.dumps(result).encode(), "transfer", "large-budget",
+        )), 1)
+        self.assertEqual([15.0, 4.0], timeouts)
+        self.assertEqual([20.0], fallback_started)
+        self.assertLessEqual(clock[0], self.runner_mod.RESULT_TOTAL_BUDGET_SECS)
+
+    def test_expired_queued_result_skips_transport_and_releases_pin(self) -> None:
+        from unittest.mock import patch
+
+        clock = [0.0]
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        command = self._command("expired-delivery", invite="one")
+
+        def action(_action, command_id, params, anchor, chunks):
+            runner._enqueue_result(
+                {"kind": "group_join_result", "command_id": command_id,
+                 "request_id": params["request_id"], "outcome": "ok"},
+                anchor, chunks,
+            )
+
+        with patch.object(runner, "_do_simple_action", side_effect=action), \
+                patch.object(
+                    self.runner_mod.time, "monotonic", side_effect=lambda: clock[0],
+                ):
+            self._direct_command(runner, "a" * 64, command)
+            clock[0] = self.runner_mod.RESULT_TOTAL_BUDGET_SECS + 1
+            publisher = threading.Thread(target=runner._publisher_loop)
+            publisher.start()
+            while not runner._send_q.empty():
+                threading.Event().wait(0.01)
+            runner._stop.set()
+            publisher.join(timeout=2)
+
+        replay_key = ("direct:" + ("a" * 64), "expired-delivery")
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(client.direct)
+        self.assertFalse(client.published)
+        self.assertFalse(runner._replay[replay_key]["delivery_pending"])
+
+    def test_oversized_result_reports_failure_when_pubsub_is_disabled(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        runner._pubsub_disabled_after_discover = True
+        result = {
+            "kind": "group_messages_result",
+            "command_id": "no-pubsub",
+            "request_id": "no-pubsub",
+            "outcome": "ok",
+            "details": {"body": "x" * 60_000},
+        }
+
+        with self.assertLogs(runner.log, level="ERROR") as captured:
+            runner._enqueue_result(result, target_aid=None, result_chunks_v2=False)
+            publisher = threading.Thread(target=runner._publisher_loop)
+            publisher.start()
+            while not runner._send_q.empty():
+                threading.Event().wait(0.01)
+            runner._stop.set()
+            publisher.join(timeout=2)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(client.direct)
+        self.assertFalse(client.published)
+        logs = "\n".join(captured.output)
+        self.assertIn("pubsub fallback is disabled", logs)
+        self.assertIn("result delivery failed within budget", logs)
+
     def test_result_stage_logs_queue_wait_and_owned_publish_completion(self) -> None:
         from unittest.mock import patch
 
@@ -865,7 +983,8 @@ class TokenRotationTests(unittest.TestCase):
         self.assertTrue(rejected.closed)
         self.assertEqual(calls[0][0].data, calls[1][0].data)
         self.assertEqual(calls[0][0].get_method(), calls[1][0].get_method())
-        self.assertEqual(calls[0][1], calls[1][1])
+        self.assertGreater(calls[1][1], 0)
+        self.assertLessEqual(calls[1][1], calls[0][1])
         if sse:
             self.assertEqual("text/event-stream", calls[1][0].get_header("Accept"))
         else:

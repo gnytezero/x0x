@@ -99,6 +99,9 @@ RESULT_RAW_QUIC_ACK_MS: Optional[int] = _optional_int_env(
 )
 RESULT_QUEUE_MAX = 1024
 RESULT_QUEUE_MAX_AGE_SECS = 300
+RESULT_TOTAL_BUDGET_SECS = 30.0
+RESULT_RAW_BUDGET_SECS = 20.0
+RESULT_HTTP_TIMEOUT_SECS = 15.0
 COMMAND_REPLAY_MAX_ENTRIES = 256
 COMMAND_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 COMMAND_REPLAY_TTL_SECS = 300
@@ -173,7 +176,12 @@ class X0xClient:
             return True
 
     def _open(self, method, path, data, timeout, accept=None):
+        deadline = time.monotonic() + timeout
+
         def send(token):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("HTTP request budget expired")
             headers = {"Authorization": f"Bearer {token}"}
             if accept is None:
                 headers["Content-Type"] = "application/json"
@@ -182,7 +190,7 @@ class X0xClient:
             req = urllib.request.Request(
                 self.base_url + path, data=data, method=method, headers=headers
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            return urllib.request.urlopen(req, timeout=remaining)
 
         token = self._current_token()
         try:
@@ -216,11 +224,14 @@ class X0xClient:
     def agent(self) -> Dict[str, Any]:
         return self._request("GET", "/agent")
 
-    def publish(self, topic: str, payload: bytes) -> Dict[str, Any]:
+    def publish(
+        self, topic: str, payload: bytes, timeout: float = 15.0,
+    ) -> Dict[str, Any]:
         return self._request(
             "POST",
             "/publish",
             body={"topic": topic, "payload": b64encode(payload)},
+            timeout=timeout,
         )
 
     def subscribe(self, topic: str) -> Dict[str, Any]:
@@ -238,6 +249,7 @@ class X0xClient:
         raw_quic_receive_ack_ms: Optional[int] = None,
         stop_fallback_on_raw_error: bool = False,
         require_gossip: bool = False,
+        timeout: float = 15.0,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -253,7 +265,7 @@ class X0xClient:
             body["stop_fallback_on_raw_error"] = True
         if require_gossip:
             body["require_gossip"] = True
-        return self._request("POST", "/direct/send", body=body)
+        return self._request("POST", "/direct/send", body=body, timeout=timeout)
 
     # ─── contacts ──────────────────────────────────────────────────────
     def contacts_list(self) -> Dict[str, Any]:
@@ -482,6 +494,10 @@ class TestRunner:
             except queue.Empty:
                 continue
             publish_started = time.monotonic()
+            total_deadline = enqueued_at + RESULT_TOTAL_BUDGET_SECS
+            raw_deadline = min(
+                total_deadline, enqueued_at + RESULT_RAW_BUDGET_SECS,
+            )
             self.log.info(
                 "result stage=publish_start kind=%s request_id=%s command_id=%s "
                 "queue_wait_ms=%.1f monotonic=%.6f",
@@ -508,7 +524,11 @@ class TestRunner:
                         envelope.get("command_id"), mode, len(payload), v1_bytes,
                     )
                     if self._send_result_dm(
-                        target_aid, payload, envelope, result_chunks_v2,
+                        target_aid,
+                        payload,
+                        envelope,
+                        result_chunks_v2,
+                        raw_deadline,
                     ):
                         self.log.info(
                             "result stage=publish_complete kind=%s request_id=%s "
@@ -526,7 +546,15 @@ class TestRunner:
                         envelope.get("kind"), envelope.get("request_id"),
                         envelope.get("command_id"), mode, len(payload),
                     )
-                self._publish_result_legacy(payload, envelope)
+                if not self._publish_result_legacy(
+                    payload, envelope, total_deadline,
+                ):
+                    self.log.error(
+                        "result delivery failed within budget: kind=%s "
+                        "request_id=%s command_id=%s",
+                        envelope.get("kind"), envelope.get("request_id"),
+                        envelope.get("command_id"),
+                    )
             finally:
                 if delivery_key is not None:
                     with self._queued_result_lock:
@@ -539,6 +567,7 @@ class TestRunner:
         payload: bytes,
         envelope: Dict[str, Any],
         result_chunks_v2: bool = False,
+        deadline: Optional[float] = None,
     ) -> bool:
         # Phase-A result DMs use the raw-QUIC message ACK path so the control
         # plane stays independent of PlumTree. If raw delivery fails, the
@@ -546,7 +575,9 @@ class TestRunner:
         # orchestrator can record the failure details.
         wire = b"x0xtest|res|" + base64.b64encode(payload)
         if len(wire) <= DM_MAX_BYTES:
-            return self._send_result_wire(target_aid, wire, envelope, 1, 1)
+            return self._send_result_wire(
+                target_aid, wire, envelope, 1, 1, deadline,
+            )
         if result_chunks_v2:
             request_id = envelope.get("request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -559,7 +590,12 @@ class TestRunner:
                 return False
             for wire_index, frame in enumerate(frames, start=1):
                 if not self._send_result_wire(
-                    target_aid, frame, envelope, wire_index, len(frames)
+                    target_aid,
+                    frame,
+                    envelope,
+                    wire_index,
+                    len(frames),
+                    deadline,
                 ):
                     return False
             return True
@@ -575,9 +611,17 @@ class TestRunner:
         envelope: Dict[str, Any],
         wire_index: int,
         wire_count: int,
+        deadline: Optional[float] = None,
     ) -> bool:
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
             attempt_started = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - attempt_started
+                if remaining <= 0:
+                    return False
+                request_timeout = min(RESULT_HTTP_TIMEOUT_SECS, remaining)
+            else:
+                request_timeout = RESULT_HTTP_TIMEOUT_SECS
             try:
                 self.client.direct_send(
                     target_aid,
@@ -586,6 +630,7 @@ class TestRunner:
                     prefer_raw_quic_if_connected=True,
                     raw_quic_receive_ack_ms=RESULT_RAW_QUIC_ACK_MS,
                     stop_fallback_on_raw_error=True,
+                    timeout=request_timeout,
                 )
                 self.log.info(
                     "result stage=wire_complete kind=%s request_id=%s command_id=%s "
@@ -619,7 +664,10 @@ class TestRunner:
                     envelope.get("command_id"), wire_index, wire_count,
                     attempt, PUBLISH_RETRY_MAX, duration_ms, status,
                 )
-                time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
+                if not self._sleep_within_deadline(
+                    PUBLISH_RETRY_BACKOFF_SECS * attempt, deadline,
+                ):
+                    return False
             except Exception as exc:
                 self.log.warning(
                     "result stage=wire_complete kind=%s request_id=%s "
@@ -631,12 +679,32 @@ class TestRunner:
                     (time.monotonic() - attempt_started) * 1000,
                     type(exc).__name__,
                 )
-                time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
+                if not self._sleep_within_deadline(
+                    PUBLISH_RETRY_BACKOFF_SECS * attempt, deadline,
+                ):
+                    return False
         return False
 
+    @staticmethod
+    def _sleep_within_deadline(
+        seconds: float, deadline: Optional[float],
+    ) -> bool:
+        if deadline is None:
+            time.sleep(seconds)
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        sleep_for = min(seconds, remaining)
+        time.sleep(sleep_for)
+        return sleep_for >= seconds and time.monotonic() < deadline
+
     def _publish_result_legacy(
-        self, payload: bytes, envelope: Dict[str, Any]
-    ) -> None:
+        self,
+        payload: bytes,
+        envelope: Dict[str, Any],
+        deadline: Optional[float] = None,
+    ) -> bool:
         if self._pubsub_disabled_after_discover:
             self.log.error(
                 "dropping result after DM failure because pubsub fallback is "
@@ -644,11 +712,20 @@ class TestRunner:
                 envelope.get("kind"), envelope.get("request_id"),
                 envelope.get("command_id"),
             )
-            return
+            return False
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
             attempt_started = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - attempt_started
+                if remaining <= 0:
+                    return False
+                request_timeout = min(RESULT_HTTP_TIMEOUT_SECS, remaining)
+            else:
+                request_timeout = RESULT_HTTP_TIMEOUT_SECS
             try:
-                self.client.publish(LEGACY_RESULTS_TOPIC, payload)
+                self.client.publish(
+                    LEGACY_RESULTS_TOPIC, payload, timeout=request_timeout,
+                )
                 self.log.info(
                     "result stage=fallback_complete kind=%s request_id=%s "
                     "command_id=%s attempt=%d/%d duration_ms=%.1f outcome=ok",
@@ -656,7 +733,7 @@ class TestRunner:
                     envelope.get("command_id"), attempt, PUBLISH_RETRY_MAX,
                     (time.monotonic() - attempt_started) * 1000,
                 )
-                return
+                return True
             except Exception as exc:
                 self.log.warning(
                     "result stage=fallback_complete kind=%s request_id=%s "
@@ -667,12 +744,16 @@ class TestRunner:
                     (time.monotonic() - attempt_started) * 1000,
                     type(exc).__name__,
                 )
-                time.sleep(PUBLISH_RETRY_BACKOFF_SECS * attempt)
+                if not self._sleep_within_deadline(
+                    PUBLISH_RETRY_BACKOFF_SECS * attempt, deadline,
+                ):
+                    return False
         self.log.error(
             "dropping result after retries: kind=%s request_id=%s command_id=%s",
             envelope.get("kind"), envelope.get("request_id"),
             envelope.get("command_id"),
         )
+        return False
 
     def _enqueue_result(
         self,

@@ -152,6 +152,7 @@ class X0xClient:
     def direct_send(
         self, agent_id: str, payload: bytes,
         require_ack_ms: Optional[int] = None,
+        timeout: float = 15.0,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -159,7 +160,7 @@ class X0xClient:
         }
         if require_ack_ms is not None:
             body["require_ack_ms"] = require_ack_ms
-        return self._req("POST", "/direct/send", body=body)
+        return self._req("POST", "/direct/send", body=body, timeout=timeout)
 
     def perform(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if action == "contact_list":
@@ -254,6 +255,7 @@ class ResultRouter:
         self.log = log
         self._lock = threading.Lock()
         self._waiters: Dict[str, CommandWaiter] = {}
+        self._expected_senders: Dict[str, str] = {}
         self._discover_q: "queue.Queue[Runner]" = queue.Queue()
         self._stop = threading.Event()
         self._chunks = ResultReassembler()
@@ -263,15 +265,18 @@ class ResultRouter:
     ) -> None:
         with self._lock:
             self._waiters[w.request_id] = w
+            self._expected_senders[w.request_id] = sender
             if not self._chunks.register_pending(
                 w.request_id, [sender], dispatch_deadline,
             ):
                 self._waiters.pop(w.request_id, None)
+                self._expected_senders.pop(w.request_id, None)
                 raise ValueError("result request metadata exceeds framing bounds")
 
     def deregister(self, rid: str) -> None:
         with self._lock:
             self._waiters.pop(rid, None)
+            self._expected_senders.pop(rid, None)
             self._chunks.deregister(rid)
 
     def arm(self, rid: str, deadline: float) -> bool:
@@ -280,7 +285,7 @@ class ResultRouter:
     def deliver_chunk(self, sender: str, wire: bytes) -> None:
         envelope = self._chunks.accept(sender, wire)
         if envelope is not None:
-            self.deliver(envelope)
+            self.deliver(envelope, sender)
 
     def stop(self) -> None:
         self._stop.set()
@@ -288,7 +293,9 @@ class ResultRouter:
     def stopped(self) -> bool:
         return self._stop.is_set()
 
-    def deliver(self, envelope: Dict[str, Any]) -> None:
+    def deliver(
+        self, envelope: Dict[str, Any], sender: Optional[str] = None,
+    ) -> None:
         kind = envelope.get("kind")
         if kind in ("discover_reply", "runner_ready"):
             self._discover_q.put(
@@ -304,7 +311,8 @@ class ResultRouter:
             return
         with self._lock:
             waiter = self._waiters.get(rid)
-        if waiter is None:
+            expected_sender = self._expected_senders.get(rid)
+        if waiter is None or sender != expected_sender:
             return
         waiter.queue.put(envelope)
 
@@ -381,6 +389,8 @@ def _route_event(
         sender = msg.get("sender")
         if not isinstance(sender, str):
             return
+        if msg.get("verified") is not True:
+            return
         if payload.startswith(RESULT_PREFIX_V2):
             router.deliver_chunk(sender, payload)
             return
@@ -391,7 +401,7 @@ def _route_event(
         except Exception as exc:
             log.debug("res DM parse error: %s", exc)
             return
-        router.deliver(envelope)
+        router.deliver(envelope, sender)
         return
     if event_type != "message":
         return
@@ -412,7 +422,10 @@ def _route_event(
     except Exception as exc:
         log.debug("legacy results parse error: %s", exc)
         return
-    router.deliver(envelope)
+    sender = inner.get("sender")
+    if inner.get("verified") is not True or not isinstance(sender, str):
+        return
+    router.deliver(envelope, sender)
 
 
 # ─── Phase-B harness ───────────────────────────────────────────────────
@@ -473,24 +486,46 @@ class FleetHarness:
             wire = PREFIX_CMD + base64.b64encode(
                 json.dumps(envelope).encode("utf-8")
             )
-            self._send_command(target, wire)
-            response_deadline = time.monotonic() + self.cmd_timeout_secs
-            if not self.router.arm(request_id, response_deadline):
-                raise RuntimeError("result request expired before response wait")
-            try:
-                response = waiter.queue.get(timeout=self.cmd_timeout_secs)
-            except queue.Empty:
-                raise TimeoutError(
-                    f"{action} on {target} timed out after "
-                    f"{self.cmd_timeout_secs}s"
-                )
+            expected_kind = f"{action}_result"
+            response = self._send_command(
+                target, wire, waiter, expected_kind,
+            )
+            if response is None:
+                response_deadline = time.monotonic() + self.cmd_timeout_secs
+                if not self.router.arm(request_id, response_deadline):
+                    raise RuntimeError("result request expired before response wait")
+                try:
+                    response = waiter.queue.get(timeout=self.cmd_timeout_secs)
+                except queue.Empty:
+                    raise TimeoutError(
+                        f"{action} on {target} timed out after "
+                        f"{self.cmd_timeout_secs}s"
+                    )
         finally:
             self.router.deregister(request_id)
         if response.get("kind") != f"{action}_result":
             raise RuntimeError(f"unexpected kind: {response.get('kind')}")
         return response
 
-    def _send_command(self, target: str, wire: bytes) -> None:
+    @staticmethod
+    def _take_expected_result(
+        waiter: CommandWaiter, expected_kind: str,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            response = waiter.queue.get_nowait()
+        except queue.Empty:
+            return None
+        if response.get("kind") != expected_kind:
+            raise RuntimeError(f"unexpected kind: {response.get('kind')}")
+        return response
+
+    def _send_command(
+        self,
+        target: str,
+        wire: bytes,
+        waiter: Optional[CommandWaiter] = None,
+        expected_kind: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         target_aid = self.runners[target].agent_id
         last: Optional[Exception] = None
         # 5 attempts with progressive backoff covers a ~25 s reconnect
@@ -498,16 +533,28 @@ class FleetHarness:
         # on the live fleet without giving up on otherwise-healthy
         # nodes.
         for attempt in range(1, 6):
+            if waiter is not None and expected_kind is not None:
+                response = self._take_expected_result(waiter, expected_kind)
+                if response is not None:
+                    return response
             try:
                 self.client.direct_send(target_aid, wire)
-                return
+                return None
             except Exception as exc:
                 last = exc
                 self.log.debug(
                     "cmd DM to %s attempt %d/5: %s", target, attempt, exc,
                 )
+            if waiter is not None and expected_kind is not None:
+                response = self._take_expected_result(waiter, expected_kind)
+                if response is not None:
+                    return response
             if attempt < 5:
                 time.sleep(min(8, 2 * attempt))
+        if waiter is not None and expected_kind is not None:
+            response = self._take_expected_result(waiter, expected_kind)
+            if response is not None:
+                return response
         raise RuntimeError(
             f"cmd DM to {target} failed after 5 attempts: {last}"
         )
