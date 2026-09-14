@@ -335,6 +335,18 @@ const VERSION_V3: u8 = 0x03;
 /// Domain and bounds of gossip #48's Signed KV inner verifier (ADR-0063).
 const MSG_V3_PREFIX: &[u8] = b"x0x-msg-v3";
 const MAX_V3_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+/// Largest application payload that fits a signed V3 envelope for `topic`.
+/// Callers that create indivisible state images use this to fail explicitly
+/// before publication rather than relying on a transport rejection.
+pub(crate) fn max_signed_v3_payload_bytes(topic: &str) -> Option<usize> {
+    let header = 1usize
+        .checked_add(32)?
+        .checked_add(2 + ML_DSA_65_PUBKEY_LEN)?
+        .checked_add(2 + ML_DSA_65_SIG_LEN)?
+        .checked_add(2 + topic.len())?;
+    MAX_V3_ENVELOPE_BYTES.checked_sub(header)
+}
 const ML_DSA_65_PUBKEY_LEN: usize = 1952;
 const ML_DSA_65_SIG_LEN: usize = 3309;
 

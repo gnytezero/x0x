@@ -648,6 +648,7 @@ enum RehydrateOutcome {
 fn is_group_store_manifest(entry: &CrdtSubscriptionEntry) -> bool {
     entry.extra.contains_key("stable_group_id")
         || entry.extra.get("policy").and_then(|v| v.as_str()) == Some("encrypted")
+        || entry.extra.get("policy").and_then(|v| v.as_str()) == Some("group_signed")
 }
 
 /// Rehydrate a single persisted subscription. See [`rehydrate`] for the

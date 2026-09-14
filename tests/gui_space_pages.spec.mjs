@@ -271,35 +271,21 @@ test('a failed listing is reported, not rendered as an empty wiki', async ({ pag
   expect(html).not.toContain('No wiki pages yet');
 });
 
-test('a public space uses the legacy local-agent store and is described truthfully', async ({ page }) => {
+test('a public space uses the shared group store and never opens a generic store', async ({ page }) => {
+  const RETURNED = 'x0x/group/public/kv/wiki';
   const seen = await mountGui(page, {
     [`GET /groups/${SID}`]: publicGroup(),
-    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
-    'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
   });
 
   await page.evaluate((sid) => {
     document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div>');
     return window.loadWikiPages(sid);
   }, SID);
-  expect(seen).toContain('GET /stores');
-
-  // The public lane still uses the LEGACY generic store, whose identity the
-  // daemon derives from the topic and the LOCAL agent
-  // (lib.rs:15724-15727 for_topic_owner(topic, &self.agent_id())). The GUI
-  // never anchors the Space owner, so the tab must not claim the Space owner
-  // is the only writer, must not tell anyone they are read-only, and must not
-  // claim collaborative editing either. (Senior P2.)
-  const blurb = await page.evaluate((sid) => {
-    const el = document.createElement('div');
-    window.renderSpaceWiki(el, sid);
-    return el.querySelector('p').textContent;
-  }, SID);
-  const low = blurb.toLowerCase();
-  expect(low).not.toContain('only the space owner');
-  expect(low).not.toContain('read-only');
-  expect(low).not.toContain('collaborative');
-  expect(low).toContain('your own device');
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
+  expect(seen).not.toContain('GET /stores');
+  expect(seen).not.toContain('POST /stores');
 });
 
 test('a failed wiki read keeps the open draft, its title and the save target', async ({ page }) => {
@@ -416,8 +402,7 @@ test('an unrecognised confidentiality is treated as private (fails closed)', asy
 async function warmPublicThenGoPrivate(page, app, extra) {
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
-    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
-    'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: `public-${app}` } },
     ...(extra || {}),
   };
   const seen = await mountGui(page, routes);
@@ -426,7 +411,7 @@ async function warmPublicThenGoPrivate(page, app, extra) {
     document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div><div id="web-pages"></div>');
     return window[fn](sid);
   }, [SID, loader]);
-  expect(seen).toContain('GET /stores');       // warmed on the public lane
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
   routes[`GET /groups/${SID}`] = privateGroup();
   seen.length = 0;
   return { seen, routes };
@@ -501,7 +486,8 @@ test('an old-policy resolution released after private is observed cannot save to
   // must not issue a generic POST/PUT, must not publish a public cache entry,
   // and must not report a false save success to its own caller.
   const RETURNED = 'grp-store-stale-inflight';
-  const gate = makeGate(['GET /stores']);
+  const gateKey = `POST /groups/${SID}/stores#1`;
+  const gate = makeGate([gateKey]);
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [] } },
@@ -519,7 +505,7 @@ test('an old-policy resolution released after private is observed cannot save to
 
   // Start a real SAVE under the public policy; it blocks inside its resolver.
   const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
-  await gate.holds['GET /stores'].enteredPromise;   // REAL request boundary
+  await gate.holds[gateKey].enteredPromise;
 
   // The space goes private and another operation observes it.
   routes[`GET /groups/${SID}`] = privateGroup();
@@ -528,7 +514,7 @@ test('an old-policy resolution released after private is observed cannot save to
 
   // Everything recorded from here on is strictly AFTER private was observed.
   const boundary = seen.length;
-  gate.holds['GET /stores'].release();
+  gate.holds[gateKey].release();
   await save;
   const after = seen.slice(boundary);
 
@@ -603,11 +589,13 @@ test('a policy change observed in the Wiki also invalidates a warm Web resolutio
 test('a save held under public cannot complete generically after the policy read fails', async ({ page }) => {
   // Root R2 P2: the unavailable branch returned WITHOUT observing, so the old
   // public generation stayed valid and the held resolver still went generic.
-  const gate = makeGate(['GET /stores']);
+  const gateKey = `POST /groups/${SID}/stores#1`;
+  const gate = makeGate([gateKey]);
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [] } },
     'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: 'held-unavailable' } },
   };
   const seen = await mountGui(page, routes, { gate });
   await page.evaluate(() => {
@@ -617,14 +605,14 @@ test('a save held under public cannot complete generically after the policy read
   });
 
   const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
-  await gate.holds['GET /stores'].enteredPromise;          // real boundary
+  await gate.holds[gateKey].enteredPromise;
 
   // A newer policy read FAILS while the save is held.
   routes[`GET /groups/${SID}`] = { status: 500, body: { ok: false, error: 'policy unavailable' } };
   await page.evaluate((sid) => window.loadWikiPages(sid), SID);
 
   const boundary = seen.length;
-  gate.holds['GET /stores'].release();
+  gate.holds[gateKey].release();
   await save;
   const after = seen.slice(boundary);
 
@@ -763,7 +751,8 @@ async function applyPrivateThroughTheRealForm(page, sid) {
 for (const app of ['wiki', 'web']) {
   test(`${app}: a held save cannot go generic after the real policy form makes the space private`, async ({ page }) => {
     const RETURNED = `grp-store-patch-${app}`;
-    const gate = makeGate(['GET /stores']);
+    const gateKey = `POST /groups/${SID}/stores#1`;
+    const gate = makeGate([gateKey]);
     const routes = {
       [`GET /groups/${SID}`]: publicGroup(),
       'GET /stores': { status: 200, body: { ok: true, stores: [] } },
@@ -783,7 +772,7 @@ for (const app of ['wiki', 'web']) {
 
     const saver = app === 'wiki' ? 'saveWikiPage' : 'saveWebPage';
     const save = page.evaluate(([sid, fn]) => window[fn](sid), [SID, saver]);
-    await gate.holds['GET /stores'].enteredPromise;      // real boundary
+    await gate.holds[gateKey].enteredPromise;
 
     // The user makes the space private through the REAL admin form, and the
     // PATCH SUCCEEDS, before the held save is released.
@@ -791,7 +780,7 @@ for (const app of ['wiki', 'web']) {
     expect(seen).toContain(`PATCH /groups/${SID}/policy`);
 
     const boundary = seen.length;
-    gate.holds['GET /stores'].release();
+    gate.holds[gateKey].release();
     await save;
     const after = seen.slice(boundary);
 
@@ -851,12 +840,14 @@ test('the real policy form invalidates the OTHER app’s warm resolution too', a
 });
 
 test('a FAILED policy PATCH is still treated as uncertain, not as no-op', async ({ page }) => {
-  const gate = makeGate(['GET /stores']);
+  const gateKey = `POST /groups/${SID}/stores#1`;
+  const gate = makeGate([gateKey]);
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [] } },
     'POST /stores': { status: 200, body: { ok: true } },
     [`PATCH /groups/${SID}/policy`]: { status: 500, body: { ok: false, error: 'patch failed' } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: 'held-failed-patch' } },
   };
   const seen = await mountGui(page, routes, { gate });
   await page.evaluate(() => {
@@ -866,11 +857,11 @@ test('a FAILED policy PATCH is still treated as uncertain, not as no-op', async 
   });
 
   const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
-  await gate.holds['GET /stores'].enteredPromise;
+  await gate.holds[gateKey].enteredPromise;
   await applyPrivateThroughTheRealForm(page, SID);   // PATCH errors
 
   const boundary = seen.length;
-  gate.holds['GET /stores'].release();
+  gate.holds[gateKey].release();
   await save;
   const after = seen.slice(boundary);
 
@@ -1011,12 +1002,14 @@ for (const [app, saver, contentId, editorId, errId] of [
 ]) {
   test(`${app}: a save whose PUT already succeeded is reported truthfully, not as unwritten`, async ({ page }) => {
     const generic = `x0x-${app}-${SID.slice(0, 16)}`;
-    const PUTKEY = `PUT /stores/${generic}/`;
+    const bound = `group-${app}-write-outcome`;
+    const PUTKEY = `PUT /stores/${bound}/`;
     const gate = makeGate([PUTKEY]);
     const routes = {
       [`GET /groups/${SID}`]: publicGroup(),
       'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
       'POST /stores': { status: 200, body: { ok: true } },
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: bound } },
       [PUTKEY]: { status: 200, body: { ok: true } },      // the write SUCCEEDS
       [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
     };
@@ -1061,12 +1054,14 @@ for (const [app, saver, contentId, editorId, errId] of [
 
 test('a read interrupted after its request cannot claim nothing was read', async ({ page }) => {
   const generic = `x0x-wiki-${SID.slice(0, 16)}`;
-  const KEYS = `GET /stores/${generic}/keys`;
+  const bound = 'group-wiki-read-outcome';
+  const KEYS = `GET /stores/${bound}/keys`;
   const gate = makeGate([KEYS]);
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
     'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: bound } },
     [KEYS]: { status: 200, body: { ok: true, keys: ['page-a'] } },
     [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
   };
