@@ -8900,7 +8900,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     // Calling replay inside _serialized while the non-reentrant guard is held
     // re-enters the same mutex → deadlock (Kimi blocker 1).
     let mut replay_group_id: Option<String> = None;
-    let applied = apply_named_group_metadata_event_inner_serialized(
+    let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
         sender,
@@ -8911,7 +8911,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         &mut replay_group_id,
         false,
         false,
-    )
+    ))
     .await;
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid).await;
@@ -8931,7 +8931,7 @@ async fn apply_named_group_metadata_event_inner(
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
     let mut replay_group_id: Option<String> = None;
-    let applied = apply_named_group_metadata_event_inner_serialized(
+    let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
         sender,
@@ -8942,7 +8942,7 @@ async fn apply_named_group_metadata_event_inner(
         &mut replay_group_id,
         false,
         false,
-    )
+    ))
     .await;
     if allow_queue {
         if let Some(gid) = replay_group_id {

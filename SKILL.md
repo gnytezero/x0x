@@ -575,6 +575,85 @@ list and retry, or conclude it is gone.
 
 **Joining a task list from a second machine = create a list with the SAME topic.** There is no join verb for task lists: the list id derives from the topic alone (`TaskListId::from_topic`), so a second machine runs `x0x tasks create <any-name> <same-topic>` and its replica converges via the state-sync side channel (cold-start bootstrap, then deltas). A plain `x0x subscribe <topic>` does NOT materialize the list — without the create, no replica exists to answer the bootstrap. KV stores are the contrast: they DO have a join verb (`POST /stores/:id/join`, anchored on the owner's agent_id).
 
+
+#### Group Wiki/Web stores
+
+Open a deterministic group-bound store with the full canonical group ID and
+the application name (`wiki` or `web`):
+
+```bash
+curl -X POST "http://$API/groups/$GROUP_ID/stores" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name":"wiki"}'
+# -> {ok,id,store_id,group_id,topic,policy,epoch,...}
+```
+
+Use the returned `id` with the ordinary store endpoints:
+
+```bash
+curl "http://$API/stores/$STORE_ID/keys" -H "Authorization: Bearer $TOKEN"
+curl "http://$API/stores/$STORE_ID/$KEY" -H "Authorization: Bearer $TOKEN"
+curl -X PUT "http://$API/stores/$STORE_ID/$KEY" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"value":"<base64 bytes>","content_type":"text/markdown"}'
+curl -X DELETE "http://$API/stores/$STORE_ID/$KEY" -H "Authorization: Bearer $TOKEN"
+```
+
+`$STORE_ID` and `$KEY` each occupy one URL path segment: percent-encode `/`,
+`%`, `?`, `#`, spaces, and non-ASCII bytes. Check both the HTTP status and
+the JSON `ok` field.
+`403` means the current read/write role does not allow the operation, `404`
+means the store or key is unavailable, and `409` means a binding, immutable-key,
+or idempotency conflict. Do not infer success from a transport-level response.
+
+For `SignedPublic`, reads follow the group's current public/member read policy;
+writes require a current group writer. Confidential Home and TreeKEM Wiki/Web
+stores use the same group-bound routes above, but remain encrypted: current
+members may read, while the current role policy controls writes. Never fall back
+to generic `Signed` create/join routes for any group-bound Wiki/Web store.
+
+Retained-history bootstrap is endorsed by the current writer who serves or
+imports it. That endorser is authenticated against the current group binding and
+role. If historical entry authorship is surfaced, treat it as unverified
+historical metadata: the current endorsement does not verify or recreate the original
+authors' provenance.
+
+#### Explicit legacy Wiki/Web recovery
+
+The group-bound identity does not implicitly republish viewer-owned legacy
+Wiki/Web stores. Discover and review an exact local source first:
+
+```bash
+curl "http://$API/groups/$GROUP_ID/stores/wiki/legacy-imports" \
+  -H "Authorization: Bearer $TOKEN"
+curl "http://$API/groups/$GROUP_ID/stores/wiki/legacy-imports/$SOURCE_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Listing/download requires authority to read that local source. Use only the
+typed `source_store_id` returned for the full canonical group ID and `wiki` or
+`web`; do not construct paths or source IDs. If `ambiguous_group_prefix` is
+true, stop and select the full group explicitly—no 16-character alias is chosen
+implicitly. Preserve the downloaded snapshot before import.
+
+A current group writer may endorse the reviewed source into the destination:
+
+```bash
+curl -X POST "http://$API/groups/$GROUP_ID/stores/wiki/legacy-imports/$SOURCE_ID" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"source_digest":"<digest from listing>","idempotency_key":"<stable retry key>"}'
+```
+
+Keep the same idempotency key, source ID, and `source_digest` for every retry;
+reusing a key with different arguments returns `409`. Import merges CRDT history,
+preserving concurrent destination state and reporting conflicts rather than
+silently deleting it. If the response is lost or reports that the destination
+persisted but its receipt did not, the outcome is uncertain: list the candidate
+again and inspect its `imported` state. Preserve the source snapshot, then retry only with the exact same source,
+digest, and idempotency key; do not create a new key to force another import.
+A receipt attributes endorsement to the current writer, not to the legacy
+entries' original authors.
+
 ### 4.6 Files
 
 ```bash

@@ -56,8 +56,9 @@ fn run_driver(driver: &str, label: &str) -> (bool, String) {
         // ---- minimal DOM/storage/network sandbox ----
         function fakeElement(id) {
             const el = {
-                id: id, value: '', textContent: '', innerHTML: '', srcdoc: '',
+                id: id, value: '', innerHTML: '', srcdoc: '',
                 style: {}, dataset: {}, checked: false, files: [],
+                isConnected: true,
                 children: [], _listeners: {},
                 setAttribute() {}, getAttribute() { return null },
                 appendChild(c) { this.children.push(c); return c },
@@ -73,6 +74,20 @@ fn run_driver(driver: &str, label: &str) -> (bool, String) {
                 classList: { add() {}, remove() {}, toggle() {}, contains() { return false } },
                 insertAdjacentHTML() {},
             };
+            // Production `esc` assigns textContent and reads innerHTML. Model
+            // that DOM contract instead of leaving the two unrelated, which
+            // turns every escaped user/API value into an empty string.
+            let textContent = '';
+            Object.defineProperty(el, 'textContent', {
+                set(v) {
+                    textContent = String(v ?? '');
+                    this.innerHTML = textContent
+                        .replaceAll('&', '&amp;')
+                        .replaceAll('<', '&lt;')
+                        .replaceAll('>', '&gt;');
+                },
+                get() { return textContent; },
+            });
             Object.defineProperty(el, 'src', { set() {}, get() { return '' } });
             return el;
         }
@@ -162,6 +177,110 @@ fn run_driver(driver: &str, label: &str) -> (bool, String) {
         }
         Err(e) => (false, format!("failed to run node: {e}")),
     }
+}
+
+#[test]
+fn gui_legacy_discovery_shows_conflicts_and_explicit_import() {
+    let driver = format!(
+        r#"
+{DRIVER_PREAMBLE}
+ROUTES['GET /groups/sid1/stores/wiki/legacy-imports'] = {{ _http_ok: true, ok: true, candidates: [{{ target_group_id: 'sid1', source_store_id: 'source1', source_digest: 'digest1', keys: ['old-page'], conflicts: ['shared'], ambiguous_group_prefix: true, imported: false, can_import: true, import_refusal_reason: null }}] }};
+ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: true, ok: true, receipt: {{}} }};
+globalThis.__done = loadLegacyPageImport('sid1','wiki').then(async () => {{
+    const panel = document.getElementById('wiki-legacy').innerHTML;
+    await importLegacyPages('sid1','wiki','source1','digest1');
+    console.log(JSON.stringify({{ panel, calls: CALLS, toasts: TOASTS }}));
+}});
+"#
+    );
+    let (ok, out) = run_driver(&driver, "legacy_import");
+    assert!(ok, "driver failed: {out}");
+    let value: serde_json::Value =
+        serde_json::from_str(out.lines().last().expect("driver JSON")).expect("parse driver JSON");
+    let panel = value["panel"].as_str().expect("rendered panel");
+    assert!(panel.contains("old-page"), "candidate keys visible: {out}");
+    assert!(
+        panel.contains("Target sid1 · Source source1"),
+        "exact ambiguity binding visible: {out}"
+    );
+    assert!(
+        panel.contains("data-legacy-import=\"source1\""),
+        "selected source retained in control: {out}"
+    );
+    assert!(
+        panel.contains("data-legacy-digest=\"digest1\""),
+        "reviewed digest retained in control: {out}"
+    );
+    assert!(
+        panel.contains("Conflicting current pages"),
+        "conflicts visible: {out}"
+    );
+    assert!(
+        panel.contains("historical alias is shared"),
+        "ambiguity visible: {out}"
+    );
+    assert!(
+        out.contains("POST /groups/sid1/stores/wiki/legacy-imports/source1"),
+        "explicit selected source imported: {out}"
+    );
+    assert!(
+        out.contains("Legacy pages imported into this space"),
+        "truthful success: {out}"
+    );
+}
+
+#[test]
+fn gui_legacy_failed_import_is_uncertain_and_reuses_idempotency_key() {
+    let driver = format!(
+        r#"
+{DRIVER_PREAMBLE}
+ROUTES['POST /groups/sid1/stores/wiki/legacy-imports/source1'] = {{ _http_ok: false, _http_status: 500, error: 'destination persisted but receipt did not' }};
+globalThis.__done = (async () => {{
+    const first=legacyImportAttemptKey('sid1','wiki','source1','digest1');
+    await importLegacyPages('sid1','wiki','source1','digest1');
+    const second=legacyImportAttemptKey('sid1','wiki','source1','digest1');
+    await importLegacyPages('sid1','wiki','source1','digest1');
+    console.log(JSON.stringify({{ first, second, calls: CALLS, toasts: TOASTS }}));
+}})();
+"#
+    );
+    let (ok, out) = run_driver(&driver, "legacy_uncertain_retry");
+    assert!(ok, "driver failed: {out}");
+    assert!(
+        out.contains("Some content may already have been applied"),
+        "uncertainty is explicit: {out}"
+    );
+    let line = out.lines().last().expect("JSON output");
+    let value: serde_json::Value = serde_json::from_str(line).expect("driver JSON");
+    assert_eq!(
+        value["first"], value["second"],
+        "retry key must remain stable"
+    );
+}
+
+#[test]
+fn gui_legacy_nonwriter_can_discover_and_download_but_not_import() {
+    let driver = format!(
+        r#"
+{DRIVER_PREAMBLE}
+ROUTES['GET /groups/sid1/stores/web/legacy-imports'] = {{ _http_ok: true, ok: true, candidates: [{{ target_group_id: 'sid1', source_store_id: 'source2', source_digest: 'digest2', keys: ['index'], conflicts: [], ambiguous_group_prefix: false, imported: false, can_import: false, import_refusal_reason: 'your current group role cannot endorse legacy history' }}] }};
+globalThis.__done = loadLegacyPageImport('sid1','web').then(() => console.log(document.getElementById('web-legacy').innerHTML));
+"#
+    );
+    let (ok, out) = run_driver(&driver, "legacy_nonwriter");
+    assert!(ok, "driver failed: {out}");
+    assert!(
+        out.contains("Download snapshot"),
+        "download remains available: {out}"
+    );
+    assert!(
+        out.contains("Import unavailable"),
+        "write refusal is visible: {out}"
+    );
+    assert!(
+        out.contains("disabled"),
+        "import control is disabled: {out}"
+    );
 }
 
 /// Shared driver preamble: stub `api` after the script has loaded (the

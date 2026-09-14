@@ -2927,8 +2927,9 @@ function renderFeedPosts(sid){
 //     so plainly and shows nothing. It does not fall back, and it does not
 //     surface any page from a legacy generic store.
 //
-// Legacy pages written by earlier builds stay exactly where they are. Nothing
-// here reads, copies, moves, republishes or deletes them.
+// Legacy pages written by earlier builds remain untouched. The discovery
+// panel can preview their keys, download the exact snapshot, and lets a
+// current writer explicitly import retained content into the shared store.
 //
 // The group opener now returns a creator-anchored shared store: SignedPublic
 // groups use signed plaintext with current roster/policy authorization, while
@@ -3135,9 +3136,66 @@ function spacePagesUnavailable(el,reason){
   el.innerHTML='<div class="card mb" style="font-size:12px;color:var(--tx3)">'+esc(reason)+'</div>';
 }
 
+function legacyImportElement(app){return document.getElementById(app+'-legacy')}
+const legacyImportKeys={};
+function legacyImportAttemptKey(sid,app,sourceId,digest){
+  const binding=sid+'|'+app+'|'+sourceId+'|'+digest;
+  if(!legacyImportKeys[binding])legacyImportKeys[binding]=(globalThis.crypto&&crypto.randomUUID)?crypto.randomUUID():(Date.now()+'-'+Math.random().toString(16).slice(2));
+  return legacyImportKeys[binding];
+}
+
+async function loadLegacyPageImport(sid,app){
+  const el=legacyImportElement(app);if(!el)return;
+  const r=await api('/groups/'+encSeg(sid)+'/stores/'+encSeg(app)+'/legacy-imports');
+  if(!el.isConnected)return;
+  if(!r||!r._http_ok){
+    el.innerHTML='<div class="card" style="font-size:12px;color:var(--tx3)">Legacy page discovery is unavailable. '+esc(apiError(r))+'</div>';
+    return;
+  }
+  const candidates=r.candidates||[];
+  if(!candidates.length){el.innerHTML='';return}
+  el.innerHTML=candidates.map(c=>{
+    const keys=(c.keys||[]).map(esc).join(', ')||'No active pages';
+    const conflicts=(c.conflicts||[]).map(esc).join(', ');
+    const ambiguity=c.ambiguous_group_prefix?' This historical alias is shared by more than one local space. Import will use target '+esc(c.target_group_id)+' and source '+esc(c.source_store_id)+'.':'';
+    const conflictText=conflicts?' Conflicting current pages: '+conflicts+'.':'';
+    const imported=c.imported?' This exact snapshot was already imported.':'';
+    const refusal=c.import_refusal_reason?' Import unavailable: '+esc(c.import_refusal_reason)+'.':'';
+    return `<div class="card" style="font-size:12px"><strong>Legacy ${esc(app)} pages found</strong><div class="mt" style="color:var(--tx3)">${keys}.${conflictText}${ambiguity}${esc(imported)}${refusal}</div><div class="mt" style="font-family:var(--mono);font-size:10px;color:var(--tx3)">Target ${esc(c.target_group_id)} · Source ${esc(c.source_store_id)}</div><div class="row mt"><button data-legacy-download="${esc(c.source_store_id)}" onclick="downloadLegacyPages('${sid}','${app}',this.dataset.legacyDownload)">Download snapshot</button><button class="pri" data-legacy-import="${esc(c.source_store_id)}" data-legacy-digest="${esc(c.source_digest)}" onclick="importLegacyPages('${sid}','${app}',this.dataset.legacyImport,this.dataset.legacyDigest)" ${c.imported||!c.can_import?'disabled':''}>Import this snapshot into this shared space</button></div></div>`;
+  }).join('');
+}
+
+async function downloadLegacyPages(sid,app,sourceId){
+  const r=await api('/groups/'+encSeg(sid)+'/stores/'+encSeg(app)+'/legacy-imports/'+encSeg(sourceId));
+  if(!r||!r._http_ok||!r.snapshot_b64){toast('Legacy snapshot download failed. '+apiError(r),'error');return}
+  try{
+    const raw=atob(r.snapshot_b64);const bytes=new Uint8Array(raw.length);
+    for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+    const url=URL.createObjectURL(new Blob([bytes],{type:'application/octet-stream'}));
+    const a=document.createElement('a');a.href=url;a.download='x0x-'+app+'-legacy-'+sourceId.slice(0,16)+'.bin';a.click();URL.revokeObjectURL(url);
+  }catch(e){toast('Legacy snapshot could not be prepared for download.','error')}
+}
+
+async function importLegacyPages(sid,app,sourceId,digest){
+  const key=legacyImportAttemptKey(sid,app,sourceId,digest);
+  const r=await api('/groups/'+encSeg(sid)+'/stores/'+encSeg(app)+'/legacy-imports/'+encSeg(sourceId),{method:'POST',body:JSON.stringify({source_digest:digest,idempotency_key:key})});
+  if(!r||!r._http_ok||!r.ok){
+    toast('The import was not confirmed. Some content may already have been applied; the same request will be used if you retry. '+apiError(r),'error');
+    if(app==='wiki')loadWikiPages(sid);else loadWebPages(sid);
+    loadLegacyPageImport(sid,app);
+    return;
+  }
+  delete legacyImportKeys[sid+'|'+app+'|'+sourceId+'|'+digest];
+  toast('Legacy pages imported into this space','success');
+  resetSpacePageStore(sid,app);
+  if(app==='wiki')loadWikiPages(sid);else loadWebPages(sid);
+  loadLegacyPageImport(sid,app);
+}
+
 // --- Space: Wiki ---
 function renderSpaceWiki(el,sid){
   el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Wiki pages are shared through this space's group store. You can read them when the space's read policy allows it, and save when your current role has write permission.</p>
+  <div id="wiki-legacy" class="mb"></div>
   <div class="row mb"><input id="wiki-slug" placeholder="Page name (e.g. getting-started)"><button class="pri" onclick="createWikiPage('${sid}')">Create Page</button></div>
   <div id="wiki-pages"></div>
   <div id="wiki-editor" style="display:none" class="mt">
@@ -3147,6 +3205,7 @@ function renderSpaceWiki(el,sid){
     <div class="row mt"><button class="pri" onclick="saveWikiPage('${sid}')">Save</button><button onclick="document.getElementById('wiki-editor').style.display='none'">Cancel</button></div>
   </div>`;
   loadWikiPages(sid);
+  loadLegacyPageImport(sid,'wiki');
 }
 
 function createWikiPage(sid){
@@ -3235,6 +3294,7 @@ async function editWikiPage(sid,slug){
 // --- Space: Web ---
 function renderSpaceWeb(el,sid){
   el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Web pages are shared through this space's group store. You can read them when the space's read policy allows it, and save when your current role has write permission.</p>
+  <div id="web-legacy" class="mb"></div>
   <div class="row mb"><input id="web-path" placeholder="Page path (e.g. index, about)"><button class="pri" onclick="editWebPage('${sid}')">Edit Page</button></div>
   <div id="web-preview" class="card" style="min-height:200px;padding:20px">
     <div style="color:var(--tx3);text-align:center;padding:40px">Select or create a page to preview</div>
@@ -3247,6 +3307,7 @@ function renderSpaceWeb(el,sid){
   <h3>Pages</h3><div id="web-pages"></div>`;
   resetWebPreviewGen();
   loadWebPages(sid);
+  loadLegacyPageImport(sid,'web');
 }
 let currentWebPath='';
 

@@ -2534,6 +2534,14 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    load_snapshot_bytes(&bytes).map(Some)
+}
+
+/// Decode one already-bounded snapshot buffer.
+///
+/// This is used by explicit import paths that must hash and validate the
+/// exact bytes they decode, without reopening a mutable filesystem path.
+pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
     let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC.as_slice()) else {
         return Err(std::io::Error::other(
             "unrecognized kv snapshot format (missing v1 magic) — corrupt or foreign file; \
@@ -2557,7 +2565,7 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
         );
     }
     store.restore_seq_counter(body.seq_counter.max(store.current_version()));
-    Ok(Some(store))
+    Ok(store)
 }
 
 #[cfg(test)]

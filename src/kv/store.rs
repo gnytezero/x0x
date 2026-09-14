@@ -31,7 +31,7 @@
 use crate::identity::AgentId;
 use crate::kv::encrypted::KvSecureContext;
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
-use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
+use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -589,6 +589,18 @@ fn validate_entry_integrity(outer_key: &str, entry: &KvEntry) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn retained_entries_equal(
+    left: &HashMap<String, KvEntry>,
+    right: &HashMap<String, KvEntry>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, left_entry)| {
+            right
+                .get(key)
+                .is_some_and(|right_entry| entry_frozen_fields_equal(left_entry, right_entry))
+        })
 }
 
 /// Inputs required to build an owner-signed checkpoint.
@@ -1702,6 +1714,21 @@ impl KvStore {
         content_type: String,
         peer_id: PeerId,
     ) -> Result<()> {
+        if !self.preflight_put_content(&key, &value, &content_type)? {
+            return Ok(());
+        }
+        let seq = self.reserve_sequences(1)?;
+        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+    }
+
+    /// Validate deterministic content constraints before reserving a local
+    /// sequence. Returns `false` only for an AppendOnly idempotent re-put.
+    pub(crate) fn preflight_put_content(
+        &self,
+        key: &str,
+        value: &[u8],
+        content_type: &str,
+    ) -> Result<bool> {
         if value.len() > crate::kv::entry::MAX_INLINE_SIZE {
             return Err(KvError::ValueTooLarge {
                 size: value.len(),
@@ -1709,15 +1736,14 @@ impl KvStore {
             });
         }
         if matches!(self.policy, AccessPolicy::AppendOnly) {
-            if let Some(existing) = self.get(&key) {
+            if let Some(existing) = self.get(key) {
                 if existing.value == value && existing.content_type == content_type {
-                    return Ok(());
+                    return Ok(false);
                 }
-                return Err(KvError::ImmutableKey(key));
+                return Err(KvError::ImmutableKey(key.to_string()));
             }
         }
-        let seq = self.reserve_sequences(1)?;
-        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+        Ok(true)
     }
 
     pub(crate) fn put_with_reserved_sequence(
@@ -2783,6 +2809,115 @@ impl KvStore {
         }
         *self = trial;
         Ok(())
+    }
+
+    /// Import retained content from one locally preserved legacy page store.
+    ///
+    /// The caller authenticates the current group writer and validates the
+    /// exact legacy manifest/snapshot binding. This method deliberately moves
+    /// only CRDT content: destination identity, group policy, checkpoints,
+    /// allowlists, and persistence authority remain local.
+    pub fn merge_legacy_signed_history(
+        &mut self,
+        source: &KvStore,
+        expected_source_owner: AgentId,
+        endorser: AgentId,
+        local_peer: PeerId,
+    ) -> Result<()> {
+        Self::validate_legacy_signed_source(source, expected_source_owner)?;
+        if !matches!(
+            self.policy,
+            AccessPolicy::GroupSigned { .. }
+                | AccessPolicy::Encrypted { .. }
+                | AccessPolicy::TreeKemEncrypted { .. }
+        ) {
+            return Err(KvError::Unauthorized(
+                "legacy import requires a group destination".to_string(),
+            ));
+        }
+
+        let retained_sequence_floor = self
+            .keys
+            .max_retained_sequence_for_peer(&local_peer)
+            .into_iter()
+            .chain(source.keys.max_retained_sequence_for_peer(&local_peer))
+            .max();
+        if retained_sequence_floor.is_some_and(|floor| floor > u64::MAX - 2) {
+            return Err(KvError::Merge(
+                "legacy history leaves insufficient local sequence allocator capacity".to_string(),
+            ));
+        }
+        let mut trial = self.clone();
+        trial
+            .keys
+            .merge_state(&source.keys)
+            .map_err(|e| KvError::Merge(format!("legacy OR-Set image merge failed: {e}")))?;
+        for (key, entry) in &source.entries {
+            if let Some(local) = trial.entries.get_mut(key) {
+                local.merge(entry);
+            } else {
+                trial.entries.insert(key.clone(), entry.clone());
+            }
+        }
+        // `merge_state` records a new OR-Set version only when it retains a
+        // previously unseen add or tombstone. Compare entries by their logical
+        // fields because their metadata maps have no canonical byte order.
+        let changed = trial.keys.version() != self.keys.version()
+            || !retained_entries_equal(&trial.entries, &self.entries)
+            || trial.last_history_endorser.as_ref() != Some(&endorser);
+        trial.last_history_endorser = Some(endorser);
+        if changed {
+            trial.version = self.version.saturating_add(1);
+        }
+        if let Some(floor) = retained_sequence_floor {
+            trial.restore_seq_counter(floor);
+        }
+        *self = trial;
+        Ok(())
+    }
+
+    /// Validate every retained entry and the exact owner/policy binding
+    /// before opening or creating an import destination.
+    pub fn validate_legacy_signed_source(
+        source: &KvStore,
+        expected_source_owner: AgentId,
+    ) -> Result<()> {
+        if source.policy != AccessPolicy::Signed || source.owner != Some(expected_source_owner) {
+            return Err(KvError::Unauthorized(
+                "legacy import requires an owner-bound Signed source".to_string(),
+            ));
+        }
+        for (key, entry) in &source.entries {
+            validate_entry_integrity(key, entry)?;
+            if entry.value.len() > crate::kv::entry::MAX_INLINE_SIZE {
+                return Err(KvError::ValueTooLarge {
+                    size: entry.value.len(),
+                    max: crate::kv::entry::MAX_INLINE_SIZE,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Active keys for which source and destination currently carry
+    /// different retained values. The CRDT merge still decides the winner;
+    /// this list makes that decision visible to the explicit importer.
+    #[must_use]
+    pub fn legacy_import_conflicts(&self, source: &KvStore) -> Vec<String> {
+        let mut conflicts = source
+            .active_keys()
+            .into_iter()
+            .filter(|key| {
+                self.get(key)
+                    .zip(source.get(key))
+                    .is_some_and(|(ours, theirs)| {
+                        ours.value != theirs.value || ours.content_type != theirs.content_type
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        conflicts.sort();
+        conflicts
     }
 
     /// Current writer who authenticated the most recently imported retained
@@ -4229,6 +4364,156 @@ mod tests {
             "a legacy GSS image cannot cross into the TreeKEM plane"
         );
         assert!(treekem.get("removed").is_none());
+    }
+
+    #[test]
+    fn legacy_signed_import_is_content_only_and_retry_idempotent() {
+        let source_owner = agent(1);
+        let writer = agent(2);
+        let mut source = KvStore::new(
+            store_id(21),
+            "Legacy Wiki".to_string(),
+            source_owner,
+            AccessPolicy::Signed,
+        )
+        .expect("legacy source");
+        source
+            .put(
+                "removed".to_string(),
+                b"old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed removed key");
+        source.remove("removed").expect("source tombstone");
+        source
+            .put(
+                "imported".to_string(),
+                b"history".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed imported key");
+        source
+            .put(
+                "shared".to_string(),
+                b"legacy".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed conflicting key");
+        source
+            .entries
+            .get_mut("imported")
+            .expect("imported metadata target")
+            .metadata
+            .extend([
+                ("z-last".to_string(), "second".to_string()),
+                ("a-first".to_string(), "first".to_string()),
+            ]);
+        let encoded = bincode::serialize(&source).expect("legacy snapshot");
+        let source: KvStore = bincode::deserialize(&encoded).expect("restart decode");
+        assert_eq!(source.seq_counter_value(), 0, "allocator is not serialized");
+
+        let group = vec![9u8; 16];
+        let mut destination = KvStore::new_group_signed(
+            store_id(22),
+            "Wiki".to_string(),
+            writer,
+            group.clone(),
+            TestCtx::new(9, &[writer]),
+        )
+        .expect("destination");
+        destination
+            .put(
+                "concurrent".to_string(),
+                b"keep".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("local value");
+        destination
+            .put(
+                "shared".to_string(),
+                b"current".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("current conflicting key");
+
+        assert_eq!(
+            destination.legacy_import_conflicts(&source),
+            vec!["shared".to_string()]
+        );
+
+        let mut forged = source.clone();
+        let wrong_entry = forged.get("imported").expect("entry").clone();
+        forged
+            .entries
+            .insert("wrong-map-key".to_string(), wrong_entry);
+        let before_forged = bincode::serialize(&destination).expect("before forged import");
+        assert!(destination
+            .merge_legacy_signed_history(&forged, source_owner, writer, peer(2))
+            .is_err());
+        assert_eq!(
+            bincode::serialize(&destination).expect("after forged import"),
+            before_forged,
+            "invalid source rejection is transactionally unchanged"
+        );
+
+        destination
+            .merge_legacy_signed_history(&source, source_owner, writer, peer(2))
+            .expect("first import");
+        let first_counter = destination.seq_counter_value();
+        let first_version = destination.current_version();
+        assert!(destination.get("removed").is_none());
+        assert_eq!(
+            destination.get("imported").expect("imported").value,
+            b"history"
+        );
+        assert_eq!(destination.get("concurrent").expect("local").value, b"keep");
+        assert_eq!(destination.owner(), Some(&writer));
+        assert_eq!(destination.last_history_endorser(), Some(&writer));
+        assert!(matches!(
+            destination.policy(),
+            AccessPolicy::GroupSigned { group_id } if group_id == &group
+        ));
+        let encoded_retry = bincode::serialize(&source).expect("retry snapshot");
+        let mut reordered_source: KvStore =
+            bincode::deserialize(&encoded_retry).expect("retry restart decode");
+        let mut reordered_entries = HashMap::new();
+        let mut entry_keys = reordered_source.entries.keys().cloned().collect::<Vec<_>>();
+        entry_keys.sort_by(|left, right| right.cmp(left));
+        for key in entry_keys {
+            let mut entry = reordered_source.entries.remove(&key).expect("retry entry");
+            let mut metadata = entry.metadata.drain().collect::<Vec<_>>();
+            metadata.sort_by(|left, right| right.0.cmp(&left.0));
+            entry.metadata.extend(metadata);
+            reordered_entries.insert(key, entry);
+        }
+        reordered_source.entries = reordered_entries;
+        destination
+            .merge_legacy_signed_history(&reordered_source, source_owner, writer, peer(2))
+            .expect("restart/reordered receipt-failure retry");
+        assert_eq!(destination.seq_counter_value(), first_counter);
+        assert_eq!(
+            destination.current_version(),
+            first_version,
+            "logically identical retry does not advance the destination"
+        );
+
+        destination
+            .put(
+                "removed".to_string(),
+                b"re-added".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("re-add after imported same-peer tombstone");
+        assert_eq!(
+            destination.get("removed").expect("re-add visible").value,
+            b"re-added"
+        );
     }
 
     #[test]
