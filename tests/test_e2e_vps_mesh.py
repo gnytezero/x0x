@@ -14,6 +14,14 @@ from unittest import mock
 
 
 def load_mesh():
+    tunnel_script = Path(__file__).with_name("e2e_tunnel.py")
+    tunnel_spec = importlib.util.spec_from_file_location("e2e_tunnel", tunnel_script)
+    assert tunnel_spec is not None
+    tunnel_module = importlib.util.module_from_spec(tunnel_spec)
+    assert tunnel_spec.loader is not None
+    sys.modules[tunnel_spec.name] = tunnel_module
+    tunnel_spec.loader.exec_module(tunnel_module)
+
     script = Path(__file__).with_name("e2e_vps_mesh.py")
     spec = importlib.util.spec_from_file_location("e2e_vps_mesh", script)
     assert spec is not None
