@@ -2,6 +2,13 @@
 
 > Back to [SKILL.md](https://github.com/saorsa-labs/x0x/blob/main/SKILL.md)
 
+## Fleet CPU metrics
+
+On multi-daemon bootstrap hosts, co-tenant `%CPU` is **not** a valid acceptance
+metric. See [runbooks/fleet-cpu-metrics.md](runbooks/fleet-cpu-metrics.md)
+(issue [#656](https://github.com/saorsa-labs/x0x/issues/656); envelope fix:
+[saorsa-gossip#76](https://github.com/saorsa-labs/saorsa-gossip/issues/76)).
+
 ## Health Check
 
 ```bash
