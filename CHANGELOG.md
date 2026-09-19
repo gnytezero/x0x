@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (one-time, for literal matchers): the 409 `fork_quarantined`
+  refusal now explains itself (ADR-0066 §5, slice 1; #732).** The stable
+  machine code moved from `error` to a new `reason` field, and `error` became a
+  human sentence naming the condition, why the operation was refused, and the
+  clearing path. The body also gains a `fork_quarantine` object with
+  `revision`, `observed_at_ms`, `no_anchor` and a machine-readable
+  `clear_with`. **HTTP 409 and `ok: false` are unchanged**; any out-of-tree
+  client matching the literal `error == "fork_quarantined"` must move to
+  `reason` — `error` is prose from now on and its wording is not a contract.
+  Why: ADR-0066 R5 removed the warn-only window on the condition that a user
+  always learns why an operation was refused. The whole user-visible payload
+  used to be the string `fork_quarantined`, which for a marker that never
+  auto-clears is a permanent, unexplained refusal. The sentence branches on
+  `no_anchor` so the remedy it names is the one that can actually succeed for
+  that group (an owner-axis marker also clears when the owner anchor advances;
+  a `no_anchor` marker only clears with `force` plus a reason).
+  `reject_fork_quarantined` remains the single refusal helper (§3e) and the
+  diagnostics contract is unchanged (one `fork_quarantine_refusals` increment
+  per refusal). Docs: `docs/api-reference.md` (Error handling),
+  `docs/runbooks/fork-quarantine.md` §1, `docs/trust-and-connectivity.md`,
+  `SKILL.md`.
+- **The `x0x` CLI now prints a response's `reason` alongside the message**, as
+  `<message> (HTTP <code>, reason: <reason>)`. Errors with no `reason` render
+  byte-identically to before, so this affects exactly the reason-bearing
+  responses — which today means the new 409 `fork_quarantined` above **and the
+  pre-existing 409 `recipient_not_active`** (ADR-0028 active-recipient group key
+  sealing), whose CLI output gains `, reason: recipient_not_active`. The change
+  is in the shared `error_from_body` path rather than per-command, so any future
+  `api_error_with_reason` response inherits it: a human reads the sentence, a
+  script matching CLI output keeps the stable code. Anything parsing the CLI's
+  error line positionally should match on the `reason:` key, not on trailing
+  text.
+
 ### CI
 
 - **Coverage Gate no longer loses the ratchet on a red test pass (#607).** The
