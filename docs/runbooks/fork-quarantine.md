@@ -564,28 +564,101 @@ re-opening the gap.
 Source: `adr0066_coverage_map.rs::PENDING_RECHECK`,
 `adr0066_coverage_map.rs::SEND_PATH_RECHECK_CALL`.
 
-**(b) History reaper ignores quarantine.**
-`src/history/reaper.rs` (47 lines, zero quarantine mentions) runs age/byte
-eviction against every group unconditionally. Age or byte pressure can destroy a
-quarantined group's history rows, and a flooder who sends the node a stream of new
-history events for the group can drive that pressure. Nothing blocks ingest
-(`R3: tag-and-retain, never refused`). **Operational mitigation during an
-incident: raise `[history] max_age_days` and `[history] max_bytes` retention
-bounds before beginning triage**, so the forensic record is not evicted while you
-are reading it.
+**(b) History reaper ignores quarantine — CLOSED by ADR-0068 D1.**
+The reaper used to run ADR-0023 §6 age and byte eviction against every scope
+unconditionally, so a quarantined group's forensic record could be destroyed —
+and a flooder could *drive* that by sending the node a stream of recordable
+events (ingest is never refused: `R3: tag-and-retain`). **What you now see as an
+operator:** a group with a live marker has its `group:<id>` history rows PINNED —
+skipped by the age bound, by the per-scope budgets and by the whole-database
+budget — up to a **per-group ceiling** of `min(4 × base, [history] max_bytes/16)`,
+where `base` is that scope's configured `scope_limits` entry or
+`max_bytes / 64`. At the shipped 1 GiB default the ceiling is **64 MiB per
+quarantined group**. Past the ceiling the reaper sheds that group's **own** oldest
+rows and nothing else — no other scope pays for it — and counts them.
+Read both numbers from `GET /diagnostics/history`:
+`history_quarantine_pinned_scopes` (how many scopes are pinned right now, the
+`G` below) and `history_quarantine_pinned_evictions` (cumulative; **non-zero
+means a pinned group is at its ceiling and losing its oldest rows**, so copy the
+record out or raise `max_bytes` before continuing triage). Disk is bounded by
+`max_bytes × (1 + G/16)`; `G` counts groups this node has joined that are
+forked at the same time, which an attacker cannot inflate. Under whole-database
+pressure unpinned scopes are still evicted exactly as before — the pin protects
+the contested scope, it does not suspend the budget for everyone. On clear the
+scope returns to normal retention on the **next** pass (≤ 300 s), including rows
+the pin kept past the age bound. Raising `[history] max_age_days` and
+`max_bytes` during an incident is still useful for a very long one — it raises
+the ceiling too, since the ceiling is derived from `max_bytes`.
+**Residual you must know BEFORE an incident (cross-model review, 2026-09-20).**
+The ceiling and the `max_bytes × (1 + G/16)` bound are measured in **payload
+bytes**, while the whole-database phase measures the SQLite **file** (page count,
+which SQLite does not return promptly after a delete). A history row's file
+footprint here is roughly **4× its payload**, because the FTS5 projection is
+indexed alongside it. So in file terms one pinned group can hold about
+`4 × max_bytes/16 = max_bytes/4`, and **healthy-history displacement reaches
+100 % at around G≈4–5** simultaneously forked-and-joined groups rather than the
+G≈16 the payload arithmetic suggests: past that point the whole-database phase
+cannot reach enough unpinned bytes to get under budget, so it evicts every
+durable unpinned row it *can* reach. **Mitigation:** watch
+`history_quarantine_pinned_scopes` — at 4 or more, raise `[history] max_bytes`
+(which raises the ceiling proportionally, since the ceiling is derived from it)
+or copy the forensic record out and clear the quarantines you have finished
+triaging. **Recommended follow-up, needing its own ADR (not this one):** a GLOBAL
+pinned cap — total pinned ≤ `max_bytes/4`, evicting the oldest pinned rows across
+groups once reached — which would bound displacement independently of `G`, at the
+cost of letting one group's flood reach another group's pinned rows. ADR-0068
+deliberately did not make that trade.
+Source: `src/history/store.rs::retain_with_pins`,
+`src/history/store.rs::pinned_ceiling`,
+`src/history/store.rs::evict_pinned_scope_to_ceiling`,
+`src/history/store.rs::db_bytes`,
+`src/server/routes/history.rs::ReaperQuarantinePins`.
 
-**(c) Inbound peer task-CRDT deltas apply ungated.**
-Row 20 gates the LOCAL REST mutations. Inbound task-CRDT deltas from peers still
-apply at `TaskList::is_authorized_content_writer`
-(`src/crdt/task_list.rs::is_authorized_content_writer`), which tests the
-`authorized_agents` set that `apply_group_authorization`
-(`tasks.rs::apply_group_authorization`) derived from the group's active members —
-the contested roster itself. So while a quarantined group's own agent is refused
-locally, a peer's claim signed by a member of the disputed roster still merges and
-can move the deterministic winner. ADR-0066 §1 enumerates no task-ingest row (it
-is not row 20, and row 24's "keep ungated" is about metadata/state-commit apply).
-Closing it needs a superseding decision about whether it is refuse-class or, like
-history ingest under R3, tag-and-retain.
+**(c) Inbound peer task-CRDT deltas apply ungated — CLOSED by ADR-0068 D2.**
+Row 20 gates the LOCAL REST mutations. Inbound deltas from peers used to merge
+regardless, admitted by the `authorized_agents` set that
+`tasks.rs::apply_group_authorization` derives from the group's active members —
+the contested roster itself — so a peer seated by the disputed roster could keep
+claiming and completing, and move the deterministic winner, while this node's own
+agent was refused. **What you now see as an operator:** a quarantined group's
+task lists **freeze and then catch up**. While the marker is live, inbound deltas
+are held in arrival order (bounded: 1024 deltas / 1 MiB per list, oldest dropped)
+and the CRDT is left byte-identical; reads keep serving that frozen state with
+the usual `fork_quarantined` annotation, so a list that looks quiet is quiet
+*because* it is contained. Once the marker is gone — manual clear or
+owner-anchored — the held deltas are applied in order, within seconds, without
+an operator step. Watch `GET /diagnostics/groups` for
+`task_deltas_quarantine_buffered` (held), `task_deltas_quarantine_dropped`
+(**non-zero means the quarantine is outlasting the buffer**; the dropped work is
+recovered by anti-entropy after the clear, not by a replay) and
+`task_deltas_quarantine_applied` (caught up). The hold is process-local: a
+daemon restart during quarantine discards it and the list re-converges by
+anti-entropy after the clear instead. Group **metadata** ingest (row 24) is
+deliberately untouched, so the commit that clears the quarantine still arrives.
+A manual clear applies the held deltas **at once** (the clear route calls the
+drain after its roster write is durable); every other clear path — metadata
+apply, explicit owner seal, rollback arms — is picked up by the listener's own
+poll within `TASK_QUARANTINE_DRAIN_POLL_SECS` (5 s), which is the guarantee.
+The drain re-checks the ADR-0067 token (marker half) inside the same critical
+section as the merge, so a marker that re-installs while it is deciding abandons
+the drain and leaves the deltas buffered in order rather than applying them on a
+stale reading. A single delta larger than 1 MiB is dropped rather than held, so
+the per-list bound is the one stated here and not the transport's frame cap.
+
+**Residual (cross-model review, 2026-09-20):** a list's `authorized_agents` set
+is captured when the subscription is set up, so a delta buffered during the
+quarantine from an agent whom the *clearing* commit removes still applies at
+drain time. This is identical to the live path's admission — the same delta
+arriving one second before the marker installed would also have been applied —
+so containment is not weakened relative to an unquarantined node; it simply does
+not retro-apply the cleared roster to work it held. Pre-existing behaviour,
+recorded rather than silently inherited.
+Source: `src/crdt/sync.rs::admit_or_buffer`,
+`src/crdt/sync.rs::drain_quarantine_buffer`,
+`src/crdt/task_list.rs::is_authorized_content_writer`,
+`src/server/routes/tasks.rs::TaskQuarantineIngestGate`,
+`src/server/routes/tasks.rs::install_task_ingest_gate`,
+`src/server/routes/tasks.rs::resume_group_task_ingest`.
 
 **(d) `clear_group_quarantine` single-spelling: alias vs stable id — RESOLVED.**
 The clear used to resolve the MAP KEY only, so a group stored under an alias

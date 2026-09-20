@@ -12,7 +12,7 @@ mod discovery;
 mod exec;
 mod files;
 mod groups;
-mod history;
+pub(in crate::server) mod history;
 pub mod home;
 mod identity;
 mod key_move;
@@ -27,7 +27,7 @@ pub(crate) mod public_group_bootstrap_outbox;
 pub(super) mod status;
 pub(super) mod stores;
 mod sync;
-mod tasks;
+pub(in crate::server) mod tasks;
 mod trust;
 mod upgrade;
 
