@@ -6,6 +6,67 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A fork-quarantine marker that lands mid-operation now aborts the operation
+  instead of being overwritten by it (ADR-0066 §4, slice 7; ADR-0067; #732).**
+  Every gate slices 1–6 added checks the marker at the START of an operation.
+  Between that check and the persist, a marker can be installed, cleared, or
+  advanced to a new evidence revision — and the two roster-persisting paths
+  covered here write a WHOLE `GroupInfo` captured earlier, so a marker
+  arriving in that window was not merely ignored, it was **erased**, silently
+  ending containment. Both paths now re-derive the group's lifecycle epoch
+  token inside the same critical section that performs the mutation and fail
+  closed on a mismatch, before the irreversible step, leaving state
+  byte-identical:
+  - the invite-join roster install re-checks across the two fsyncs that sit
+    between its decision and its insert, and answers 409 `fork_quarantined`
+    (§5 body) rather than seating over a marker;
+  - the TreeKEM roster+snapshot atomic persist re-checks the marker under the
+    persistence lock it already holds, before any journal or live-file write.
+    The check is deliberately asymmetric — it fires only when the LIVE record
+    already carries a marker, so the marker remains settable (an incoming
+    record that ADDS one is the install path itself, the mirror of ADR-0066
+    §2's rule that gating the retry-rollback would make a marker unclearable).
+- **Home provisioning and reseal no longer erase a marker installed mid-seal
+  (found in cross-model security review of #748).** `stamp_and_seal_home` and
+  `reseal_home` clone the Home record under a read guard, DROP that guard,
+  await `seal_commit_owner_certified`, then write the WHOLE record back. A
+  forked sibling device landing authenticated fork evidence on the Home group
+  inside that window had its marker **erased** by the write — containment
+  dropped silently, on the group where the owner axis matters most. Both sites
+  now capture the lifecycle epoch token in the same read guard as the clone and
+  re-check it under the write guard before the insert; on a mismatch the seal
+  is refused, nothing is written and **the marker survives**. Provisioning is
+  retried on the next pass, not looped. The comparison is `MarkerOnly` (a seal
+  bumps `state_revision` by construction) and refuses in BOTH directions —
+  erasure and resurrection — because unlike the TreeKEM persist this path never
+  installs a marker, so there is no install to mistake a new marker for.
+- **Encrypted (GSS) KvStore access fails closed under fork quarantine
+  (ADR-0066 §1 rows 10–12, the bind-time gap; #732).** `GssKvSecureContext`
+  was the one cached KV authorization context blind to the marker —
+  `PublicGroupKvContext` folds it into `valid` and the TreeKEM context clears
+  its roster, but the GSS snapshot had no notion of quarantine and neither did
+  the refresh validator that feeds it. A marker installed AFTER an encrypted
+  store bound was therefore invisible to work already in flight, and the
+  cached roster kept authorizing writers on an authorization taken before the
+  fork was observed. Now a refresh that sees the marker suspends the context
+  (secret dropped, roster emptied) so sealing, opening and membership all fail
+  closed, and `validate_gss_store_group` refuses with the §5 message naming
+  the manual-clear remedy. **This is recoverable, unlike a withdrawal:** the
+  next refresh after `POST /groups/:id/quarantine/clear` re-arms the context.
+- The lifecycle epoch token is `(state_revision, marker_identity)`, **derived
+  on demand** from the live record rather than counted — no new field on
+  `GroupInfo`, so no new serde surface and no new #470 full-equality
+  participant. ADR-0067 supersedes ADR-0066 §4's token composition and R4 for
+  this reason: §4 asked for a counter "on the group entry" while R4 forbade
+  exactly that participant, and a census found three marker writers no
+  process-local counter reaches (the on-disk recovery install and the two
+  clears that bypass the persistence lock), whose failure mode would have been
+  **fail-open**.
+- Both-spellings group resolution is now one shared helper
+  (`resolve_group_entry_locked`): `delegations::fork_quarantine_marker`
+  delegates to it, and the TreeKEM store protector's `current_info` — which
+  used a bare single-spelling `get` — resolves through it too, so a protector
+  bound under one alias no longer reports a live group as unavailable.
 - **Group task-list mutations now REFUSE, and a contested group's bootstrap
   snapshot is no longer published, while the group is fork-quarantined
   (ADR-0066 §3c, rows 20 and 21, slice 5; #732) — an availability change,

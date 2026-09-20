@@ -74,6 +74,38 @@ struct CoverageRow {
     /// turns "somebody shipped a row without saying so" — or reverted one
     /// — into a failing test rather than a quiet drift.
     closed: bool,
+    /// ADR-0067: does the §1 Decision column for this row ask for the §4
+    /// re-check *before the effect*, on top of the entry gate?
+    ///
+    /// WHY this is a separate field from `closed`. Rows 1, 2, 4 and 6 read
+    /// "Keep; add §4 re-check" — they are `Gated` at entry and therefore
+    /// already `closed: true`, so the `closed`/`OPEN_ROWS` machinery is
+    /// structurally blind to whether the re-check ever landed. Slice 7 lands
+    /// the mechanism (row 22) and the KV-plane re-check, but David deferred
+    /// those four outbound paths to a later slice: they perform no roster
+    /// mutation and take no persistence lock, so "inside the same critical
+    /// section as the mutation" does not define a site for them and ADR-0066
+    /// defines no critical section for an outbound publish (ADR-0067,
+    /// "Deferral").
+    ///
+    /// Without this field that deferral would ship invisible — the fixture
+    /// would pass either way. `PENDING_RECHECK` below turns it into an
+    /// asserted, exact fact instead, so `OPEN_ROWS` can be empty without the
+    /// map quietly claiming more coverage than the tree has.
+    recheck_before_effect: RecheckState,
+}
+
+/// ADR-0067: the state of a row's §4 "re-check before the effect"
+/// obligation, as distinct from its entry gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecheckState {
+    /// The §1 Decision column asks for no §4 re-check on this row.
+    NotRequired,
+    /// Asked for, and the re-check is in the tree.
+    Landed,
+    /// Asked for, deferred to a later slice, and held visible by
+    /// `PENDING_RECHECK`.
+    Pending,
 }
 
 /// The §1 table, transcribed. Deliberately verbatim: a divergence between
@@ -86,6 +118,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -94,6 +127,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -102,6 +136,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -110,6 +145,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -118,6 +154,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -126,6 +163,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -134,6 +172,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -142,6 +181,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -150,6 +190,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -158,6 +199,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Landed,
         closed: true,
     },
     CoverageRow {
@@ -166,6 +208,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -174,6 +217,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Landed,
         closed: true,
     },
     CoverageRow {
@@ -182,6 +226,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -190,6 +235,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(4),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -198,6 +244,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -206,6 +253,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -214,6 +262,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -222,6 +271,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -230,6 +280,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -238,6 +289,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/tasks.rs",
         disposition: Disposition::Split,
         closed_by_slice: Some(5),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -246,6 +298,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/public_group_bootstrap_outbox.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(5),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -254,7 +307,8 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Introduce,
         closed_by_slice: Some(7),
-        closed: false,
+        recheck_before_effect: RecheckState::Landed,
+        closed: true,
     },
     CoverageRow {
         row: 23,
@@ -262,6 +316,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/files.rs",
         disposition: Disposition::OutOfScope,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -270,6 +325,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::KeepUngated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -278,6 +334,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/ws.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(6),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -286,6 +343,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
 ];
@@ -620,8 +678,11 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     // that a slice which lands its code without updating this map fails
     // here instead of leaving the map quietly describing a tree that no
     // longer exists. Slice 3 closed 15–19, slice 4 closed 13, 14 and 26,
-    // slice 5 closed 20 and 21, and slice 6 closed 25; what remains is the
-    // §4 epoch token, slice 7 (22).
+    // slice 5 closed 20 and 21, slice 6 closed 25 and slice 7 closed 22 —
+    // so EVERY §1 row has now landed and the open set is EMPTY. That is a
+    // milestone, not a licence: see PENDING_RECHECK below, which is the
+    // reason an empty open set does not mean ADR-0066 §4 is fully
+    // discharged across the §1 surface.
     let open: Vec<u8> = COVERAGE_MAP
         .iter()
         .filter(|row| !row.closed)
@@ -631,6 +692,53 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
         open, OPEN_ROWS,
         "the §1 rows still awaiting their slice — update this list in the slice that closes one"
     );
+
+    // ADR-0066 §1 is now fully landed, asserted as its OWN clause rather than
+    // left implicit in the equality above. Spelling it out means a future
+    // change that reopens a row fails with a message saying what was lost, and
+    // it records the milestone slice 7 completes.
+    assert!(
+        open.is_empty(),
+        "every §1 row's behaviour is supposed to be in the tree after slice 7 — these are \
+         open again: {open:?}. Coverage must not shrink; if a row genuinely needs reopening, \
+         say so in OPEN_ROWS and explain why."
+    );
+
+    // ADR-0067: the §4 "re-check before the effect" ledger, kept SEPARATE
+    // from `closed` because rows 1/2/4/6 are `Gated` at entry and so are
+    // already closed — the `OPEN_ROWS` machinery is structurally incapable of
+    // noticing whether their re-check landed.
+    //
+    // Asserted as an exact equality, in row order, for the same reason
+    // `OPEN_ROWS` is: a later slice that lands one of these must move it out
+    // of this list, and a slice that quietly drops a landed re-check fails
+    // here. When `PENDING_RECHECK` empties, ADR-0066 §4 is fully discharged
+    // across the §1 surface — and until then an empty `OPEN_ROWS` cannot be
+    // mistaken for that.
+    let pending: Vec<u8> = COVERAGE_MAP
+        .iter()
+        .filter(|row| row.recheck_before_effect == RecheckState::Pending)
+        .map(|row| row.row)
+        .collect();
+    assert_eq!(
+        pending, PENDING_RECHECK,
+        "the §1 rows whose Decision column asks for a §4 re-check that is NOT in the tree \
+         yet — outbound send / TreeKEM encrypt / GSS encrypt / GSS reseal, deferred to their \
+         own slice (ADR-0067, \"Deferral\"). Update this list in the slice that lands one; \
+         do not delete the assertion."
+    );
+
+    // A row cannot claim a LANDED re-check while still being open: "the
+    // re-check is in the tree" presupposes the row's behaviour is.
+    for row in COVERAGE_MAP.iter() {
+        if row.recheck_before_effect == RecheckState::Landed {
+            assert!(
+                row.closed,
+                "§1 row {} claims a landed §4 re-check but is still open",
+                row.row
+            );
+        }
+    }
 
     // A row that claims to be CLOSED and whose disposition is a refusal,
     // a split or an annotation must actually consult the marker in its
@@ -660,7 +768,32 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
 }
 
 /// The §1 rows whose behaviour change has not landed yet, in row order.
-const OPEN_ROWS: &[u8] = &[22];
+///
+/// **EMPTY, and that is the point of this slice.** Slice 5 closed rows 20 and
+/// 21 and slice 7 closed row 22, so every one of the 26 normative §1 rows now
+/// has its behaviour in the tree. The emptiness is asserted explicitly below
+/// rather than merely observed, so a later change that reopens a row — or
+/// deletes a landed gate — fails here instead of quietly shrinking coverage.
+///
+/// An empty open set is NOT the claim that ADR-0066 §4 is fully discharged
+/// across the §1 surface: four rows are gated at entry but still await their
+/// re-check-before-effect. See [`PENDING_RECHECK`].
+const OPEN_ROWS: &[u8] = &[];
+
+/// ADR-0067 deferral ledger: the §1 rows whose Decision column asks for the
+/// §4 re-check *before the effect* and whose re-check is NOT in the tree yet,
+/// in row order.
+///
+/// Rows 1, 2, 4 and 6 — signed-public outbound send, TreeKEM encrypt, GSS
+/// encrypt, GSS reseal. All four are `Gated` at entry and therefore already
+/// `closed: true`, so nothing in the `closed`/`OPEN_ROWS` machinery can
+/// notice that their re-check is missing — and now that `OPEN_ROWS` is empty,
+/// this list is the ONLY thing standing between "every row landed" and a
+/// false claim that §4 is done. They perform no roster mutation and take no
+/// persistence lock, so ADR-0066 §4's "inside the same critical section as the
+/// mutation" does not name a site for them; David deferred them to their own
+/// slice on 2026-09-20 (ADR-0067, "Deferral").
+const PENDING_RECHECK: &[u8] = &[1, 2, 4, 6];
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
 /// every route on the censused surface must be explicitly classified. Row
