@@ -105,9 +105,11 @@ undo of an install that never durably happened. This is deliberately not gated o
 
 **All 26 ADR-0066 §1 data-plane paths have landed** (`OPEN_ROWS == &[]`,
 asserted in the exhaustiveness fixture
-`src/server/routes/named_groups/tests/adr0066_coverage_map.rs`). Rows 1, 2, 4
-and 6 are gated at entry but still await their §4 re-check before effect
-(`PENDING_RECHECK == [1, 2, 4, 6]` — see §6a).
+`src/server/routes/named_groups/tests/adr0066_coverage_map.rs`), **and every row
+§1 asks to re-check before its effect now does** — slice 9 closed the last four,
+so `PENDING_RECHECK == &[]` in the same fixture. §4 is therefore discharged
+across the censused surface; the rows 1/2/4/6 block in §3.3 says what that
+re-check refuses and what it leaves behind.
 
 ### 3.1 Refused surfaces — 409 `fork_quarantined`
 
@@ -261,6 +263,57 @@ A mismatch aborts even when the marker was **cleared** mid-operation (a cleared
 marker is stale authorization, not a retry hazard — the retry sees the cleared
 state and succeeds immediately). These refusals are retryable and are not a
 lockout; nothing parks.
+
+**Rows 1, 2, 4 and 6 — outbound send and crypto: re-checked immediately before
+the effect (§4, slice 9).** The row 22 sites above all persist a roster record,
+so §4's "inside the same critical section as the mutation" named a site for them.
+These four mutate no roster and take no persistence lock: their effect is
+something LEAVING the node, so they get the same §4 rule at the only site they
+have — the last point before the effect with no suspension between. One helper,
+`named_groups.rs::reject_fork_quarantine_installed_before_effect`, is called from
+all four.
+
+| Row | Path | The effect protected |
+|------|------|---------------------|
+| 1 | `named_groups.rs::send_group_public_message` | the gossip publish — once the bytes are handed to gossip the contested message is on the wire |
+| 2 | `named_groups.rs::treekem_group_encrypt` | the send-ratchet advance and the ciphertext |
+| 4 | `named_groups.rs::secure_group_encrypt` | the ciphertext and its durable history row (GSS plane) |
+| 6 | `named_groups.rs::secure_group_reseal` | the group's shared secret, sealed to a member's ML-KEM key, in the response |
+
+**What you see.** A 409 `fork_quarantined` (the same §5 body — same `reason`,
+same prose, same `clear_with`) on a send or crypto route whose earlier attempts
+succeeded: evidence landed while that request was in flight. **Nothing was
+exported** — no message published, no ciphertext or envelope returned, no history
+row, no ratchet generation burned, every durable file byte-identical. The
+ordinary remedy applies (§4); there is nothing extra to clean up.
+
+**Not retryable, unlike row 22.** A retry meets the ENTRY gate and refuses
+again, because the marker is now installed. That is correct — the group is
+contested until cleared. Do not loop the client.
+
+**Only the marker half of the token is compared**
+(`groups::LifecycleEpochToken::same_marker`), so a concurrent legitimate roster
+advance — a rename, a role change — does not refuse a send. Comparing the full
+token would refuse every send that raced a rename, with no containment benefit.
+
+**A marker CLEARED mid-operation does not refuse, and cannot occur.** The
+operation was admitted only because the entry gate saw no marker, so the captured
+marker identity is always absent. This differs deliberately from row 22, which
+does refuse on a clear; it is not an inconsistency.
+
+**Residual window, stated honestly.** Between the re-check and the bytes actually
+reaching the wire or the caller, nothing holds the roster lock, so a marker
+installed in that last stretch does not stop that one effect. The window is **one
+message wide** and is irreducible without a send-path critical section — a lock
+held from the authorization check until the client has the bytes — which ADR-0066
+does not define and which would serialize the hot path behind a network write. It
+is acceptable because containment is about stopping the flow, not about the
+instant of the install: the re-check shrinks the exposure from the whole request
+duration (which includes awaits on the rider-token mutex, a revocation lookup,
+delegation verification and the TreeKEM group mutex) to a tail with no suspension
+point, and the very next request refuses. **Operationally: after installing or
+observing a marker, assume at most ONE message per in-flight request may already
+have left**, and check the group's history and the peers' view accordingly.
 
 **Row 24 — Inbound metadata / state-commit apply: deliberately ungated.** The
 clearing commit must still be able to arrive. Gating this would make some
@@ -502,16 +555,14 @@ under either name — not that you used the wrong spelling.
 These are open items that ship visible, not closed silently. Each is asserted or
 noted at the symbol cited.
 
-**(a) Send-path §4 re-check deferred — rows 1, 2, 4, 6.**
-ADR-0066 §1 Decision column asks for a §4 re-check before the effect on
-`POST /groups/:id/send` (row 1), TreeKEM encrypt (row 2), GSS encrypt (row 4) and
-GSS reseal (row 6). These paths perform no roster mutation and take no persistence
-lock, so ADR-0066's "inside the same critical section as the mutation" does not
-define a site for them. David deferred them to a later slice on 2026-09-20
-(ADR-0067, "Deferral"). They are gated at entry and therefore `closed: true` in
-the fixture, but carry `recheck_before_effect: RecheckState::Pending`; they appear
-exactly in `PENDING_RECHECK == &[1, 2, 4, 6]`.
-Source: `adr0066_coverage_map.rs::PENDING_RECHECK`.
+**(a) Send-path §4 re-check — CLOSED by slice 9.** Rows 1, 2, 4 and 6 now
+re-check the marker immediately before their effect; see §3.3 ("outbound send and
+crypto"), including the one-message-wide residual window that remains and why it
+is accepted. `PENDING_RECHECK == &[]` is asserted, and the fixture additionally
+counts one re-check CALL per row so a deletion fails the suite rather than quietly
+re-opening the gap.
+Source: `adr0066_coverage_map.rs::PENDING_RECHECK`,
+`adr0066_coverage_map.rs::SEND_PATH_RECHECK_CALL`.
 
 **(b) History reaper ignores quarantine.**
 `src/history/reaper.rs` (47 lines, zero quarantine mentions) runs age/byte
@@ -567,6 +618,22 @@ Under plain `cargo test` (which runs tests in the same process), concurrent test
 threads that touch the same static can interfere and produce spurious failures.
 `cargo nextest` runs each test in a separate process and is unaffected. Always use
 `cargo nextest` or the project's `just test` recipe.
+
+**(g) TreeKEM snapshot persist is single-spelling; a stable-id caller can burn a
+generation.** Found while building slice 9's stable-id fixture, NOT introduced by
+it, and on a non-quarantine path. `named_groups.rs::persist_treekem_snapshot_bound`
+resolves one spelling (`groups.get(group_id_hex)`), so in the state #750 named —
+the roster re-keyed to an alias while `treekem_groups` still holds the live
+ratchet under the stable id — a stable-id encrypt advances the send ratchet and
+then fails its persist with a 500 `failed to persist secure group state`. The
+generation is burned with no snapshot written, so it is lost across a restart
+rather than reused (fail-safe for nonce reuse, not for availability). The fix is
+the mechanical one: route that lookup through
+`server::resolve_group_entry_locked` like #750 did for the gates. Slice 9's
+`row2_stable_id_spelling_reaches_the_recheck_and_is_refused` asserts reachability
+as "not 424 and the ratchet moved" rather than as a 200, precisely so the §4
+fixture is not coupled to this bug's lifetime. Note the §4 re-check makes this
+*less* reachable for a quarantined group, which now refuses before the advance.
 
 ---
 
@@ -663,5 +730,9 @@ mandate-producing authority.
 | Delegation index dedup key | `(group_id, revision)`, bound 1024 |
 | ADR-0066 §1 coverage fixture | `src/server/routes/named_groups/tests/adr0066_coverage_map.rs` |
 | `OPEN_ROWS == &[]` (all 26 rows landed) | `adr0066_coverage_map.rs::OPEN_ROWS` |
-| `PENDING_RECHECK == &[1, 2, 4, 6]` | `adr0066_coverage_map.rs::PENDING_RECHECK` |
+| `PENDING_RECHECK == &[]` (§4 discharged) | `adr0066_coverage_map.rs::PENDING_RECHECK` |
+| Send-path re-check call, counted per row | `adr0066_coverage_map.rs::SEND_PATH_RECHECK_CALL` |
+| Before-effect re-check (rows 1/2/4/6) | `named_groups.rs::reject_fork_quarantine_installed_before_effect` |
+| Send-path race barrier (`cfg(test)`) | `named_groups.rs::send_recheck_barrier` |
+| Slice-9 fixtures | `src/server/routes/named_groups/tests/adr0066_send_path.rs` |
 | Exhaustiveness fixture | `adr0066_coverage_map.rs` (const array assertion) |
