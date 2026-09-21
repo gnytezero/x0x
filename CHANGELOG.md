@@ -534,6 +534,43 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A retired KV store sync stops merging, and retirement can be drained
+  (#757).** The `KvStoreSync` listener and responder selected between
+  cancellation and the next message without `biased`, so after
+  `retire()`/`cancel_sync()` a queued delta was still merged — and its snapshot
+  written — about half the time; a merge admitted just before the cancel could
+  also start its snapshot write arbitrarily late. The listener (whole
+  iteration) and the responder's owner-announce arm now hold a per-sync
+  lifecycle lock across `cancel check -> merge / ownership update -> persist`,
+  never across a network await; all loop selects are cancel-first; and no
+  receive future is dropped mid-flight, so an opened TreeKEM record always
+  reaches its merge and persist. New `KvStoreSync::cancel_sync_and_drain` /
+  `KvStoreHandle::retire_and_drain` cancel and then take that lock once: on
+  return no background merge, ownership update or snapshot write is in flight
+  or can start (read-only state serves and the requester publish are outside
+  the fence).
+  - **Drains:** the cached-binding-mismatch arms of `open_bound_*_store`,
+    before the handle is unregistered — when the CACHED sync is GSS or public.
+    The choice follows the cached sync, not the requested plane: a TreeKEM ->
+    SignedPublic policy change keeps the topic, so any arm can find any sync.
+  - **Cannot drain (deadlock), still `retire()`:** a cached TreeKEM sync in any
+    mismatch arm (callers hold the group membership guard that the protector's
+    `open_record` / `merge_main_record` take inside a section); the
+    secure-refresh hooks (they run inside a section: listener holds lifecycle
+    -> hook takes `kv_stores`); `retire_group_kv_stores` and the registration
+    rollback (hold `kv_stores` / the membership guard).
+  - An owner announce is validated BEFORE the responder enters its section
+    (`KvStore::check_ownership_announce`), so a rejected or stale announce
+    never queues behind the listener's merge + snapshot write and cannot stall
+    the state requests behind it.
+  - **Residual (#760):** after a non-draining `retire()`, one already-admitted
+    section may still land its snapshot write, and can race a later re-open of
+    the same snapshot path.
+
+  This was the mechanism behind the intermittent Coverage Gate failure of
+  `legacy_import_unloaded_preview_ambiguity_and_receipt_retry_preserve_state`
+  (`Is a directory (os error 21)`).
+
 - **TreeKEM snapshot persist now resolves alias-keyed groups, so a stable-id
   send no longer burns a ratchet generation (#732, runbook known gap (g)).**
   `persist_treekem_snapshot_bound` — the post-crypto step of
