@@ -20,7 +20,8 @@ KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-PUBSUB_SHA = "9b97359a1c57af33c5fe8c7ef5458b382db3ca47b86e68575fb352835999d887"
+PUBSUB_VERSION = "0.5.84"
+PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
 
 
 class Inconclusive(ValueError):
@@ -35,6 +36,25 @@ def require(condition, code):
 def integer(value):
     require(type(value) is int and 0 <= value < 2**64, "INVALID_COUNTER")
     return value
+
+
+def validate_source_premise(cargo_bytes, rust_bytes):
+    """Bind this evidence premise to the workspace pin and Rust producer check."""
+    dependencies = tomllib.loads(cargo_bytes.decode()).get("dependencies", {})
+    require(
+        dependencies.get("saorsa-gossip-pubsub") == f"={PUBSUB_VERSION}",
+        "WORKSPACE_PUBSUB_PIN_MISMATCH",
+    )
+    rust = rust_bytes.decode()
+    versions = re.findall(
+        r'pinned\[0\]\["version"\]\.as_str\(\) != Some\("([^"]+)"\)', rust
+    )
+    checksums = re.findall(
+        r'pinned\[0\]\["checksum"\]\.as_str\(\)\s*!= Some\("([0-9a-f]{64})"\)',
+        rust,
+    )
+    require(versions == [PUBSUB_VERSION], "RUST_PUBSUB_VERSION_MISMATCH")
+    require(checksums == [PUBSUB_SHA], "RUST_PUBSUB_SHA_MISMATCH")
 
 
 LABELS = ("G5", "D5", "O5", "W5")
@@ -188,7 +208,7 @@ def derive(record, lock_bytes):
     require(hashlib.sha256(lock_bytes).hexdigest() == record["build_lock_sha256"], "BUILD_LOCK_MISMATCH")
     require(HEX64.fullmatch(record["binary_sha256"]) is not None, "BINARY_HASH_MISSING")
     packages = [p for p in tomllib.loads(lock_bytes.decode())["package"] if p["name"] == "saorsa-gossip-pubsub"]
-    require(len(packages) == 1 and packages[0]["version"] == "0.5.81" and packages[0]["checksum"] == PUBSUB_SHA, "PRODUCER_PIN_MISMATCH")
+    require(len(packages) == 1 and packages[0]["version"] == PUBSUB_VERSION and packages[0]["checksum"] == PUBSUB_SHA, "PRODUCER_PIN_MISMATCH")
     require(0 < len(record["universe"]) <= 64, "UNIVERSE_BOUND")
     full, allowed = set(), set()
     for topic in record["universe"]:

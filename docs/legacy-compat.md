@@ -152,6 +152,53 @@ announce/discovery/caps/release lane). The #501 meter premise therefore moves
 from 0.5.79 to **0.5.80**, checksum `2f019ae3c17a73197ff7c48b5078caa2d03b669b7c0b724e30d2037e44e868b6`.
 
 
+## 2026-09-21 — meter producer premise moved to saorsa-gossip-pubsub 0.5.84
+
+saorsa-gossip 0.5.84 publishes the pubsub fixes merged in PR #84
+(`IntentLimit` recovery-intent admission fairness, merge `8ea1cfd`) and
+PR #85 (zero disabled-limiter dispatch overhead and bounded late-offer
+catch-up, merge `5da7906`). Release PR #86 merged as `24882f2`. The #501
+meter producer premise therefore moves to **0.5.84**, checksum
+`ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3`.
+
+The checksum was independently verified against both the crates.io sparse
+index record (published 2026-09-21 18:35:55 UTC, not yanked) and the SHA-256
+of the downloaded
+`saorsa-gossip-pubsub-0.5.84.crate`. This dependency update makes the
+fixes available to x0x; it is not evidence that either delivery regression is
+fixed on the fleet. Runtime and fleet acceptance remain separate gates.
+
+## 2026-09-18 — meter producer premise moved to saorsa-gossip-pubsub 0.5.83
+
+saorsa-gossip 0.5.83 carries the #504 slice-2 Leaf egress work
+(saorsa-gossip PR #82, merged `05fc664`, release `cea70b8`, tag `v0.5.83`):
+`BytePolicy`, `LeafEgressConfig.policy`, and the `LeafEgressSnapshot`
+counters including `shed_suppressed`. The #501 meter premise therefore moves
+to **0.5.83**, checksum
+`7886ce7293eecce58e59be0fa48f1fee5262af7a9e4e02be305dc12e94166912`
+(verified two ways: the `Cargo.lock` entry produced by `cargo fetch` against
+the caret pins, and `shasum -a 256` of
+`~/.cargo/registry/cache/*/saorsa-gossip-pubsub-0.5.83.crate`).
+
+The x0x consumer default is `byte_policy = "observe_only"`, so the producer
+still meters rather than sheds and #501 measurements stay comparable across
+this bump. A capture taken with `byte_policy = "shed_normal"` is **not**
+comparable to any earlier baseline and must say so.
+
+**The premise had split in two.** The 0.5.82 bump (#722) moved only
+`src/legacy_bus_interop_tests.rs` and left
+`scripts/ci/derive-legacy-bus-attempts.py` (plus its fixture) asserting
+0.5.81, and added no entry here. The Rust assertion and the Python
+`PRODUCER_PIN_MISMATCH` check therefore disagreed for four days. It went
+unnoticed because the derive script is an offline evidence tool, not a CI
+gate, so nothing turned red. This bump brings all three sites to 0.5.83 in
+one step — it does not stop at 0.5.82, which is no longer the version x0x
+builds against — and removes the mechanism that allowed the drift: the
+script now owns a single `PUBSUB_VERSION` constant, and the test fixture
+derives its lock text from `module.PUBSUB_VERSION` and `module.PUBSUB_SHA`
+instead of repeating the version literal. The premise is now one value per
+half (Rust, Python) rather than four.
+
 ## 2026-09-14 — #613: the measured arms' ingress joins the record, and the t1 cut waits for it
 
 Two defects in how the #501 meter *reads* the measured arms, both found by

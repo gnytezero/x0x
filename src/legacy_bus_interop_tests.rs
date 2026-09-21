@@ -2053,9 +2053,9 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
         .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
         .collect::<Vec<_>>();
     if pinned.len() != 1
-        || pinned[0]["version"].as_str() != Some("0.5.82")
+        || pinned[0]["version"].as_str() != Some("0.5.84")
         || pinned[0]["checksum"].as_str()
-            != Some("5c53f3c2cf8f671b405ccf5810c0fff1cc19fe852f8853fd3f56d1eb731a276a")
+            != Some("ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3")
     {
         raw["outcome"] = json!("INCONCLUSIVE");
         raw["reason"] = json!("published meter producer pin unavailable");
@@ -2727,6 +2727,7 @@ fn generator_returns_preserve_order_override_and_unavailable() {
             Some(FanoutCounts {
                 attempted: 2,
                 succeeded: 1,
+                ..Default::default()
             }),
         ),
         (0, None),
@@ -2753,7 +2754,8 @@ fn generator_load_interpretation_rejects_incoherent_or_partial_records() {
             7,
             Some(FanoutCounts {
                 attempted: 2,
-                succeeded: 1
+                succeeded: 1,
+                ..Default::default()
             })
         );
         200
@@ -2852,7 +2854,8 @@ fn generator_ancillary_attachment_is_bounded_and_ignores_cut_totals() {
             u32::MAX,
             Some(FanoutCounts {
                 attempted: usize::MAX,
-                succeeded: usize::MAX
+                succeeded: usize::MAX,
+                ..Default::default()
             })
         );
         200
@@ -2872,7 +2875,8 @@ fn generator_ancillary_attachment_is_bounded_and_ignores_cut_totals() {
             2,
             Some(FanoutCounts {
                 attempted: 2,
-                succeeded: 0
+                succeeded: 0,
+                ..Default::default()
             })
         );
         200
